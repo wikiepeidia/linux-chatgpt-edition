@@ -407,9 +407,13 @@ build_from_local() {
     verify_repository_snapshot "$object_root"
 
     build_root=$WORK_ROOT/buildroots/$request_hash
+    builder_user=builder
+    builder_uid=1000
+    builder_gid=1000
     rm -rf "$build_root"
     mkdir -p "$build_root/etc/apk/keys" "$build_root/repo/x86_64" "$build_root/work" "$build_root/workspace" \
-        "$build_root/export" "$build_root/run/300k-secrets" "$build_root/root/.mkimage" "$build_root/tmp"
+        "$build_root/export" "$build_root/run/300k-secrets" "$build_root/home/$builder_user/.mkimage" \
+        "$build_root/tmp" "$build_root/proc" "$build_root/dev"
     cp /etc/apk/keys/* "$build_root/etc/apk/keys/"
     cp "$SECRET_ROOT/300k.rsa.pub" "$build_root/etc/apk/keys/300k.rsa.pub"
     cp "$object_root"/* "$build_root/repo/x86_64/"
@@ -420,7 +424,7 @@ build_from_local() {
     mkdir -p "$build_root/work/aports"
     tar -xf "$object_root/aports.tar" -C "$build_root/work/aports"
     [ -f "$build_root/work/aports/scripts/mkimage.sh" ] || fail APORTS_ARCHIVE_INVALID "retained aports archive is incomplete"
-    cp "$build_root/workspace/builder/profiles/mkimg.300k.sh" "$build_root/root/.mkimage/mkimg.300k.sh"
+    cp "$build_root/workspace/builder/profiles/mkimg.300k.sh" "$build_root/home/$builder_user/.mkimage/mkimg.300k.sh"
 
     repositories_file=$build_root/etc/apk/repositories
     printf '%s\n' 'file:///repo' > "$repositories_file"
@@ -437,6 +441,16 @@ build_from_local() {
     fi
     umount /repo || fail OFFLINE_REPOSITORY_UNMOUNT_FAILED "canonical local repository unmount failed"
     rmdir /repo
+    chroot "$build_root" /usr/sbin/addgroup -S -g "$builder_gid" "$builder_user"
+    chroot "$build_root" /usr/sbin/adduser -S -D -H -u "$builder_uid" -G "$builder_user" -s /bin/sh "$builder_user"
+    mkdir -p "$build_root/work/mkimage" "$build_root/export/raw"
+    chown -R "$builder_uid:$builder_gid" \
+        "$build_root/home/$builder_user" "$build_root/work/mkimage" "$build_root/export"
+    chown "$builder_uid:$builder_gid" \
+        "$build_root/run/300k-secrets/300k.rsa" "$build_root/run/300k-secrets/300k.rsa.pub"
+    chmod 0600 "$build_root/run/300k-secrets/300k.rsa"
+    chmod 0700 "$build_root/home/$builder_user/.mkimage"
+    chmod 1777 "$build_root/tmp"
     apk --root "$build_root" --no-network list --installed --manifest | LC_ALL=C sort > "$EXPORT_ROOT/builder-packages.lock"
     require_file "$EXPORT_ROOT/builder-packages.lock"
     cp /etc/resolv.conf "$build_root/etc/resolv.conf" 2>/dev/null || true
@@ -456,20 +470,27 @@ build_from_local() {
     verify_repository_snapshot "$object_root"
     source_date_epoch=$(json_scalar source_date_epoch "$REQUEST_FILE")
     case "$source_date_epoch" in ''|0|*[!0-9]*) fail SOURCE_DATE_EPOCH_INVALID "BuildRequest epoch is invalid" ;; esac
-    chroot "$build_root" env -i \
-        HOME=/root \
-        PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-        SOURCE_DATE_EPOCH="$source_date_epoch" \
-        PACKAGER_PRIVKEY=/run/300k-secrets/300k.rsa \
-        PACKAGER_PUBKEY=/run/300k-secrets/300k.rsa.pub \
-        /bin/sh /work/aports/scripts/mkimage.sh \
-            --tag "p01-${request_hash%${request_hash#????????????}}" \
-            --outdir /export/raw \
-            --workdir "/work/mkimage/$request_hash" \
-            --arch x86_64 \
-            --repository file:///repo \
-            --profile 300k_bootstrap \
-            --checksum \
+    release_tag=p01-${request_hash%${request_hash#????????????}}
+    mkimage_workdir=/work/mkimage/$request_hash
+    mkimage_command="exec /usr/bin/env -i HOME=/home/$builder_user PATH=/usr/sbin:/usr/bin:/sbin:/bin SOURCE_DATE_EPOCH=$source_date_epoch PACKAGER_PRIVKEY=/run/300k-secrets/300k.rsa PACKAGER_PUBKEY=/run/300k-secrets/300k.rsa.pub /bin/sh /work/aports/scripts/mkimage.sh --tag $release_tag --outdir /export/raw --workdir $mkimage_workdir --arch x86_64 --repository file:///repo --profile 300k_bootstrap --checksum"
+    # Pinned aports uses apk add --no-chown for its APKROOT. apk-tools 3 maps
+    # that option to usermode and rejects uid 0, so run mkimage as its sole
+    # dedicated owner rather than weakening package verification.
+    mount --bind /proc "$build_root/proc" \
+        || fail MKIMAGE_PROC_MOUNT_FAILED "builder proc mount failed"
+    if ! mount --bind /dev "$build_root/dev"; then
+        umount "$build_root/proc" >/dev/null 2>&1 || true
+        fail MKIMAGE_DEV_MOUNT_FAILED "builder device mount failed"
+    fi
+    mkimage_status=0
+    chroot "$build_root" /bin/su -s /bin/sh -c "$mkimage_command" "$builder_user" \
+        || mkimage_status=$?
+    mount_cleanup_status=0
+    umount "$build_root/dev" || mount_cleanup_status=1
+    umount "$build_root/proc" || mount_cleanup_status=1
+    [ "$mount_cleanup_status" -eq 0 ] \
+        || fail MKIMAGE_MOUNT_CLEANUP_FAILED "builder proc/device cleanup failed"
+    [ "$mkimage_status" -eq 0 ] \
         || fail MKIMAGE_FAILED "pinned offline aports build failed"
     verify_repository_snapshot "$object_root"
 
