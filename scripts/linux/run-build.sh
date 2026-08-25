@@ -186,7 +186,13 @@ assert_exact_xorriso_stderr() {
     [ "$banner_count" -le 1 ] || fail "$code" "$label emitted duplicate xorriso startup banners"
     filtered=$log.filtered
     grep -Fvx -- "$expected_banner" "$log" > "$filtered" || true
-    [ ! -s "$filtered" ] || fail "$code" "$label emitted non-banner xorriso stderr"
+    if [ -s "$filtered" ]; then
+        residue_bytes=$(file_bytes "$filtered")
+        residue_hash=$(sha256_file "$filtered")
+        residue_text=$(head -c 256 "$filtered" | tr '\r\n' '  ' | tr -cd '[:alnum:] ._+:/()=,-')
+        [ -n "$residue_text" ] || residue_text=no-printable-diagnostic
+        fail "$code" "$label emitted non-banner xorriso stderr bytes=$residue_bytes sha256=$residue_hash text=$residue_text"
+    fi
 }
 
 require_public_contract() {
