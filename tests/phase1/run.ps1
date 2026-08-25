@@ -97,12 +97,12 @@ if ($Scope -in @('Unit', 'Qemu', 'All')) {
 Add-TestCase -Name 'BUILD-03 inspection policy pins every decoder and bounded graph limit' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
     $inputsPath = Join-Path $script:RepositoryRoot 'builder/inputs.json'
     $inputs = Get-Content -Raw -LiteralPath $inputsPath | ConvertFrom-Json -Depth 64
-    $formats = @($inputs.inspection_toolchain.formats)
+    $formats = @($inputs.inspection_toolchain.PSObject.Properties)
 
-    Assert-Equal -Expected @('gzip', 'xz', 'zstd', 'lz4', 'cpio', 'squashfs', 'iso9660', 'tar', 'apk') -Actual @($formats.name) -Message 'The complete nested decoder graph must be closed and ordered.'
+    Assert-Equal -Expected @('gzip', 'xz', 'zstd', 'lz4', 'cpio', 'squashfs', 'iso', 'tar', 'apk') -Actual @($formats.Name) -Message 'The complete nested decoder graph must be closed and ordered.'
     foreach ($format in $formats) {
-        Assert-Match -Value ([string] $format.package) -Pattern '^[a-z0-9][a-z0-9+_.-]*=[0-9][a-zA-Z0-9.+_~-]*-r[0-9]+$' -Message "Decoder '$($format.name)' must name an exact APK package version."
-        Assert-Match -Value ([string] $format.command) -Pattern '^/[A-Za-z0-9._+/-]+$' -Message "Decoder '$($format.name)' must use an absolute command path."
+        Assert-Match -Value ([string] $format.Value.package) -Pattern '^[a-z0-9][a-z0-9+_.-]*=[0-9][a-zA-Z0-9.+_~-]*-r[0-9]+$' -Message "Decoder '$($format.Name)' must name an exact APK package version."
+        Assert-Match -Value ([string] $format.Value.command) -Pattern '^/[A-Za-z0-9._+/-]+$' -Message "Decoder '$($format.Name)' must use an absolute command path."
     }
 
     $limits = $inputs.inspection_policy.limits
@@ -115,7 +115,7 @@ Add-TestCase -Name 'BUILD-03 inspection policy pins every decoder and bounded gr
 
     $builderPackages = @($inputs.builder_packages)
     foreach ($format in $formats) {
-        Assert-True -Condition ($builderPackages -ccontains [string] $format.package) -Message "Decoder package '$($format.package)' is outside the retained builder closure."
+        Assert-True -Condition ($builderPackages -ccontains [string] $format.Value.package) -Message "Decoder package '$($format.Value.package)' is outside the retained builder closure."
     }
 }
 

@@ -98,7 +98,7 @@
     "xz": {
       "package": "xz=5.8.3-r0",
       "command": "/usr/bin/xz",
-      "decoder": ["/usr/bin/xz", "-dc", "--single-stream", "--"],
+      "decoder": ["/usr/bin/xz", "-dc", "--"],
       "fixture_encoder": ["/usr/bin/xz", "-zc", "--check=crc32", "--"],
       "version_argv": ["/usr/bin/xz", "--version"]
     },
@@ -136,7 +136,32 @@
       "decoder": ["/usr/bin/xorriso", "-osirrox", "on:o_excl_on", "-indev"],
       "fixture_encoder": ["/usr/bin/xorriso", "-as", "mkisofs", "-quiet", "-output"],
       "version_argv": ["/usr/bin/xorriso", "-version"]
+    },
+    "tar": {
+      "package": "busybox=1.37.0-r31",
+      "command": "/bin/tar",
+      "decoder": ["/bin/tar", "-xOf"],
+      "fixture_encoder": ["/bin/tar", "-cf"],
+      "version_argv": ["/bin/busybox"]
+    },
+    "apk": {
+      "package": "apk-tools=3.0.7-r0",
+      "command": "/sbin/apk",
+      "decoder": ["/bin/gzip", "-dc", "--"],
+      "fixture_encoder": ["/bin/tar", "-cf"],
+      "version_argv": ["/sbin/apk", "--version"]
     }
+  },
+  "inspection_policy": {
+    "limits": {
+      "max_depth": 8,
+      "max_members": 200000,
+      "max_path_bytes": 4096,
+      "max_file_bytes": 1073741824,
+      "max_total_expanded_bytes": 4294967296
+    },
+    "materialized_types": ["regular"],
+    "follow_links": false
   },
   "canonical_guest_roles": {
     "source": "/workspace",

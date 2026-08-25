@@ -13,6 +13,24 @@ WORK_ROOT=/work
 CACHE_ROOT=/var/lib/300k-cache
 SECRET_ROOT=/run/300k-secrets
 SERIAL_DEVICE=/dev/ttyS0
+ACTIVE_BUILD_ROOT=
+
+cleanup_sensitive_build_state() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    if [ -n "$ACTIVE_BUILD_ROOT" ]; then
+        case "$ACTIVE_BUILD_ROOT" in
+            "$WORK_ROOT"/buildroots/*)
+                if [ -d "$ACTIVE_BUILD_ROOT/run/300k-secrets" ] && [ ! -L "$ACTIVE_BUILD_ROOT/run/300k-secrets" ]; then
+                    rm -f -- "$ACTIVE_BUILD_ROOT/run/300k-secrets/300k.rsa" "$ACTIVE_BUILD_ROOT/run/300k-secrets/300k.rsa.pub" 2>/dev/null || true
+                fi
+                ;;
+            *) printf '%s\n' 'BUILD_SECRET_CLEANUP_REFUSED: active build root is outside the owned buildroots directory' >&2 ;;
+        esac
+    fi
+    exit "$status"
+}
+trap cleanup_sensitive_build_state EXIT HUP INT TERM
 
 fail() {
     code=$1
@@ -103,6 +121,39 @@ repository_value() {
     ' "$INPUTS_FILE"
 }
 
+inspection_value() {
+    format=$1
+    field=$2
+    awk -v object="\"$format\"" -v wanted="\"$field\"" '
+        index($0, object) && /[{][[:space:]]*$/ { inside=1; next }
+        inside && /^[[:space:]]*}[,]?[[:space:]]*$/ { exit }
+        inside && index($0, wanted) {
+            line=$0
+            sub(/^[^:]*:[[:space:]]*/, "", line)
+            sub(/[[:space:]]*,?[[:space:]]*$/, "", line)
+            gsub(/^"|"$/, "", line)
+            print line
+            exit
+        }
+    ' "$INPUTS_FILE"
+}
+
+inspection_array_first() {
+    format=$1
+    field=$2
+    awk -v object="\"$format\"" -v wanted="\"$field\"" '
+        index($0, object) && /[{][[:space:]]*$/ { inside=1; next }
+        inside && /^[[:space:]]*}[,]?[[:space:]]*$/ { exit }
+        inside && index($0, wanted) {
+            line=$0
+            sub(/^[^[]*\[[[:space:]]*"/, "", line)
+            sub(/".*$/, "", line)
+            print line
+            exit
+        }
+    ' "$INPUTS_FILE"
+}
+
 json_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g'
 }
@@ -119,6 +170,13 @@ require_public_contract() {
     grep -F '"lz4=1.10.0-r1"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "lz4 pin missing"
     grep -F '"cpio=2.15-r0"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "cpio pin missing"
     grep -F '"decoder": ["/usr/bin/xorriso", "-osirrox", "on:o_excl_on", "-indev"]' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "ISO decoder contract changed"
+    grep -F '"package": "busybox=1.37.0-r31"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "tar decoder package pin missing"
+    grep -F '"package": "apk-tools=3.0.7-r0"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "APK decoder package pin missing"
+    grep -F '"max_depth": 8' "$INPUTS_FILE" >/dev/null || fail INPUT_INSPECTION_POLICY_INVALID "inspection depth policy changed"
+    grep -F '"max_members": 200000' "$INPUTS_FILE" >/dev/null || fail INPUT_INSPECTION_POLICY_INVALID "inspection member policy changed"
+    grep -F '"max_path_bytes": 4096' "$INPUTS_FILE" >/dev/null || fail INPUT_INSPECTION_POLICY_INVALID "inspection path policy changed"
+    grep -F '"max_file_bytes": 1073741824' "$INPUTS_FILE" >/dev/null || fail INPUT_INSPECTION_POLICY_INVALID "inspection file policy changed"
+    grep -F '"max_total_expanded_bytes": 4294967296' "$INPUTS_FILE" >/dev/null || fail INPUT_INSPECTION_POLICY_INVALID "inspection expansion policy changed"
 }
 
 download_file() {
@@ -414,41 +472,58 @@ verify_codec_round_trip() {
     root=$1
     format=$2
     fixture=/tmp/300k-inspection-fixture
+    rm -rf "$root/tmp/cpio-fixture" "$root/tmp/squash-fixture" "$root/tmp/iso-fixture" "$root/tmp/tar-fixture"
+    rm -f "$root$fixture" "$root$fixture".*
     printf '300K deterministic inspection fixture\n' > "$root$fixture"
+    command_path=$(inspection_value "$format" command)
+    encoder_path=$(inspection_array_first "$format" fixture_encoder)
     case "$format" in
         gzip)
-            chroot "$root" /bin/gzip -n -c -- "$fixture" > "$root$fixture.gz"
-            chroot "$root" /bin/gzip -dc -- "$fixture.gz" > "$root$fixture.out"
+            chroot "$root" "$encoder_path" -n -c -- "$fixture" > "$root$fixture.gz"
+            chroot "$root" "$command_path" -dc -- "$fixture.gz" > "$root$fixture.out"
             ;;
         xz)
-            chroot "$root" /usr/bin/xz -zc --check=crc32 -- "$fixture" > "$root$fixture.xz"
-            chroot "$root" /usr/bin/xz -dc --single-stream -- "$fixture.xz" > "$root$fixture.out"
+            chroot "$root" "$encoder_path" -zc --check=crc32 -- "$fixture" > "$root$fixture.xz"
+            chroot "$root" "$command_path" -dc -- "$fixture.xz" > "$root$fixture.out"
             ;;
         zstd)
-            chroot "$root" /usr/bin/zstd -q -c -- "$fixture" > "$root$fixture.zst"
-            chroot "$root" /usr/bin/zstd -q -dc -- "$fixture.zst" > "$root$fixture.out"
+            chroot "$root" "$encoder_path" -q -c -- "$fixture" > "$root$fixture.zst"
+            chroot "$root" "$command_path" -q -dc -- "$fixture.zst" > "$root$fixture.out"
             ;;
         lz4)
-            chroot "$root" /usr/bin/lz4 -q -c -- "$fixture" > "$root$fixture.lz4"
-            chroot "$root" /usr/bin/lz4 -q -d -c -- "$fixture.lz4" > "$root$fixture.out"
+            chroot "$root" "$encoder_path" -q -c -- "$fixture" > "$root$fixture.lz4"
+            chroot "$root" "$command_path" -q -d -c -- "$fixture.lz4" > "$root$fixture.out"
             ;;
         cpio)
             mkdir -p "$root/tmp/cpio-fixture"
             cp "$root$fixture" "$root/tmp/cpio-fixture/payload"
-            chroot "$root" /bin/sh -ceu "cd /tmp/cpio-fixture; printf 'payload\\n' | /usr/bin/cpio --create --format=newc --reproducible --quiet" > "$root$fixture.cpio"
-            chroot "$root" /usr/bin/cpio --extract --to-stdout --quiet payload < "$root$fixture.cpio" > "$root$fixture.out"
+            chroot "$root" /bin/sh -ceu "cd /tmp/cpio-fixture; printf 'payload\\n' | $encoder_path --create --format=newc --reproducible --quiet" > "$root$fixture.cpio"
+            chroot "$root" "$command_path" --extract --to-stdout --quiet payload < "$root$fixture.cpio" > "$root$fixture.out"
             ;;
         squashfs)
             mkdir -p "$root/tmp/squash-fixture"
             cp "$root$fixture" "$root/tmp/squash-fixture/payload"
-            chroot "$root" /usr/bin/mksquashfs /tmp/squash-fixture "$fixture.sqfs" -noappend -no-xattrs -all-time 0 -quiet
-            chroot "$root" /usr/bin/unsquashfs -cat "$fixture.sqfs" payload > "$root$fixture.out"
+            chroot "$root" "$encoder_path" /tmp/squash-fixture "$fixture.sqfs" -noappend -no-xattrs -all-time 0 -quiet
+            chroot "$root" "$command_path" -cat "$fixture.sqfs" payload > "$root$fixture.out"
             ;;
         iso)
             mkdir -p "$root/tmp/iso-fixture"
             cp "$root$fixture" "$root/tmp/iso-fixture/payload"
-            chroot "$root" /usr/bin/xorriso -as mkisofs -quiet -output "$fixture.iso" /tmp/iso-fixture
-            chroot "$root" /usr/bin/xorriso -osirrox on:o_excl_on -indev "$fixture.iso" -extract_single /payload "$fixture.out" >/dev/null 2>&1
+            chroot "$root" "$encoder_path" -as mkisofs -quiet -output "$fixture.iso" /tmp/iso-fixture
+            chroot "$root" "$command_path" -osirrox on:o_excl_on -indev "$fixture.iso" -extract_single /payload "$fixture.out" >/dev/null 2>&1
+            ;;
+        tar)
+            mkdir -p "$root/tmp/tar-fixture"
+            cp "$root$fixture" "$root/tmp/tar-fixture/payload"
+            chroot "$root" /bin/sh -ceu "cd /tmp/tar-fixture; $encoder_path -cf $fixture.tar payload"
+            chroot "$root" "$command_path" -xOf "$fixture.tar" payload > "$root$fixture.out"
+            ;;
+        apk)
+            mkdir -p "$root/tmp/tar-fixture"
+            cp "$root$fixture" "$root/tmp/tar-fixture/payload"
+            tar_path=$(inspection_value tar command)
+            gzip_path=$(inspection_value gzip command)
+            chroot "$root" /bin/sh -ceu "cd /tmp/tar-fixture; $tar_path -cf $fixture.tar payload; $gzip_path -n -c -- $fixture.tar > $fixture.apk; $gzip_path -dc -- $fixture.apk | $tar_path -xOf - payload" > "$root$fixture.out"
             ;;
         *) fail INSPECTION_FORMAT_UNSUPPORTED "unsupported inspection format" ;;
     esac
@@ -458,20 +533,31 @@ verify_codec_round_trip() {
 record_inspection_command() {
     root=$1
     format=$2
-    package_pin=$3
-    command_path=$4
-    version_args=$5
-    output_file=$6
+    output_file=$3
+    repository=$4
+    package_pin=$(inspection_value "$format" package)
+    command_path=$(inspection_value "$format" command)
+    [ -n "$package_pin" ] && [ -n "$command_path" ] \
+        || fail INSPECTION_CONFIG_INVALID "$format package/path is absent from inspection_toolchain"
     package_name=${package_pin%%=*}
     package_version=${package_pin#*=}
     expected_owner=$package_name-$package_version
     ownership=$(chroot "$root" apk info --who-owns "$command_path" 2>/dev/null || true)
     printf '%s' "$ownership" | grep -F "$expected_owner" >/dev/null || fail INSPECTION_OWNER_MISMATCH "$format command ownership mismatch"
-    # version_args is fixed source-controlled text, never external input.
-    version=$(chroot "$root" sh -ceu "$version_args" | head -n 1 | tr -cd '[:alnum:] ._+:/()-')
+    case "$format" in
+        squashfs|iso) version=$(chroot "$root" "$command_path" -version 2>&1 | head -n 1 | tr -cd '[:alnum:] ._+:/()-') ;;
+        tar) version=$(chroot "$root" /bin/busybox 2>&1 | head -n 1 | tr -cd '[:alnum:] ._+:/()-') ;;
+        *) version=$(chroot "$root" "$command_path" --version 2>&1 | head -n 1 | tr -cd '[:alnum:] ._+:/()-') ;;
+    esac
     [ -n "$version" ] || fail INSPECTION_VERSION_MISSING "$format version output is empty"
     verify_codec_round_trip "$root" "$format"
     command_hash=$(sha256_file "$root$command_path")
+    retained_apk=$(find "$repository" -maxdepth 1 -type f -name "$package_name-$package_version.apk" | LC_ALL=C sort | head -n 1)
+    require_file "$retained_apk"
+    retained_basename=$(basename "$retained_apk")
+    retained_hash=$(sha256_file "$retained_apk")
+    grep -F "$retained_hash  $retained_basename" "$repository/repository.sha256" >/dev/null \
+        || fail INSPECTION_RETAINED_APK_DRIFT "$format package is absent from the verified repository manifest"
     if [ -s "$output_file" ]; then printf ',\n' >> "$output_file"; fi
     cat >> "$output_file" <<EOF
     {
@@ -480,11 +566,58 @@ record_inspection_command() {
       "command": "$command_path",
       "command_sha256": "$command_hash",
       "version": "$(json_escape "$version")",
+      "retained_apk_file": "$retained_basename",
+      "retained_apk_sha256": "$retained_hash",
       "package_ownership_verified": true,
       "path_verified": true,
-      "round_trip_verified": true
+      "round_trip_verified": true,
+      "retained_apk_verified": true,
+      "contract_source": "builder/inputs.json:inspection_toolchain",
+      "retained_repository": "$repository_object_id"
     }
 EOF
+}
+
+assert_inspection_toolchain_identity() {
+    root=$1
+    repository=$2
+    evidence=$3
+    seen=0
+    for format in gzip xz zstd lz4 cpio squashfs iso tar apk; do
+        package_pin=$(inspection_value "$format" package)
+        command_path=$(inspection_value "$format" command)
+        retained_basename=$(awk -v wanted="\"format\": \"$format\"" '
+            index($0,wanted) { inside=1 }
+            inside && /"retained_apk_file"/ { line=$0; sub(/^[^:]*:[[:space:]]*"/,"",line); sub(/",?[[:space:]]*$/, "", line); print line; exit }
+        ' "$evidence")
+        retained_hash=$(awk -v wanted="\"format\": \"$format\"" '
+            index($0,wanted) { inside=1 }
+            inside && /"retained_apk_sha256"/ { line=$0; sub(/^[^:]*:[[:space:]]*"/,"",line); sub(/",?[[:space:]]*$/, "", line); print line; exit }
+        ' "$evidence")
+        grep -F "\"package\": \"$package_pin\"" "$evidence" >/dev/null \
+            || fail INSPECTION_EVIDENCE_MISMATCH "$format package evidence is absent"
+        grep -F "\"command\": \"$command_path\"" "$evidence" >/dev/null \
+            || fail INSPECTION_EVIDENCE_MISMATCH "$format command evidence is absent"
+        require_file "$root$command_path"
+        require_file "$repository/$retained_basename"
+        [ "$(sha256_file "$repository/$retained_basename")" = "$retained_hash" ] \
+            || fail INSPECTION_RETAINED_APK_DRIFT "$format retained APK changed before inspection"
+        seen=$((seen + 1))
+    done
+    [ "$seen" -eq 9 ] || fail INSPECTION_TOOLCHAIN_SET_INVALID "inspection evidence is incomplete"
+}
+
+run_inspector_self_test() {
+    root=$1
+    chroot "$root" /bin/sh /workspace/scripts/linux/inspect-iso.sh self-test /work/inspection-self-test \
+        || fail INSPECTION_SELF_TEST_FAILED "hostile compressed-layer fixture suite failed"
+}
+
+inspect_iso_artifact() {
+    root=$1
+    iso=$2
+    chroot "$root" /bin/sh /workspace/scripts/linux/inspect-iso.sh audit "$iso" /work/inspection-audit /export/iso-audit.json \
+        || fail ISO_DECODE_AUDIT_FAILED "settled ISO failed recursive decoded-content inspection"
 }
 
 build_from_local() {
@@ -505,6 +638,7 @@ build_from_local() {
     verify_repository_snapshot "$object_root"
 
     build_root=$WORK_ROOT/buildroots/$request_hash
+    ACTIVE_BUILD_ROOT=$build_root
     builder_user=builder
     builder_uid=1000
     builder_gid=1000
@@ -520,6 +654,7 @@ build_from_local() {
     cp "$SECRET_ROOT/300k.rsa.pub" "$build_root/run/300k-secrets/300k.rsa.pub"
     chmod 0600 "$build_root/run/300k-secrets/300k.rsa"
     cp -a /workspace/. "$build_root/workspace/"
+    require_file "$build_root/workspace/scripts/linux/inspect-iso.sh"
     mkdir -p "$build_root/work/aports"
     tar -xf "$object_root/aports.tar" -C "$build_root/work/aports"
     [ -f "$build_root/work/aports/scripts/mkimage.sh" ] || fail APORTS_ARCHIVE_INVALID "retained aports archive is incomplete"
@@ -573,20 +708,20 @@ build_from_local() {
 
     inspection_file=$WORK_ROOT/inspection-commands.json.items
     : > "$inspection_file"
-    record_inspection_command "$build_root" gzip 'gzip=1.14-r2' /bin/gzip '/bin/gzip --version' "$inspection_file"
-    record_inspection_command "$build_root" xz 'xz=5.8.3-r0' /usr/bin/xz '/usr/bin/xz --version' "$inspection_file"
-    record_inspection_command "$build_root" zstd 'zstd=1.5.7-r2' /usr/bin/zstd '/usr/bin/zstd --version' "$inspection_file"
-    record_inspection_command "$build_root" lz4 'lz4=1.10.0-r1' /usr/bin/lz4 '/usr/bin/lz4 --version' "$inspection_file"
-    record_inspection_command "$build_root" cpio 'cpio=2.15-r0' /usr/bin/cpio '/usr/bin/cpio --version' "$inspection_file"
-    record_inspection_command "$build_root" squashfs 'squashfs-tools=4.7.5-r0' /usr/bin/unsquashfs '/usr/bin/unsquashfs -version' "$inspection_file"
-    record_inspection_command "$build_root" iso 'xorriso=1.5.8-r0' /usr/bin/xorriso '/usr/bin/xorriso -version' "$inspection_file"
+    for inspection_format in gzip xz zstd lz4 cpio squashfs iso tar apk; do
+        record_inspection_command "$build_root" "$inspection_format" "$inspection_file" "$object_root"
+    done
 
     verify_repository_snapshot "$build_root/repo/x86_64"
     verify_repository_snapshot "$object_root"
+    assert_inspection_toolchain_identity "$build_root" "$object_root" "$inspection_file"
+    cp "$inspection_file" "$build_root/work/inspection-commands.json.items"
+    cp "$trusted_key_manifest" "$build_root/work/trusted-keys.sha256"
     disable_network
     verify_repository_snapshot "$build_root/repo/x86_64"
     verify_repository_snapshot "$object_root"
     verify_closed_keyring "$build_root/etc/apk/keys" "$trusted_key_manifest"
+    run_inspector_self_test "$build_root"
     source_date_epoch=$(json_scalar source_date_epoch "$REQUEST_FILE")
     case "$source_date_epoch" in ''|0|*[!0-9]*) fail SOURCE_DATE_EPOCH_INVALID "BuildRequest epoch is invalid" ;; esac
     release_tag=p01-${request_hash%${request_hash#????????????}}
@@ -632,7 +767,15 @@ build_from_local() {
     require_file "$iso_in_root"
     iso_hash=$(sha256_file "$iso_in_root")
     iso_name=300k-bootstrap-x86_64-$(printf '%s' "$iso_hash" | cut -c1-12).iso
+    inspect_iso_artifact "$build_root" "${iso_in_root#$build_root}"
+    require_file "$build_root/export/iso-audit.json"
+    grep -F "\"iso_sha256\": \"$iso_hash\"" "$build_root/export/iso-audit.json" >/dev/null \
+        || fail ISO_AUDIT_HASH_MISMATCH "decoded audit does not identify the settled ISO bytes"
+    grep -F '"result": "pass"' "$build_root/export/iso-audit.json" >/dev/null \
+        || fail ISO_AUDIT_RESULT_INVALID "decoded audit is not a successful result"
     cp "$iso_in_root" "$EXPORT_ROOT/$iso_name"
+    cp "$build_root/export/iso-audit.json" "$EXPORT_ROOT/iso-audit.json"
+    printf '%s  %s\n' "$iso_hash" "$iso_name" > "$EXPORT_ROOT/SHA256SUMS"
     chroot "$build_root" /usr/bin/xorriso -indev "${iso_in_root#$build_root}" -pvd_info > "$EXPORT_ROOT/boot-layout.txt"
     chroot "$build_root" /usr/bin/xorriso -indev "${iso_in_root#$build_root}" -report_el_torito plain >> "$EXPORT_ROOT/boot-layout.txt"
     chroot "$build_root" /usr/bin/xorriso -indev "${iso_in_root#$build_root}" -report_el_torito as_mkisofs >> "$EXPORT_ROOT/boot-layout.txt"
@@ -643,6 +786,11 @@ build_from_local() {
     builder_bytes=$(file_bytes "$EXPORT_ROOT/builder-packages.lock")
     apk_hashes_hash=$(sha256_file "$EXPORT_ROOT/apk-files.sha256")
     apk_hashes_bytes=$(file_bytes "$EXPORT_ROOT/apk-files.sha256")
+    audit_hash=$(sha256_file "$EXPORT_ROOT/iso-audit.json")
+    audit_bytes=$(file_bytes "$EXPORT_ROOT/iso-audit.json")
+    checksums_hash=$(sha256_file "$EXPORT_ROOT/SHA256SUMS")
+    checksums_bytes=$(file_bytes "$EXPORT_ROOT/SHA256SUMS")
+    inspection_hash=$(sha256_file "$inspection_file")
     iso_bytes=$(file_bytes "$EXPORT_ROOT/$iso_name")
     main_hash=$(repository_value main apkindex_sha256)
     community_hash=$(repository_value community apkindex_sha256)
@@ -678,9 +826,12 @@ $(cat "$trusted_key_items")
   "inspection_commands": [
 $(cat "$inspection_file")
   ],
+  "inspection_toolchain_sha256": "$inspection_hash",
   "offline_install": {"repositories": ["file:///repo"], "apk_no_network": true, "network_disabled": true, "complete_manifest_verified": true},
   "artifacts": [
-    {"role": "bootstrap_iso", "file": "$iso_name", "sha256": "$iso_hash", "bytes": $iso_bytes}
+    {"role": "bootstrap_iso", "file": "$iso_name", "sha256": "$iso_hash", "bytes": $iso_bytes},
+    {"role": "decoded_iso_audit", "file": "iso-audit.json", "sha256": "$audit_hash", "bytes": $audit_bytes},
+    {"role": "iso_checksums", "file": "SHA256SUMS", "sha256": "$checksums_hash", "bytes": $checksums_bytes}
   ]
 }
 EOF
