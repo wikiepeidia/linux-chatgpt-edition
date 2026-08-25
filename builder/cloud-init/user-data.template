@@ -7,6 +7,7 @@ users:
     groups: [wheel]
     shell: /bin/ash
     lock_passwd: false
+    hashed_passwd: '$6$8fez.9b7L58w.azw$E3qoh7VXOJ3B.jwYNJCsWTOqHfHA/m14bJwtLUUP27qc0vf.joaQ9WLC7K8.7DYNjgxCEZvKErJzHZ4F7KqDe/'
     ssh_authorized_keys:
       - @@SSH_PUBLIC_KEY@@
 write_files:
@@ -43,9 +44,15 @@ runcmd:
       chown -R builder:builder "$cache_root"
       rc-service sshd restart
       host_key=/etc/ssh/ssh_host_ed25519_key.pub
+      authorized_key=/home/builder/.ssh/authorized_keys
+      account_status=$(passwd -S builder | awk '{print $2}')
+      test "$account_status" = P
+      test -s "$authorized_key"
+      management_fingerprint=$(ssh-keygen -E sha256 -lf "$authorized_key" | awk '{print $2}')
       key_type=$(awk '{print $1}' "$host_key")
       key_data=$(awk '{print $2}' "$host_key")
       fingerprint=$(ssh-keygen -E sha256 -lf "$host_key" | awk '{print $2}')
       test "$key_type" = ssh-ed25519
       printf '300K_SSH_HOST_KEY %s %s %s\n' "$key_type" "$key_data" "$fingerprint" > /dev/ttyS0
+      printf '300K_MANAGEMENT_KEY %s %s\n' "$account_status" "$management_fingerprint" > /dev/ttyS0
       printf '%s\n' 300K_SSH_READY > /dev/ttyS0

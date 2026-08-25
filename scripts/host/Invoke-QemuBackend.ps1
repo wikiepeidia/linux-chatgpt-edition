@@ -617,6 +617,16 @@ function Invoke-QemuBackend {
             Test-QemuSshFingerprint -KeyType $keyType -PublicKey $key -Fingerprint $fingerprint -ScratchDirectory $runRoot -SshKeygenPath $sshKeygenPath
         }.GetNewClosure()
         $serialTrust = Wait-QemuSerialHostKey -Lease $qemuLease -SerialPath $serialPath -VerifyFingerprint $verifyFingerprint -TimeoutSeconds $BootTimeoutSeconds
+        $managementFingerprintResult = Invoke-CheckedProcess -FilePath $sshKeygenPath -ArgumentList @('-E', 'sha256', '-lf', "$identityPath.pub") -TimeoutSeconds 30
+        $managementFingerprintMatch = [regex]::Match($managementFingerprintResult.StandardOutput, 'SHA256:[A-Za-z0-9+/]+={0,2}')
+        if (-not $managementFingerprintMatch.Success) {
+            throw (New-QemuException -Code 'QEMU_MANAGEMENT_KEY_INVALID' -Message 'The ephemeral management public-key fingerprint is malformed.')
+        }
+        $managementMilestone = "300K_MANAGEMENT_KEY P $($managementFingerprintMatch.Value)"
+        $managementMilestoneCount = @(Read-SharedTextLines -Path $serialPath | Where-Object { $_ -ceq $managementMilestone }).Count
+        if ($managementMilestoneCount -ne 1) {
+            throw (New-QemuException -Code 'SERIAL_MANAGEMENT_KEY_MISMATCH' -Message 'Serial evidence did not prove one unlocked account with the exact ephemeral management key.')
+        }
         [System.IO.File]::WriteAllText(
             $knownHostsPath,
             "[127.0.0.1]:$($sshReservation.Port) $($serialTrust.KeyType) $($serialTrust.PublicKey)`n",

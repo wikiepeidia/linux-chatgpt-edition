@@ -288,8 +288,10 @@ Add-TestCase -Name 'BUILD-04 NoCloud templates are public-only and emit the orde
     Assert-Match -Value $user -Pattern 'PasswordAuthentication\s+no'
     Assert-Match -Value $user -Pattern 'KbdInteractiveAuthentication\s+no'
     Assert-Match -Value $user -Pattern 'lock_passwd:\s*false'
+    Assert-Match -Value $user -Pattern 'hashed_passwd:\s*''\$6\$[A-Za-z0-9./]+\$[A-Za-z0-9./]+'''
     Assert-Match -Value $user -Pattern 'AuthenticationMethods\s+publickey'
     Assert-Match -Value $user -Pattern 'PermitEmptyPasswords\s+no'
+    Assert-Match -Value $user -Pattern '300K_MANAGEMENT_KEY'
     Assert-False -Condition ([bool]($meta + $user -match '(?i)BEGIN .*PRIVATE KEY|password:\s*[^!]|token:\s*\S+')) -Message 'NoCloud templates contain secret-bearing material.'
 }
 
