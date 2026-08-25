@@ -616,10 +616,13 @@ inspect_archive_members() {
     tab=$(printf '\t')
     while IFS="$tab" read -r id type size member target; do
         [ "$type" = f ] || continue
-        materialized=$(stream_regular_member "$kind" "$archive" "$member" "$size")
-        scan_regular_bytes "$materialized" "$logical/$member"
-        role=$(role_for_path "$member")
-        inspect_file "$materialized" "$logical/$member" $((depth + 1)) "$role"
+        (
+            materialized=$(stream_regular_member "$kind" "$archive" "$member" "$size")
+            member_logical=$logical/$member
+            scan_regular_bytes "$materialized" "$member_logical"
+            role=$(role_for_path "$member")
+            inspect_file "$materialized" "$member_logical" $((depth + 1)) "$role"
+        )
     done < "$manifest"
 }
 
