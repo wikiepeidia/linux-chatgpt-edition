@@ -154,6 +154,24 @@ inspection_array_first() {
     ' "$INPUTS_FILE"
 }
 
+inspection_evidence_value() {
+    evidence=$1
+    format=$2
+    field=$3
+    awk -v object="\"format\": \"$format\"" -v wanted="\"$field\"" '
+        index($0, object) { inside=1 }
+        inside && index($0, wanted) {
+            line=$0
+            sub(/^[^:]*:[[:space:]]*/, "", line)
+            sub(/[[:space:]]*,?[[:space:]]*$/, "", line)
+            gsub(/^"|"$/, "", line)
+            print line
+            exit
+        }
+        inside && /^[[:space:]]*}[,]?[[:space:]]*$/ { exit }
+    ' "$evidence"
+}
+
 json_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g'
 }
@@ -628,6 +646,37 @@ inspect_iso_artifact() {
         || fail ISO_DECODE_AUDIT_FAILED "settled ISO failed recursive decoded-content inspection"
 }
 
+append_iso_report() {
+    root=$1
+    iso=$2
+    evidence=$3
+    output=$4
+    label=$5
+    shift 5
+    report=$root/work/boot-layout-$label.stdout
+    errors=$root/work/boot-layout-$label.stderr
+    status=0
+    chroot "$root" /usr/bin/xorriso -report_about WARNING -indev "$iso" "$@" \
+        > "$report" 2> "$errors" || status=$?
+    expected_banner=$(inspection_evidence_value "$evidence" iso version)
+    [ -n "$expected_banner" ] \
+        || fail BOOT_LAYOUT_TOOLCHAIN_MISSING "$label lacks locked xorriso version evidence"
+    banner_count=$(grep -Fxc -- "$expected_banner" "$errors" 2>/dev/null || true)
+    [ "$banner_count" -le 1 ] \
+        || fail BOOT_LAYOUT_REPORT_STDERR "$label emitted duplicate xorriso startup banners"
+    filtered=$errors.filtered
+    grep -Fvx -- "$expected_banner" "$errors" > "$filtered" || true
+    [ ! -s "$filtered" ] \
+        || fail BOOT_LAYOUT_REPORT_STDERR "$label emitted non-banner xorriso stderr"
+    if [ "$status" -ne 0 ]; then
+        detail=$(tail -n 5 "$report" | tr -cd '[:alnum:] ._+:/()=-\n' | tr '\n' ' ' | cut -c1-320)
+        [ -n "$detail" ] || detail=no-result-channel-diagnostic
+        fail BOOT_LAYOUT_REPORT_FAILED "$label exited $status: $detail"
+    fi
+    require_file "$report"
+    cat "$report" >> "$output"
+}
+
 build_from_local() {
     grep -F '"schema": "BuildRequest"' "$REQUEST_FILE" >/dev/null || fail BUILD_REQUEST_INVALID "expected BuildRequest"
     require_file "$WORK_ROOT/repository-object-id"
@@ -784,10 +833,13 @@ build_from_local() {
     cp "$iso_in_root" "$EXPORT_ROOT/$iso_name"
     cp "$build_root/export/iso-audit.json" "$EXPORT_ROOT/iso-audit.json"
     printf '%s  %s\n' "$iso_hash" "$iso_name" > "$EXPORT_ROOT/SHA256SUMS"
-    chroot "$build_root" /usr/bin/xorriso -indev "${iso_in_root#$build_root}" -pvd_info > "$EXPORT_ROOT/boot-layout.txt"
-    chroot "$build_root" /usr/bin/xorriso -indev "${iso_in_root#$build_root}" -report_el_torito plain >> "$EXPORT_ROOT/boot-layout.txt"
-    chroot "$build_root" /usr/bin/xorriso -indev "${iso_in_root#$build_root}" -report_el_torito as_mkisofs >> "$EXPORT_ROOT/boot-layout.txt"
-    chroot "$build_root" /usr/bin/xorriso -indev "${iso_in_root#$build_root}" -report_system_area plain >> "$EXPORT_ROOT/boot-layout.txt"
+    boot_layout=$EXPORT_ROOT/boot-layout.txt
+    : > "$boot_layout.partial"
+    append_iso_report "$build_root" "${iso_in_root#$build_root}" "$inspection_file" "$boot_layout.partial" pvd-info -pvd_info
+    append_iso_report "$build_root" "${iso_in_root#$build_root}" "$inspection_file" "$boot_layout.partial" el-torito-plain -report_el_torito plain
+    append_iso_report "$build_root" "${iso_in_root#$build_root}" "$inspection_file" "$boot_layout.partial" el-torito-mkisofs -report_el_torito as_mkisofs
+    append_iso_report "$build_root" "${iso_in_root#$build_root}" "$inspection_file" "$boot_layout.partial" system-area -report_system_area plain
+    mv "$boot_layout.partial" "$boot_layout"
     require_file "$EXPORT_ROOT/boot-layout.txt"
 
     builder_hash=$(sha256_file "$EXPORT_ROOT/builder-packages.lock")
