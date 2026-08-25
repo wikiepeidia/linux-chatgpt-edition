@@ -61,7 +61,8 @@
     "xz=5.8.3-r0",
     "zstd=1.5.7-r2",
     "lz4=1.10.0-r1",
-    "cpio=2.15-r0"
+    "cpio=2.15-r0",
+    "tar=1.35-r5"
   ],
   "requested_image_packages": [
     "alpine-base",
@@ -138,11 +139,11 @@
       "version_argv": ["/usr/bin/xorriso", "-version"]
     },
     "tar": {
-      "package": "busybox=1.37.0-r31",
+      "package": "tar=1.35-r5",
       "command": "/bin/tar",
       "decoder": ["/bin/tar", "-xOf"],
       "fixture_encoder": ["/bin/tar", "-cf"],
-      "version_argv": ["/bin/busybox"]
+      "version_argv": ["/bin/tar", "--version"]
     },
     "apk": {
       "package": "apk-tools=3.0.7-r0",

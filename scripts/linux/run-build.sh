@@ -551,7 +551,6 @@ record_inspection_command() {
     printf '%s' "$ownership" | grep -F "$expected_owner" >/dev/null || fail INSPECTION_OWNER_MISMATCH "$format command ownership mismatch"
     case "$format" in
         squashfs|iso) version=$(chroot "$root" "$command_path" -version 2>&1 | head -n 1 | tr -cd '[:alnum:] ._+:/()-') ;;
-        tar) version=$(chroot "$root" /bin/busybox 2>&1 | head -n 1 | tr -cd '[:alnum:] ._+:/()-') ;;
         *) version=$(chroot "$root" "$command_path" --version 2>&1 | head -n 1 | tr -cd '[:alnum:] ._+:/()-') ;;
     esac
     [ -n "$version" ] || fail INSPECTION_VERSION_MISSING "$format version output is empty"
