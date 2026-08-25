@@ -385,6 +385,9 @@ function Publish-BuildArtifacts {
     if (-not [System.IO.File]::Exists($lockPath)) { throw (New-BuildException -Code 'BUILD_OUTPUT_MISSING' -Message 'resolved-build-lock.json is absent.') }
     $lock = Get-Content -Raw -LiteralPath $lockPath | ConvertFrom-Json -Depth 64
     [void](Test-ResolvedBuildLock -Lock $lock -ExpectedBuildRequestSha256 $BuildRequestHash)
+    if (-not [bool]$BackendResult.CleanupComplete) {
+        throw (New-BuildException -Code 'QEMU_CLEANUP_INCOMPLETE' -Message 'QEMU cleanup did not complete, so artifact publication is forbidden.')
+    }
 
     foreach ($recordName in @('builder_packages_record', 'apk_files_record')) {
         $record = Get-ObjectProperty -Object $lock -Name $recordName
@@ -412,11 +415,12 @@ function Publish-BuildArtifacts {
         guest_os = 'linux'
         guest_arch = 'x86_64'
         alpine_release = '3.24.1'
+        qemu_cloud_image_sha512 = $BackendResult.CloudImageSha512
         docker_status = $DockerProbe.status
         docker_reason = $DockerProbe.reason
         serial_host_fingerprint = $BackendResult.SerialFingerprint
         live_management_stages = @($BackendResult.ManagementStages)
-        cleanup_complete = $true
+        cleanup_complete = [bool]$BackendResult.CleanupComplete
         source_commit = $SourceCommit
     }
     Write-CanonicalJson -Value $environment -Path (Join-Path $StagingDirectory 'environment-report.json')
@@ -424,9 +428,9 @@ function Publish-BuildArtifacts {
     $allowedFiles = @(
         'build-request.json', 'resolved-build-lock.json', 'builder-packages.lock', 'apk-files.sha256',
         $isoName, 'boot-layout.txt', 'qemu-image-info.json', 'environment-report.json',
-        'serial-evidence.log', 'repository-evidence.json'
+        'serial-evidence.log', 'repository-evidence.json', 'resource-inventory.json'
     )
-    foreach ($required in @('resolved-build-lock.json', 'builder-packages.lock', 'apk-files.sha256', $isoName, 'boot-layout.txt', 'qemu-image-info.json', 'environment-report.json', 'serial-evidence.log')) {
+    foreach ($required in @('resolved-build-lock.json', 'builder-packages.lock', 'apk-files.sha256', $isoName, 'boot-layout.txt', 'qemu-image-info.json', 'environment-report.json', 'serial-evidence.log', 'resource-inventory.json')) {
         if (-not [System.IO.File]::Exists((Join-Path $StagingDirectory $required))) { throw (New-BuildException -Code 'BUILD_EVIDENCE_MISSING' -Message "Required evidence '$required' is absent.") }
     }
 
@@ -528,13 +532,29 @@ function Invoke-300kBuild {
     [System.IO.Directory]::CreateDirectory($backendExport) | Out-Null
 
     if ($InitializeKey) {
+        $secretRoot = Join-Path $state 'secrets\apk'
+        $existingIdentityPath = Join-Path $secretRoot 'signing-public.json'
+        if (
+            [System.IO.File]::Exists($existingIdentityPath) -and
+            [System.IO.File]::Exists((Join-Path $secretRoot '300k.rsa')) -and
+            [System.IO.File]::Exists((Join-Path $secretRoot '300k.rsa.pub'))
+        ) {
+            $existingIdentity = Get-Content -Raw -LiteralPath $existingIdentityPath | ConvertFrom-Json
+            [void](Test-SigningPublicIdentity -SigningPublic $existingIdentity -BaseDirectory $secretRoot)
+            return [pscustomobject]@{
+                status = 'signing-key-already-initialized'
+                backend = 'qemu'
+                signing_public_file = 'signing-public.json'
+                signing_public_sha256 = $existingIdentity.public_key_sha256
+                cleanup_complete = $true
+            }
+        }
         $request = New-KeyInitRequest -Inputs $inputs -RunNonce $runNonce
         $requestPath = Join-Path $runRoot 'key-init-request.json'
         Write-CanonicalJson -Value $request -Path $requestPath
         $result = Invoke-QemuBackend -Operation init-signing-key -QemuRoot $SelectedQemuRoot -StateRoot $state -RunId $runNonce `
             -RequestFile $requestPath -SourceArchive $sourceArchive -ExportDirectory $backendExport `
             -CloudImageUri ([uri]$inputs.qemu.cloud_image_url) -CloudImageSha512 $inputs.qemu.cloud_image_sha512 -CacheIdentity $cacheIdentity
-        $secretRoot = Join-Path $state 'secrets\apk'
         [System.IO.Directory]::CreateDirectory($secretRoot) | Out-Null
         foreach ($name in @('300k.rsa', '300k.rsa.pub', 'signing-public.json')) {
             $generated = Join-Path $backendExport $name

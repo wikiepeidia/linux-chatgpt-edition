@@ -405,7 +405,7 @@ function Invoke-QemuScp {
 function Write-SanitizedSerialEvidence {
     param([string] $SerialPath, [string] $EvidencePath)
     $allowed = if ([System.IO.File]::Exists($SerialPath)) {
-        @([System.IO.File]::ReadAllLines($SerialPath) | Where-Object { $_ -match '^300K_[A-Z0-9_]+(?:\s+[A-Za-z0-9_./:+-]+)*$' })
+        @([System.IO.File]::ReadAllLines($SerialPath) | Where-Object { $_ -match '^300K_[A-Z0-9_]+(?:\s+[A-Za-z0-9_./:+=-]+)*$' })
     }
     else { @() }
     [System.IO.File]::WriteAllText($EvidencePath, (($allowed -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
@@ -435,8 +435,17 @@ function Invoke-QemuBackend {
     $serialTrust = $null
     $managementStages = [System.Collections.Generic.List[string]]::new()
     $cleanupError = $null
+    $operationError = $null
+    $serialPath = $null
+    $identityPath = $null
+    $knownHostsPath = $null
+    $overlayPath = $null
+    $seedServer = $null
+    $sshReservation = $null
+    $resultObject = $null
     $runRoot = [System.IO.Path]::GetFullPath((Join-Path $StateRoot "state\runs\$RunId"))
     $evidenceDirectory = [System.IO.Path]::GetFullPath($ExportDirectory)
+    $serialEvidencePath = Join-Path $evidenceDirectory 'serial-evidence.log'
     [System.IO.Directory]::CreateDirectory($evidenceDirectory) | Out-Null
 
     try {
@@ -572,14 +581,14 @@ function Invoke-QemuBackend {
         [void](Wait-CheckedProcessLease -Lease $qemuLease -TimeoutSeconds 90 -AllowNonZero)
         $managementStages.Add('shutdown-complete')
 
-        $serialEvidencePath = Join-Path $evidenceDirectory 'serial-evidence.log'
         Write-SanitizedSerialEvidence -SerialPath $serialPath -EvidencePath $serialEvidencePath
-        return [pscustomobject]@{
+        $resultObject = [pscustomobject]@{
             SchemaVersion       = 1
             Backend             = 'qemu'
             GuestOs            = 'linux'
             GuestArch          = 'x86_64'
             AlpineRelease      = '3.24.1'
+            CloudImageSha512   = $CloudImageSha512
             SerialFingerprint  = $serialTrust.Fingerprint
             QemuLeaseProcessId = $qemuLease.Process.Id
             ManagementStages   = $managementStages.ToArray()
@@ -587,15 +596,49 @@ function Invoke-QemuBackend {
             SerialEvidenceFile = [System.IO.Path]::GetFileName($serialEvidencePath)
             CleanupComplete    = $false
         }
+        return $resultObject
+    }
+    catch {
+        $operationError = $_.Exception
+        throw
     }
     finally {
         try {
             if ($null -ne $qemuLease -and -not $qemuLease.Closed -and -not $qemuLease.Process.HasExited) {
                 Stop-CheckedProcessLease -Lease $qemuLease -TimeoutSeconds 20
             }
-            Close-QemuResourceOwner -Owner $owner
         }
         catch { $cleanupError = $_.Exception }
-        if ($null -ne $cleanupError -and $null -eq $Error[0]) { throw $cleanupError }
+        try {
+            if ($null -ne $serialPath -and [System.IO.File]::Exists($serialPath)) {
+                Write-SanitizedSerialEvidence -SerialPath $serialPath -EvidencePath $serialEvidencePath
+            }
+        }
+        catch { if ($null -eq $cleanupError) { $cleanupError = $_.Exception } }
+        try {
+            Close-QemuResourceOwner -Owner $owner
+        }
+        catch { if ($null -eq $cleanupError) { $cleanupError = $_.Exception } }
+
+        $inventory = [ordered]@{
+            schema_version = 1
+            cleanup_complete = ($null -eq $cleanupError -and -not [System.IO.Directory]::Exists($runRoot))
+            resources = [ordered]@{
+                qemu_lease_live = ($null -ne $qemuLease -and -not $qemuLease.Closed)
+                seed_listener_live = ($null -ne $cleanupError -and $null -ne $seedServer)
+                port_reservation_live = ($null -ne $sshReservation -and -not $sshReservation.Released)
+                ssh_identity_present = ($null -ne $identityPath -and [System.IO.File]::Exists($identityPath))
+                known_hosts_present = ($null -ne $knownHostsPath -and [System.IO.File]::Exists($knownHostsPath))
+                overlay_present = ($null -ne $overlayPath -and [System.IO.File]::Exists($overlayPath))
+                management_scratch_present = [System.IO.Directory]::Exists($runRoot)
+            }
+        }
+        [System.IO.File]::WriteAllText(
+            (Join-Path $evidenceDirectory 'resource-inventory.json'),
+            (($inventory | ConvertTo-Json -Depth 8 -Compress) + "`n"),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        if ($null -ne $resultObject) { $resultObject.CleanupComplete = $inventory.cleanup_complete }
+        if ($null -ne $cleanupError -and $null -eq $operationError) { throw $cleanupError }
     }
 }

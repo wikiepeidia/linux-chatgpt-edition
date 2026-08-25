@@ -78,7 +78,7 @@ function Assert-ThrowsCode {
     throw "Expected exception code '$Code', but no exception was thrown."
 }
 
-if ($Scope -in @('Unit', 'All')) {
+if ($Scope -in @('Unit', 'Qemu', 'All')) {
     foreach ($relativeScript in @(
         'scripts/host/Invoke-CheckedProcess.ps1',
         'scripts/host/Invoke-QemuBackend.ps1'
@@ -425,7 +425,126 @@ Add-TestCase -Name 'BUILD-04 Linux core owns package/profile decisions and the Q
 
 if ($Scope -in @('Qemu', 'All')) {
     Add-TestCase -Name 'BUILD-04 real clean-tree QEMU tracer' -Scopes @('Qemu') -Requirements @('BUILD-04') -Body {
-        throw 'QEMU_SCOPE_NOT_IMPLEMENTED'
+        $gitPath = (Get-Command git.exe -CommandType Application -ErrorAction Stop).Source
+        $cleanBefore = Invoke-CheckedProcess -FilePath $gitPath -ArgumentList @('status', '--porcelain', '--untracked-files=all') -WorkingDirectory $script:RepositoryRoot -TimeoutSeconds 30
+        Assert-True -Condition ([string]::IsNullOrEmpty($cleanBefore.StandardOutput)) -Message "QEMU tracer requires an empty source tree before any external mutation.`n$($cleanBefore.StandardOutput)"
+
+        $qemuExe = Join-Path $QemuRoot 'qemu-system-x86_64.exe'
+        $qemuImg = Join-Path $QemuRoot 'qemu-img.exe'
+        Assert-True -Condition ([System.IO.File]::Exists($qemuExe)) -Message "QEMU system emulator is missing: $qemuExe"
+        Assert-True -Condition ([System.IO.File]::Exists($qemuImg)) -Message "QEMU image tool is missing: $qemuImg"
+
+        $stateRoot = [System.IO.Path]::GetFullPath((Join-Path ([System.IO.Path]::GetTempPath()) '300k-linux-phase1-tracer'))
+        $repositoryBoundary = $script:RepositoryRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+        Assert-False -Condition ($stateRoot.StartsWith($repositoryBoundary, [System.StringComparison]::OrdinalIgnoreCase)) -Message 'QEMU tracer state must resolve outside the repository.'
+
+        $head = Invoke-CheckedProcess -FilePath $gitPath -ArgumentList @('rev-parse', 'HEAD') -WorkingDirectory $script:RepositoryRoot -TimeoutSeconds 30
+        $sourceCommit = $head.StandardOutput.Trim()
+        Assert-Match -Value $sourceCommit -Pattern '^[0-9a-f]{40}$' -Message 'Clean source commit is malformed.'
+
+        $pwshPath = (Get-Command pwsh.exe -CommandType Application -ErrorAction Stop).Source
+        $buildEntry = Join-Path $script:RepositoryRoot 'build.ps1'
+        $commonArguments = @(
+            '-NoProfile', '-File', $buildEntry,
+            '-Backend', 'Auto',
+            '-Target', 'Bootstrap',
+            '-StateRoot', $stateRoot,
+            '-QemuRoot', ([System.IO.Path]::GetFullPath($QemuRoot))
+        )
+
+        $initialization = Invoke-CheckedProcess -FilePath $pwshPath -ArgumentList ($commonArguments + '-InitializeSigningKey') -WorkingDirectory $script:RepositoryRoot -TimeoutSeconds 5400
+        Assert-Equal -Expected 0 -Actual $initialization.ExitCode -Message 'Signing-key initialization child failed.'
+        Assert-Match -Value $initialization.StandardOutput -Pattern 'signing-key-(?:already-)?initialized' -Message 'Initialization child returned no successful result.'
+
+        $build = Invoke-CheckedProcess -FilePath $pwshPath -ArgumentList ($commonArguments + '-Clean') -WorkingDirectory $script:RepositoryRoot -TimeoutSeconds 14400
+        Assert-Equal -Expected 0 -Actual $build.ExitCode -Message 'QEMU build child failed.'
+
+        $latestPath = Join-Path $script:RepositoryRoot 'dist\LATEST.json'
+        Assert-True -Condition ([System.IO.File]::Exists($latestPath)) -Message 'QEMU build did not publish dist/LATEST.json.'
+        $latest = Get-Content -Raw -LiteralPath $latestPath | ConvertFrom-Json -Depth 32
+        Assert-Match -Value $latest.build_id -Pattern '^p01-[0-9a-f]{12}$' -Message 'Published build ID is not request-hash-qualified.'
+        Assert-Match -Value $latest.iso_file -Pattern '^300k-bootstrap-x86_64-[0-9a-f]{12}\.iso$' -Message 'Published ISO name is not hash-qualified.'
+        Assert-Match -Value $latest.iso_sha256 -Pattern '^[0-9a-f]{64}$' -Message 'Published ISO SHA-256 is malformed.'
+        Assert-True -Condition ([long]$latest.iso_bytes -gt 0) -Message 'Published ISO is empty.'
+
+        $artifactRoot = Join-Path $script:RepositoryRoot (Join-Path 'dist' $latest.directory)
+        foreach ($name in @(
+            'build-request.json', 'resolved-build-lock.json', 'builder-packages.lock', 'apk-files.sha256',
+            $latest.iso_file, 'boot-layout.txt', 'qemu-image-info.json', 'environment-report.json',
+            'serial-evidence.log', 'repository-evidence.json', 'resource-inventory.json', 'artifact-manifest.json'
+        )) {
+            $path = Join-Path $artifactRoot $name
+            Assert-True -Condition ([System.IO.File]::Exists($path)) -Message "Required QEMU evidence is absent: $name"
+            Assert-True -Condition ((Get-Item -LiteralPath $path).Length -gt 0) -Message "Required QEMU evidence is empty: $name"
+        }
+
+        $isoPath = Join-Path $artifactRoot $latest.iso_file
+        $isoHash = (Get-FileHash -LiteralPath $isoPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        Assert-Equal -Expected $latest.iso_sha256 -Actual $isoHash -Message 'Published ISO bytes do not match LATEST.json.'
+        Assert-Equal -Expected ([long]$latest.iso_bytes) -Actual ([long](Get-Item -LiteralPath $isoPath).Length) -Message 'Published ISO size does not match LATEST.json.'
+
+        $requestPath = Join-Path $artifactRoot 'build-request.json'
+        $request = Get-Content -Raw -LiteralPath $requestPath | ConvertFrom-Json -Depth 64
+        $requestHash = (Get-FileHash -LiteralPath $requestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $lock = Get-Content -Raw -LiteralPath (Join-Path $artifactRoot 'resolved-build-lock.json') | ConvertFrom-Json -Depth 64
+        Assert-Equal -Expected $requestHash -Actual $lock.build_request_sha256 -Message 'Guest ResolvedBuildLock belongs to a different BuildRequest.'
+        Assert-Equal -Expected $sourceCommit -Actual $request.source.git_commit -Message 'Build evidence does not preserve the clean source commit.'
+        Assert-False -Condition ([bool]$request.source.dirty) -Message 'BuildRequest marked the committed source dirty.'
+        Assert-Match -Value $lock.repository_object_id -Pattern '^[0-9a-f]{64}$' -Message 'Content-addressed repository ID is malformed.'
+        Assert-True -Condition ([bool]$lock.offline_install.apk_no_network) -Message 'Resolved lock does not prove apk --no-network.'
+        Assert-True -Condition ([bool]$lock.offline_install.network_disabled) -Message 'Resolved lock does not prove networking was disabled before assembly.'
+        Assert-True -Condition ([bool]$lock.offline_install.complete_manifest_verified) -Message 'Resolved lock does not prove complete manifest verification.'
+        Assert-Equal -Expected @('file:///repo') -Actual @($lock.offline_install.repositories) -Message 'Offline build consumed a non-local repository.'
+
+        $expectedFormats = @('gzip', 'xz', 'zstd', 'lz4', 'cpio', 'squashfs', 'iso')
+        $commands = @($lock.inspection_commands)
+        Assert-Equal -Expected $expectedFormats.Count -Actual $commands.Count -Message 'Resolved lock has an incomplete inspection command set.'
+        Assert-Equal -Expected $expectedFormats -Actual @($commands.format) -Message 'Resolved lock inspection formats differ from public input.'
+        foreach ($command in $commands) {
+            Assert-Match -Value $command.package -Pattern '^[a-z0-9+_.-]+=[0-9][A-Za-z0-9._-]*-r\d+$' -Message 'Inspection package is not exactly pinned.'
+            Assert-Match -Value $command.command -Pattern '^/' -Message 'Inspection command is not an exact absolute path.'
+            Assert-Match -Value $command.command_sha256 -Pattern '^[0-9a-f]{64}$' -Message 'Inspection command hash is malformed.'
+            Assert-True -Condition (-not [string]::IsNullOrWhiteSpace($command.version)) -Message 'Inspection command version is absent.'
+            foreach ($field in @('package_ownership_verified', 'path_verified', 'round_trip_verified')) {
+                Assert-True -Condition ([bool]$command.$field) -Message "Inspection command '$($command.format)' did not prove $field."
+            }
+        }
+
+        $repository = Get-Content -Raw -LiteralPath (Join-Path $artifactRoot 'repository-evidence.json') | ConvertFrom-Json -Depth 32
+        Assert-Equal -Expected $requestHash -Actual $repository.build_request_sha256 -Message 'Repository evidence belongs to a different request.'
+        Assert-Equal -Expected $lock.repository_object_id -Actual $repository.repository_object_id -Message 'Repository evidence names a different content object.'
+        Assert-True -Condition ([long]$repository.apk_count -gt 0) -Message 'Retained repository contains no APKs.'
+        foreach ($field in @('official_indexes_verified', 'official_signatures_verified', 'content_addressed_snapshot_verified')) {
+            Assert-True -Condition ([bool]$repository.$field) -Message "Repository evidence did not prove $field."
+        }
+
+        $environment = Get-Content -Raw -LiteralPath (Join-Path $artifactRoot 'environment-report.json') | ConvertFrom-Json -Depth 32
+        Assert-Equal -Expected 'qemu' -Actual $environment.backend
+        Assert-Equal -Expected 'executed' -Actual $environment.backend_status
+        Assert-Equal -Expected 'linux' -Actual $environment.guest_os
+        Assert-Equal -Expected 'x86_64' -Actual $environment.guest_arch
+        Assert-Equal -Expected '3.24.1' -Actual $environment.alpine_release
+        Assert-Equal -Expected '8d756f6fc7653daa4fb4e2e213d8a66007bcb1e5a846e28891af62c47b90685c694486c2746099ad99e9e8f5278db76b69d11dfe1e9361aa4c8406df16929a9c' -Actual $environment.qemu_cloud_image_sha512
+        Assert-Equal -Expected 'unverified-unavailable' -Actual $environment.docker_status -Message 'Absent Docker daemon was not recorded honestly.'
+        Assert-Equal -Expected $sourceCommit -Actual $environment.source_commit
+        Assert-Match -Value $environment.serial_host_fingerprint -Pattern '^SHA256:[A-Za-z0-9+/]+$' -Message 'Serial-derived SSH fingerprint is malformed.'
+        Assert-True -Condition ([bool]$environment.cleanup_complete) -Message 'Environment report does not prove QEMU cleanup.'
+        foreach ($stage in @('ssh-readiness-live', 'prepare-guest-live', 'input-transfer-live', 'private-key-tmpfs-live', 'prepare-repository-and-build-live', 'artifact-export-live', 'shutdown-complete')) {
+            Assert-True -Condition (@($environment.live_management_stages) -ccontains $stage) -Message "Owned QEMU lease was not proven live at '$stage'."
+        }
+
+        $serial = Get-Content -Raw -LiteralPath (Join-Path $artifactRoot 'serial-evidence.log')
+        Assert-Match -Value $serial -Pattern '(?m)^300K_SSH_HOST_KEY ssh-ed25519 [A-Za-z0-9+/]+=* SHA256:[A-Za-z0-9+/]+$' -Message 'Sanitized serial evidence lacks the accepted SSH trust milestone.'
+        Assert-Match -Value $serial -Pattern '(?m)^300K_BUILD_COMPLETE [0-9a-f]{64}$' -Message 'Sanitized serial evidence lacks the real build completion milestone.'
+
+        $inventory = Get-Content -Raw -LiteralPath (Join-Path $artifactRoot 'resource-inventory.json') | ConvertFrom-Json -Depth 16
+        Assert-True -Condition ([bool]$inventory.cleanup_complete) -Message 'Resource inventory reports incomplete cleanup.'
+        foreach ($property in $inventory.resources.PSObject.Properties) {
+            Assert-False -Condition ([bool]$property.Value) -Message "Owned QEMU resource '$($property.Name)' remains after the tracer."
+        }
+
+        $cleanAfter = Invoke-CheckedProcess -FilePath $gitPath -ArgumentList @('status', '--porcelain', '--untracked-files=all') -WorkingDirectory $script:RepositoryRoot -TimeoutSeconds 30
+        Assert-True -Condition ([string]::IsNullOrEmpty($cleanAfter.StandardOutput)) -Message "QEMU tracer dirtied the source tree.`n$($cleanAfter.StandardOutput)"
     }
 }
 
