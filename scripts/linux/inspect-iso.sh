@@ -367,8 +367,8 @@ stream_regular_member() {
     case "$kind" in
         iso9660)
             iso_command=$(tool_field iso command)
-            (ulimit -f "$blocks"; "$iso_command" -report_about WARNING -osirrox on:o_excl_on -indev "$container" -extract_single "/$member" "$partial") \
-                >/dev/null 2>"$error_log" || status=$?
+            (ulimit -f "$blocks"; "$iso_command" -report_about WARNING -indev "$container" -concat overwrite - "/$member" --) \
+                > "$partial" 2>"$error_log" || status=$?
             ;;
         tar|apk)
             tar_command=$(tool_field tar command)

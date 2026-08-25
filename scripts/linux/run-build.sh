@@ -169,7 +169,7 @@ require_public_contract() {
     grep -F '"zstd=1.5.7-r2"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "zstd pin missing"
     grep -F '"lz4=1.10.0-r1"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "lz4 pin missing"
     grep -F '"cpio=2.15-r0"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "cpio pin missing"
-    grep -F '"decoder": ["/usr/bin/xorriso", "-osirrox", "on:o_excl_on", "-indev"]' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "ISO decoder contract changed"
+    grep -F '"decoder": ["/usr/bin/xorriso", "-report_about", "WARNING", "-indev", "{container}", "-concat", "overwrite", "-", "/{member}", "--"]' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "ISO decoder contract changed"
     grep -F '"package": "tar=1.35-r5"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "tar decoder package pin missing"
     grep -F '"package": "apk-tools=3.0.7-r0"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "APK decoder package pin missing"
     grep -F '"max_depth": 8' "$INPUTS_FILE" >/dev/null || fail INPUT_INSPECTION_POLICY_INVALID "inspection depth policy changed"
@@ -510,7 +510,7 @@ verify_codec_round_trip() {
             mkdir -p "$root/tmp/iso-fixture"
             cp "$root$fixture" "$root/tmp/iso-fixture/payload"
             chroot "$root" "$encoder_path" -as mkisofs -quiet -output "$fixture.iso" /tmp/iso-fixture
-            chroot "$root" "$command_path" -osirrox on:o_excl_on -indev "$fixture.iso" -extract_single /payload "$fixture.out" >/dev/null 2>&1
+            chroot "$root" "$command_path" -report_about WARNING -indev "$fixture.iso" -concat overwrite - /payload -- > "$root$fixture.out" 2>/dev/null
             ;;
         tar)
             mkdir -p "$root/tmp/tar-fixture"
