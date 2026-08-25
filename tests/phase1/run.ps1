@@ -448,6 +448,7 @@ Add-TestCase -Name 'BUILD-04 Linux core owns package/profile decisions and the Q
     Assert-Match -Value $qemu -Pattern 'install -d -m 700 -o builder -g builder /inputs /run/300k-secrets' -Message 'Guest input and tmpfs transfer directories are not explicitly owned by the ephemeral builder.'
     Assert-Match -Value $qemu -Pattern 'builder@127\.0\.0\.1:/run/300k-secrets/300k\.rsa' -Message 'The private APK key is not transferred directly into guest tmpfs.'
     Assert-False -Condition ([bool]($qemu -match 'builder@127\.0\.0\.1:/inputs/300k\.rsa[''"]')) -Message 'The private APK key still crosses the disk-backed guest input directory.'
+    Assert-Match -Value $qemu -Pattern 'QEMU_SSH_FAILED.*SSH stage ''\$Stage'' failed' -Message 'Remote SSH failures do not retain their exact management stage.'
 }
 
 if ($Scope -in @('Qemu', 'All')) {

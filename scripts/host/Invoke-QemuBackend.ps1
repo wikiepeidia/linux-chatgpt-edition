@@ -460,7 +460,14 @@ function Invoke-QemuSshCommand {
     Test-QemuLeaseAlive -Lease $Lease -Stage $Stage
     $payload = @('builder@127.0.0.1') + $Command
     $arguments = New-IsolatedSshArgumentList -Tool ssh -IdentityFile $IdentityFile -KnownHostsFile $KnownHostsFile -Port $Port -RemoteUser builder -Payload $payload
-    return Invoke-CheckedProcess -FilePath $SshPath -ArgumentList $arguments -TimeoutSeconds $TimeoutSeconds -AllowNonZero:$AllowNonZero
+    $result = Invoke-CheckedProcess -FilePath $SshPath -ArgumentList $arguments -TimeoutSeconds $TimeoutSeconds -AllowNonZero
+    if (-not $AllowNonZero -and $result.ExitCode -ne 0) {
+        $diagnostic = if (-not [string]::IsNullOrWhiteSpace($result.StandardError)) { $result.StandardError.Trim() } else { "ssh exited $($result.ExitCode) without stderr" }
+        $diagnostic = [regex]::Replace($diagnostic, '[\r\n]+', ' ')
+        if ($diagnostic.Length -gt 512) { $diagnostic = $diagnostic.Substring(0, 512) }
+        throw (New-QemuException -Code 'QEMU_SSH_FAILED' -Message "SSH stage '$Stage' failed: $diagnostic")
+    }
+    return $result
 }
 
 function Invoke-QemuScp {
