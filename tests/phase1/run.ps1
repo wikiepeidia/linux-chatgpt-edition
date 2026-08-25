@@ -271,6 +271,157 @@ Add-TestCase -Name 'BUILD-04 NoCloud templates are public-only and emit the orde
     Assert-False -Condition ([bool]($meta + $user -match '(?i)BEGIN .*PRIVATE KEY|password:\s*[^!]|token:\s*\S+')) -Message 'NoCloud templates contain secret-bearing material.'
 }
 
+Add-TestCase -Name 'BUILD-04 KeyInitRequest BuildRequest and ResolvedBuildLock enforce temporal ordering' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
+    $inputs = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'builder/inputs.json') | ConvertFrom-Json -Depth 30
+    $keyRequest = New-KeyInitRequest -Inputs $inputs -RunNonce '0123456789abcdef0123456789abcdef'
+    $keyJson = $keyRequest | ConvertTo-Json -Depth 30 -Compress
+    Assert-Match -Value $keyJson -Pattern 'KeyInitRequest'
+    Assert-False -Condition ([bool]($keyJson -match '(?i)public_key_sha256|signing_public')) -Message 'KeyInitRequest contains an identity that does not exist yet.'
+
+    $source = [pscustomobject]@{
+        git_commit = ('a' * 40)
+        archive_sha256 = ('b' * 64)
+        source_date_epoch = 1787670000
+        dirty = $false
+    }
+    $hashes = [ordered]@{
+        inputs_sha256 = ('c' * 64)
+        run_build_sha256 = ('d' * 64)
+        profile_sha256 = ('e' * 64)
+    }
+    Assert-ThrowsCode -Code 'SIGNING_PUBLIC_REQUIRED' -Body {
+        New-BuildRequest -Inputs $inputs -Source $source -InputHashes $hashes -SigningPublic $null | Out-Null
+    }
+
+    $signing = [pscustomobject]@{ schema = 'SigningPublic'; public_key_file = '300k.rsa.pub'; public_key_sha256 = ('f' * 64) }
+    $request = New-BuildRequest -Inputs $inputs -Source $source -InputHashes $hashes -SigningPublic $signing
+    $requestJson = $request | ConvertTo-Json -Depth 30 -Compress
+    foreach ($forbidden in @('resolved_build_lock', 'apk_files', 'private', 'backend_observations', 'output_sha256', 'self_hash')) {
+        Assert-False -Condition ([bool]($requestJson -match $forbidden)) -Message "BuildRequest contains forbidden post-resolution field '$forbidden'."
+    }
+    Assert-Match -Value $requestJson -Pattern 'BuildRequest'
+
+    $requestHash = '1' * 64
+    $validLock = [pscustomobject]@{
+        schema = 'ResolvedBuildLock'
+        build_request_sha256 = $requestHash
+        repository_object_id = ('2' * 64)
+        artifacts = @()
+        inspection_commands = @()
+    }
+    [void](Test-ResolvedBuildLock -Lock $validLock -ExpectedBuildRequestSha256 $requestHash -AllowEmptyArtifacts)
+    Assert-ThrowsCode -Code 'RESOLVED_LOCK_REQUEST_MISMATCH' -Body {
+        Test-ResolvedBuildLock -Lock $validLock -ExpectedBuildRequestSha256 ('3' * 64) -AllowEmptyArtifacts | Out-Null
+    }
+}
+
+Add-TestCase -Name 'BUILD-04 generated artifact ownership and independent host validation are closed' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
+    $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('300k-records-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $scratch | Out-Null
+    try {
+        $file = Join-Path $scratch 'builder-packages.lock'
+        [System.IO.File]::WriteAllText($file, "busybox-1.37.0-r31`n", [System.Text.UTF8Encoding]::new($false))
+        $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+        $record = [pscustomobject]@{
+            file = 'builder-packages.lock'
+            sha256 = $hash
+            bytes = (Get-Item -LiteralPath $file).Length
+            producer = 'run-build.sh:prepare-repository'
+            validator = 'build.ps1:Test-GeneratedFileRecord'
+        }
+        [void](Test-GeneratedFileRecord -Record $record -BaseDirectory $scratch -ExpectedProducer 'run-build.sh:prepare-repository')
+
+        foreach ($badRecord in @(
+            [pscustomobject]@{ file = '..\escape'; sha256 = $hash; bytes = 1; producer = $record.producer; validator = $record.validator },
+            [pscustomobject]@{ file = $record.file; sha256 = $hash.ToUpperInvariant(); bytes = $record.bytes; producer = $record.producer; validator = $record.validator },
+            [pscustomobject]@{ file = $record.file; sha256 = $hash; bytes = 0; producer = $record.producer; validator = $record.validator },
+            [pscustomobject]@{ file = $record.file; sha256 = $hash; bytes = $record.bytes; producer = 'some-other-producer'; validator = $record.validator }
+        )) {
+            Assert-ThrowsCode -Code 'GENERATED_RECORD_INVALID' -Body {
+                Test-GeneratedFileRecord -Record $badRecord -BaseDirectory $scratch -ExpectedProducer 'run-build.sh:prepare-repository' | Out-Null
+            }
+        }
+    }
+    finally { Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue }
+
+    $allSource = (Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'build.ps1')) + (Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/linux/run-build.sh'))
+    Assert-False -Condition ([bool]($allSource -match '(?<!builder-)packages\.lock')) -Message 'A dangling packages.lock ownership reference remains.'
+}
+
+Add-TestCase -Name 'BUILD-04 public inputs pin the complete builder and inspection command surface' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
+    $inputsPath = Join-Path $script:RepositoryRoot 'builder/inputs.json'
+    $raw = Get-Content -Raw -LiteralPath $inputsPath
+    $inputs = $raw | ConvertFrom-Json -Depth 30
+    Assert-Equal -Expected '3.24.1' -Actual $inputs.alpine.release
+    Assert-Equal -Expected 'x86_64' -Actual $inputs.target.arch
+    Assert-Equal -Expected '52643b7a176095362fd87fe73cdb994cb2e5ffae' -Actual $inputs.aports.commit
+    Assert-Equal -Expected '8d756f6fc7653daa4fb4e2e213d8a66007bcb1e5a846e28891af62c47b90685c694486c2746099ad99e9e8f5278db76b69d11dfe1e9361aa4c8406df16929a9c' -Actual $inputs.qemu.cloud_image_sha512
+
+    $packages = @($inputs.builder_packages)
+    foreach ($pin in @('gzip=1.14-r2', 'xz=5.8.3-r0', 'zstd=1.5.7-r2', 'lz4=1.10.0-r1', 'cpio=2.15-r0')) {
+        Assert-True -Condition ($packages -ccontains $pin) -Message "Missing exact inspection package pin '$pin'."
+    }
+    foreach ($format in @('gzip', 'xz', 'zstd', 'lz4', 'cpio', 'squashfs', 'iso')) {
+        $entry = $inputs.inspection_toolchain.$format
+        Assert-True -Condition ($null -ne $entry) -Message "Inspection format '$format' is absent."
+        Assert-Match -Value $entry.package -Pattern '^[a-z0-9+_.-]+=[0-9][A-Za-z0-9._-]*-r\d+$'
+        Assert-Match -Value ([string]$entry.decoder[0]) -Pattern '^/' -Message "'$format' decoder is not an exact absolute command."
+        Assert-True -Condition (@($entry.fixture_encoder).Count -gt 0) -Message "'$format' lacks a deterministic fixture encoder."
+    }
+    Assert-False -Condition ([bool]($raw -match '(?i)optional|\$PATH|latest-stable|/home/|[A-Z]:\\')) -Message 'Public inputs contain an ambient/moving/host-specific value.'
+}
+
+Add-TestCase -Name 'BUILD-04 repository drift aborts before the offline install boundary' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
+    $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('300k-repository-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $scratch | Out-Null
+    try {
+        $apk = Join-Path $scratch 'fixture-1.0-r0.apk'
+        [System.IO.File]::WriteAllBytes($apk, [byte[]](1..32))
+        $manifest = Join-Path $scratch 'repository.sha256'
+        $hash = (Get-FileHash -LiteralPath $apk -Algorithm SHA256).Hash.ToLowerInvariant()
+        [System.IO.File]::WriteAllText($manifest, "$hash  fixture-1.0-r0.apk`n", [System.Text.UTF8Encoding]::new($false))
+        [void](Test-RepositorySnapshot -RepositoryDirectory $scratch -ManifestFile $manifest)
+        [System.IO.File]::AppendAllText($apk, 'drift')
+        Assert-ThrowsCode -Code 'REPOSITORY_DRIFT' -Body {
+            Test-RepositorySnapshot -RepositoryDirectory $scratch -ManifestFile $manifest | Out-Null
+        }
+    }
+    finally { Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue }
+
+    $linux = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/linux/run-build.sh')
+    foreach ($pattern in @('init-signing-key', 'prepare-repository', 'build-from-local', 'file://', '--no-network', '300K_INJECT_REPOSITORY_DRIFT', 'ResolvedBuildLock', 'inspection_commands', 'network_disabled')) {
+        Assert-Match -Value $linux -Pattern ([regex]::Escape($pattern)) -Message "Linux build core is missing '$pattern'."
+    }
+    Assert-Match -Value $linux -Pattern '(?s)verify_repository_snapshot.*?disable_network.*?mkimage\.sh' -Message 'Repository verification, network disablement, and mkimage order is not fail-closed.'
+}
+
+Add-TestCase -Name 'BUILD-04 Docker and QEMU semantic records compare content without ISO byte identity' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
+    $content = [pscustomobject]@{
+        target = 'Bootstrap'; arch = 'x86_64'; source_archive_sha256 = ('a' * 64)
+        build_request_sha256 = ('b' * 64); inputs_sha256 = ('c' * 64)
+        run_build_sha256 = ('d' * 64); profile_sha256 = ('e' * 64)
+        aports_commit = ('f' * 40); source_date_epoch = 1787670000
+        signing_public_sha256 = ('1' * 64); repository_index_sha256 = @(('2' * 64), ('3' * 64))
+        guest_roles = Get-CanonicalGuestRoles
+    }
+    $docker = [pscustomobject]@{ backend = 'docker'; transport = 'volume'; iso_sha256 = ('4' * 64); content = $content }
+    $qemu = [pscustomobject]@{ backend = 'qemu'; transport = 'ssh'; iso_sha256 = ('5' * 64); content = $content }
+    Assert-True -Condition (Test-BuildSemanticParity -Left $docker -Right $qemu) -Message 'Semantically equal adapters were rejected due to transport/output differences.'
+    $qemu.content.profile_sha256 = '6' * 64
+    Assert-False -Condition (Test-BuildSemanticParity -Left $docker -Right $qemu) -Message 'A content-field mismatch was ignored.'
+}
+
+Add-TestCase -Name 'BUILD-04 Linux core owns package/profile decisions and the QEMU adapter remains transport-only' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
+    $profile = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'builder/profiles/mkimg.300k.sh')
+    Assert-Match -Value $profile -Pattern 'profile_300k_bootstrap'
+    Assert-Match -Value $profile -Pattern 'profile_virt'
+    Assert-False -Condition ([bool]($profile -match '(?i)apk add|xorriso|mkimage\.sh|linux-virt')) -Message 'The thin profile duplicated upstream assembly decisions.'
+    Assert-True -Condition (($profile -split "`n").Count -le 12) -Message 'The bootstrap profile is no longer a thin profile_virt extension.'
+
+    $qemu = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/host/Invoke-QemuBackend.ps1')
+    Assert-False -Condition ([bool]($qemu -match '(?im)^\s*(apk\s+add|.*mkimage\.sh\s+--|profile_virt\s*\()')) -Message 'QEMU transport contains package/profile build logic.'
+}
+
 if ($Scope -in @('Qemu', 'All')) {
     Add-TestCase -Name 'BUILD-04 real clean-tree QEMU tracer' -Scopes @('Qemu') -Requirements @('BUILD-04') -Body {
         throw 'QEMU_SCOPE_NOT_IMPLEMENTED'
