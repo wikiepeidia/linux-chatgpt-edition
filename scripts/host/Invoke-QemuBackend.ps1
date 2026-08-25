@@ -573,6 +573,7 @@ function Invoke-QemuBackend {
         $overlayPath = Join-Path $runRoot 'overlay.qcow2'
         [void](Invoke-CheckedProcess -FilePath $qemuImgExe -ArgumentList @('create', '-f', 'qcow2', '-F', 'qcow2', '-b', $basePath, $overlayPath) -TimeoutSeconds 60)
         Add-QemuOwnedResource -Owner $owner -Name 'overlay' -Cleanup { param($path) if ([System.IO.File]::Exists($path)) { [System.IO.File]::Delete($path) } } -CleanupArgument $overlayPath
+        [void](Invoke-CheckedProcess -FilePath $qemuImgExe -ArgumentList @('resize', '-f', 'qcow2', $overlayPath, '16G') -TimeoutSeconds 60)
 
         if ($CacheIdentity -cnotmatch '^[0-9a-f]{12,64}$') { throw (New-QemuException -Code 'QEMU_CACHE_ID_INVALID' -Message 'Cache identity must be lowercase content hex.') }
         $cachePath = Join-Path $cacheDirectory "300k-cache-$($CacheIdentity.Substring(0,12)).qcow2"

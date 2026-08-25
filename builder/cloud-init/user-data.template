@@ -1,6 +1,11 @@
 #cloud-config
 disable_root: true
 ssh_pwauth: false
+growpart:
+  mode: auto
+  devices: ['/']
+  ignore_growroot_disabled: false
+resize_rootfs: true
 users:
   - name: builder
     gecos: 300K ephemeral build user

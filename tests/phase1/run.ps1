@@ -282,6 +282,7 @@ Add-TestCase -Name 'BUILD-04 NoCloud templates are public-only and emit the orde
     $user = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'builder/cloud-init/user-data.template')
     Assert-Match -Value $meta -Pattern 'instance-id:\s*@@INSTANCE_ID@@'
     Assert-Match -Value $user -Pattern '^#cloud-config'
+    Assert-Match -Value $user -Pattern '(?s)growpart:.*?mode:\s*auto.*?devices:\s*\[''/''\].*?resize_rootfs:\s*true' -Message 'NoCloud does not expand the tiny pinned cloud disk before package installation.'
     Assert-Match -Value $user -Pattern '300K_NOCLOUD_BEGIN'
     Assert-Match -Value $user -Pattern '300K_SSH_HOST_KEY'
     Assert-Match -Value $user -Pattern '300K_SSH_READY'
@@ -483,6 +484,7 @@ Add-TestCase -Name 'BUILD-04 Linux core owns package/profile decisions and the Q
     Assert-True -Condition (($profile -split "`n").Count -le 12) -Message 'The bootstrap profile is no longer a thin profile_virt extension.'
 
     $qemu = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/host/Invoke-QemuBackend.ps1')
+    Assert-Match -Value $qemu -Pattern '@\(''resize'', ''-f'', ''qcow2'', \$overlayPath, ''16G''\)' -Message 'The disposable cloud overlay is not expanded before boot.'
     Assert-False -Condition ([bool]($qemu -match '(?im)^\s*(apk\s+add|.*mkimage\.sh\s+--|profile_virt\s*\()')) -Message 'QEMU transport contains package/profile build logic.'
     Assert-Match -Value $qemu -Pattern 'install -d -m 700 -o builder -g builder /inputs /run/300k-secrets' -Message 'Guest input and tmpfs transfer directories are not explicitly owned by the ephemeral builder.'
     Assert-Match -Value $qemu -Pattern 'builder@127\.0\.0\.1:/run/300k-secrets/300k\.rsa' -Message 'The private APK key is not transferred directly into guest tmpfs.'
