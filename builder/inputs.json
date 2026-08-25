@@ -137,7 +137,11 @@
       "decoder": ["/usr/bin/xorriso", "-report_about", "WARNING", "-osirrox", "on", "-indev", "{container}", "-concat", "overwrite", "-", "/{member}", "--"],
       "fixture_encoder": ["/usr/bin/xorriso", "-as", "mkisofs", "-quiet", "-output"],
       "version_argv": ["/usr/bin/xorriso", "-version"],
-      "stderr_banner": "xorriso 1.5.8 : RockRidge filesystem manipulator, libburnia project."
+      "version_identity": "xorriso 1.5.8",
+      "stderr_banner": "xorriso 1.5.8 : RockRidge filesystem manipulator, libburnia project.",
+      "stderr_banner_framing": "lf-lf",
+      "stderr_banner_bytes": 70,
+      "stderr_banner_sha256": "f2f1edcb0b5c04de61066b76942ae38fc2fdb1ebd1978acfe5108bad01e9c64f"
     },
     "tar": {
       "package": "tar=1.35-r5",

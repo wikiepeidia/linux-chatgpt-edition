@@ -117,6 +117,15 @@ function Assert-PublicInputs {
     if (-not ([uri]$Inputs.qemu.cloud_image_url).AbsoluteUri.StartsWith('https://dl-cdn.alpinelinux.org/', [System.StringComparison]::Ordinal)) {
         throw (New-BuildException -Code 'INPUT_QEMU_ORIGIN_INVALID' -Message 'The cloud-image origin is not approved.')
     }
+    $isoTool = $Inputs.inspection_toolchain.iso
+    $expectedBanner = ([string]$isoTool.version_identity + ' : RockRidge filesystem manipulator, libburnia project.')
+    $bannerBytes = [System.Text.UTF8Encoding]::new($false).GetBytes(([string]$isoTool.stderr_banner + "`n`n"))
+    $bannerHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bannerBytes)).ToLowerInvariant()
+    if ($isoTool.version_identity -cne 'xorriso 1.5.8' -or $isoTool.stderr_banner -cne $expectedBanner -or
+        $isoTool.stderr_banner_framing -cne 'lf-lf' -or [long]$isoTool.stderr_banner_bytes -ne [long]$bannerBytes.Length -or
+        $isoTool.stderr_banner_sha256 -cnotmatch '^[0-9a-f]{64}$' -or $isoTool.stderr_banner_sha256 -cne $bannerHash) {
+        throw (New-BuildException -Code 'INPUT_INSPECTION_TOOLCHAIN_INVALID' -Message 'The xorriso identity and exact framed stderr banner pins are inconsistent.')
+    }
 }
 
 function New-KeyInitRequest {
@@ -616,14 +625,43 @@ function Test-ClosedStagingBundle {
     for ($index = 0; $index -lt $commands.Count; $index++) {
         $command = $commands[$index]
         $expected = @($Inputs.inspection_toolchain.PSObject.Properties)[$index].Value
-        Assert-ClosedObjectKeys -Object $command -ExpectedKeys @('format','package','command','command_sha256','version','retained_apk_file','retained_apk_sha256','package_ownership_verified','path_verified','round_trip_verified','retained_apk_verified','contract_source','retained_repository') -Code 'INSPECTION_TOOLCHAIN_INVALID' -Label 'inspection command'
-        $expectedVersion = if ($expected.PSObject.Properties.Name -ccontains 'stderr_banner') { [string]$expected.stderr_banner } else { $null }
+        $commandKeys = @('format','package','command','command_sha256','version','retained_apk_file','retained_apk_sha256','package_ownership_verified','path_verified','round_trip_verified','retained_apk_verified','contract_source','retained_repository')
+        $isIso = [string]$command.format -ceq 'iso'
+        if ($isIso) {
+            $commandKeys = @($commandKeys + @('version_stdout_hex','version_stdout_sha256','version_stdout_bytes','stderr_banner','stderr_banner_framing','stderr_banner_bytes','stderr_banner_sha256'))
+        }
+        Assert-ClosedObjectKeys -Object $command -ExpectedKeys $commandKeys -Code 'INSPECTION_TOOLCHAIN_INVALID' -Label 'inspection command'
         if ($command.package -cne $expected.package -or $command.command -cne $expected.command -or $command.command_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
             -not [bool]$command.package_ownership_verified -or -not [bool]$command.path_verified -or -not [bool]$command.round_trip_verified -or -not [bool]$command.retained_apk_verified -or
             $command.retained_apk_sha256 -cnotmatch '^[0-9a-f]{64}$' -or $command.retained_apk_file -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*[.]apk$' -or
-            $command.contract_source -cne 'builder/inputs.json:inspection_toolchain' -or $command.retained_repository -cne $lock.repository_object_id -or [string]::IsNullOrWhiteSpace([string]$command.version) -or
-            ($null -ne $expectedVersion -and [string]$command.version -cne $expectedVersion)) {
+            $command.contract_source -cne 'builder/inputs.json:inspection_toolchain' -or $command.retained_repository -cne $lock.repository_object_id -or [string]::IsNullOrWhiteSpace([string]$command.version)) {
             throw (New-BuildException -Code 'INSPECTION_TOOLCHAIN_INVALID' -Message 'A decoder lacks exact package, path, retained APK, or round-trip evidence.')
+        }
+        if ($isIso) {
+            $versionHex = [string]$command.version_stdout_hex
+            if ([string]$command.version -cne [string]$expected.version_identity -or
+                [string]$command.stderr_banner -cne [string]$expected.stderr_banner -or
+                [string]$command.stderr_banner -cne ([string]$command.version + ' : RockRidge filesystem manipulator, libburnia project.') -or
+                [string]$command.stderr_banner_framing -cne [string]$expected.stderr_banner_framing -or
+                [long]$command.stderr_banner_bytes -ne [long]$expected.stderr_banner_bytes -or
+                [string]$command.stderr_banner_sha256 -cne [string]$expected.stderr_banner_sha256 -or
+                $versionHex -cnotmatch '^(?:[0-9a-f]{2})+$' -or [string]$command.version_stdout_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+                [long]$command.version_stdout_bytes -le 0 -or [long]$command.version_stdout_bytes -gt 65536) {
+                throw (New-BuildException -Code 'INSPECTION_TOOLCHAIN_INVALID' -Message 'The ISO decoder lacks separated exact version stdout and stderr banner evidence.')
+            }
+            try {
+                $versionBytes = [Convert]::FromHexString($versionHex)
+                $versionText = [System.Text.UTF8Encoding]::new($false, $true).GetString($versionBytes)
+            } catch {
+                throw (New-BuildException -Code 'INSPECTION_TOOLCHAIN_INVALID' -Message 'The xorriso version stdout serialization is not strict UTF-8 hexadecimal evidence.')
+            }
+            $versionHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($versionBytes)).ToLowerInvariant()
+            $firstLf = $versionText.IndexOf("`n", [System.StringComparison]::Ordinal)
+            if ([long]$versionBytes.Length -ne [long]$command.version_stdout_bytes -or $versionHash -cne [string]$command.version_stdout_sha256 -or
+                -not $versionText.EndsWith("`n", [System.StringComparison]::Ordinal) -or $versionText -cmatch '[^\x0A\x20-\x7E]' -or
+                $firstLf -le 0 -or $versionText.Substring(0, $firstLf) -cne [string]$command.version) {
+                throw (New-BuildException -Code 'INSPECTION_TOOLCHAIN_INVALID' -Message 'The complete xorriso version stdout is not byte-bound to its canonical first-line identity.')
+            }
         }
     }
 

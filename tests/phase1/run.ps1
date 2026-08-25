@@ -141,7 +141,7 @@ Add-TestCase -Name 'BUILD-03 hostile fixture matrix preflights before no-follow 
         Assert-Match -Value $source -Pattern ([regex]::Escape($guard)) -Message "Inspector guard '$guard' is absent."
     }
     Assert-Match -Value $source -Pattern 'preflight_graph[\s\S]{0,4000}stream_regular_member' -Message 'The source must make preflight precede any regular-file streaming.'
-    Assert-Match -Value $source -Pattern 'expected_banner=\$\(evidence_field iso version\)[\s\S]*printf ''%s\\n\\n''[\s\S]*cmp "\$log" "\$expected"' -Message 'Only the exact locked xorriso banner with its pinned two-LF framing may be removed from strict decoder stderr.'
+    Assert-Match -Value $source -Pattern 'stderr_banner=\$\(evidence_field iso stderr_banner\)[\s\S]*stderr_banner_framing=\$\(evidence_field iso stderr_banner_framing\)[\s\S]*stderr_banner_sha256=\$\(evidence_field iso stderr_banner_sha256\)[\s\S]*printf ''%s\\n\\n''[\s\S]*sha256_file "\$expected"[\s\S]*cmp "\$log" "\$expected"' -Message 'Only the separately locked, reconstructed, hash-checked xorriso banner frame may be removed from strict decoder stderr.'
     Assert-Match -Value $source -Pattern '\$iso_command" -report_about WARNING -osirrox on -indev "\$container" -concat overwrite - "/\$member" --' -Message 'ISO members must stream to the bounded stdout sink without naming a decoder-controlled disk path.'
     Assert-False -Condition ($source -match '-extract_single') -Message 'The inspector must not ask xorriso to restore a member to a decoder-controlled disk path.'
     Assert-Match -Value $source -Pattern 'create_iso_fixture[\s\S]*assert_decoder_log_clean iso9660' -Message 'Hostile ISO fixture encoders must apply the same exact locked-banner stderr contract per invocation.'
@@ -195,14 +195,27 @@ function New-ClosedSecurityFixture {
         [pscustomobject]@{ Name = 'environment-report.json'; Value = [ordered]@{ schema_version = 1; backend = 'qemu'; backend_status = 'executed'; guest_os = 'linux'; guest_arch = 'x86_64'; alpine_release = '3.24.1'; qemu_cloud_image_sha512 = $inputs.qemu.cloud_image_sha512; docker_status = 'unverified-unavailable'; docker_reason = 'fixture'; serial_host_fingerprint = 'SHA256:fixtureFingerprint'; live_management_stages = @('shutdown-complete'); cleanup_complete = $true; source_commit = ('e' * 40) } }
     )) { Write-CanonicalJson -Value $record.Value -Path (Join-Path $staging $record.Name) }
 
+    $fixtureVersionBytes = [System.Text.UTF8Encoding]::new($false).GetBytes("xorriso 1.5.8`nlibburnia fixture detail`n")
+    $fixtureVersionHex = [Convert]::ToHexString($fixtureVersionBytes).ToLowerInvariant()
+    $fixtureVersionHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($fixtureVersionBytes)).ToLowerInvariant()
     $toolItems = @($inputs.inspection_toolchain.PSObject.Properties | ForEach-Object {
-        [ordered]@{
+        $record = [ordered]@{
             format = $_.Name; package = $_.Value.package; command = $_.Value.command
-            command_sha256 = ('f' * 64); version = $(if ($_.Name -ceq 'iso') { $_.Value.stderr_banner } else { 'fixture' }); package_ownership_verified = $true
+            command_sha256 = ('f' * 64); version = $(if ($_.Name -ceq 'iso') { $_.Value.version_identity } else { 'fixture' }); package_ownership_verified = $true
             path_verified = $true; round_trip_verified = $true; retained_apk_verified = $true
             retained_apk_file = ($_.Value.package.Replace('=', '-') + '.apk'); retained_apk_sha256 = ('a' * 64)
             contract_source = 'builder/inputs.json:inspection_toolchain'; retained_repository = ('d' * 64)
         }
+        if ($_.Name -ceq 'iso') {
+            $record['version_stdout_hex'] = $fixtureVersionHex
+            $record['version_stdout_sha256'] = $fixtureVersionHash
+            $record['version_stdout_bytes'] = [long]$fixtureVersionBytes.Length
+            $record['stderr_banner'] = $_.Value.stderr_banner
+            $record['stderr_banner_framing'] = $_.Value.stderr_banner_framing
+            $record['stderr_banner_bytes'] = [long]$_.Value.stderr_banner_bytes
+            $record['stderr_banner_sha256'] = $_.Value.stderr_banner_sha256
+        }
+        $record
     })
     $toolchainHash = '9' * 64
     $audit = [ordered]@{
@@ -256,6 +269,18 @@ Add-TestCase -Name 'BUILD-03 closed staging rejects paths schemas hashes sizes l
         $validated = Test-ClosedStagingBundle -StagingDirectory $fixture.Staging -ExpectedBuildRequestSha256 $fixture.RequestHash -Inputs $fixture.Inputs -BuildRequest $fixture.Request
         Assert-Equal -Expected $fixture.IsoHash -Actual $validated.IsoSha256
         Assert-Equal -Expected $fixture.IsoName -Actual $validated.IsoFile
+
+        $lockPath = Join-Path $fixture.Staging 'resolved-build-lock.json'
+        $lockBytes = [System.IO.File]::ReadAllBytes($lockPath)
+        $lock = Get-Content -Raw -LiteralPath $lockPath | ConvertFrom-Json -Depth 64
+        $isoCommand = @($lock.inspection_commands | Where-Object format -CEQ 'iso')[0]
+        $wrongVersionBytes = [System.Text.UTF8Encoding]::new($false).GetBytes("xorriso 9.9.9`nlibburnia fixture detail`n")
+        $isoCommand.version_stdout_hex = [Convert]::ToHexString($wrongVersionBytes).ToLowerInvariant()
+        $isoCommand.version_stdout_sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($wrongVersionBytes)).ToLowerInvariant()
+        $isoCommand.version_stdout_bytes = [long]$wrongVersionBytes.Length
+        Write-CanonicalJson -Value $lock -Path $lockPath
+        Assert-ThrowsCode -Code 'INSPECTION_TOOLCHAIN_INVALID' -Body { Test-ClosedStagingBundle -StagingDirectory $fixture.Staging -ExpectedBuildRequestSha256 $fixture.RequestHash -Inputs $fixture.Inputs -BuildRequest $fixture.Request | Out-Null }
+        [System.IO.File]::WriteAllBytes($lockPath, $lockBytes)
 
         $extra = Join-Path $fixture.Staging 'unexpected.bin'
         [System.IO.File]::WriteAllText($extra, 'unexpected')
@@ -661,9 +686,15 @@ Add-TestCase -Name 'BUILD-04 public inputs pin the complete builder and inspecti
         Assert-Match -Value ([string]$entry.decoder[0]) -Pattern '^/' -Message "'$format' decoder is not an exact absolute command."
         Assert-True -Condition (@($entry.fixture_encoder).Count -gt 0) -Message "'$format' lacks a deterministic fixture encoder."
     }
-    Assert-Equal -Expected 'xorriso 1.5.8 : RockRidge filesystem manipulator, libburnia project.' -Actual $inputs.inspection_toolchain.iso.stderr_banner -Message 'The accepted xorriso stderr banner must be exact and public.'
+    Assert-Equal -Expected 'xorriso 1.5.8' -Actual $inputs.inspection_toolchain.iso.version_identity -Message 'The canonical xorriso identity must remain distinct from full version stdout and stderr.'
+    Assert-Equal -Expected 'xorriso 1.5.8 : RockRidge filesystem manipulator, libburnia project.' -Actual $inputs.inspection_toolchain.iso.stderr_banner -Message 'The accepted xorriso stderr banner line must be exact and public.'
+    Assert-Equal -Expected ($inputs.inspection_toolchain.iso.version_identity + ' : RockRidge filesystem manipulator, libburnia project.') -Actual $inputs.inspection_toolchain.iso.stderr_banner -Message 'The banner line is not deterministically bound to the canonical first line of xorriso -version stdout.'
+    Assert-Equal -Expected 'lf-lf' -Actual $inputs.inspection_toolchain.iso.stderr_banner_framing -Message 'The exact xorriso stderr banner framing must be pinned.'
     $framedBanner = [System.Text.UTF8Encoding]::new($false).GetBytes(([string]$inputs.inspection_toolchain.iso.stderr_banner + "`n`n"))
-    Assert-Equal -Expected 'f2f1edcb0b5c04de61066b76942ae38fc2fdb1ebd1978acfe5108bad01e9c64f' -Actual ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($framedBanner)).ToLowerInvariant()) -Message 'The pinned banner framing differs from the observed xorriso stderr bytes.'
+    Assert-Equal -Expected 70 -Actual ([long]$inputs.inspection_toolchain.iso.stderr_banner_bytes) -Message 'The pinned banner byte count differs from the observed xorriso stderr frame.'
+    Assert-Equal -Expected ([long]$inputs.inspection_toolchain.iso.stderr_banner_bytes) -Actual ([long]$framedBanner.Length) -Message 'The serialized banner line/framing does not reconstruct the pinned byte count.'
+    Assert-Equal -Expected 'f2f1edcb0b5c04de61066b76942ae38fc2fdb1ebd1978acfe5108bad01e9c64f' -Actual $inputs.inspection_toolchain.iso.stderr_banner_sha256 -Message 'The exact xorriso stderr frame hash must be pinned.'
+    Assert-Equal -Expected $inputs.inspection_toolchain.iso.stderr_banner_sha256 -Actual ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($framedBanner)).ToLowerInvariant()) -Message 'The pinned banner line/framing differs from the observed xorriso stderr bytes.'
     Assert-False -Condition ([bool]($raw -match '(?i)optional|\$PATH|latest-stable|/home/|[A-Z]:\\')) -Message 'Public inputs contain an ambient/moving/host-specific value.'
 }
 
@@ -783,10 +814,12 @@ Add-TestCase -Name 'BUILD-04 repository drift aborts before the offline install 
     Assert-Match -Value $linux -Pattern '(?s)chown -R "\$builder_uid:\$builder_gid" "\$build_root/repo".*?verify_repository_snapshot "\$build_root/repo/x86_64".*?mkimage\.sh.*?verify_repository_snapshot "\$build_root/repo/x86_64"' -Message 'Protected hardlink ownership is not bounded by staged repository verification.'
     Assert-Match -Value $linux -Pattern '(?s)mkimage_log=.*?300k-mkimage\.log.*?2>&1.*?tail -n 80 "\$mkimage_log" >&2' -Message 'A bounded mkimage failure tail is not preserved for the host tracer.'
     Assert-Match -Value $linux -Pattern 'env -i HOME=/home/\$builder_user PATH=/usr/sbin:/usr/bin:/sbin:/bin CBUILD=x86_64 SOURCE_DATE_EPOCH=' -Message 'The clean mkimage environment does not pin its build architecture.'
-    Assert-Match -Value $linux -Pattern 'assert_exact_xorriso_stderr[\s\S]*printf ''%s\\n\\n''[\s\S]*cmp "\$log" "\$expected"[\s\S]*residue_bytes[\s\S]*residue_hash[\s\S]*head -c 256' -Message 'Every xorriso caller must byte-compare the exact framed locked banner and retain bounded mismatch diagnostics.'
-    Assert-Match -Value $linux -Pattern 'stderr_banner=\$\(inspection_value iso stderr_banner\)[\s\S]*"\$version "\*\)[\s\S]*version=\$stderr_banner' -Message 'The locked full banner must be tied to the actual xorriso -version output before serialization.'
+    Assert-Match -Value $linux -Pattern 'assert_exact_xorriso_stderr[\s\S]*stderr_banner_framing[\s\S]*stderr_banner_bytes[\s\S]*stderr_banner_sha256[\s\S]*cmp "\$log" "\$expected"[\s\S]*residue_bytes[\s\S]*residue_hash[\s\S]*head -c 256' -Message 'Every xorriso caller must reconstruct and hash-check the exact framed locked banner before accepting only empty or byte-equal stderr.'
+    Assert-Match -Value $linux -Pattern 'version_stdout=.*inspection-version-iso[.]stdout[\s\S]*version_stderr=.*inspection-version-iso[.]stderr[\s\S]*-version > "\$version_stdout" 2> "\$version_stderr"' -Message 'xorriso -version stdout and stderr must be captured as separate byte streams.'
+    Assert-Match -Value $linux -Pattern 'version_stdout_hex=.*od -An -tx1 -v[\s\S]*version_stdout_sha256=.*sha256_file[\s\S]*version_stdout_bytes=.*file_bytes' -Message 'The complete xorriso -version stdout must be serialized and hash-bound without linewise collapse.'
+    Assert-Match -Value $linux -Pattern 'version_identity=\$\(sed -n ''1p'' "\$version_stdout"\)[\s\S]*expected_identity=\$\(inspection_value iso version_identity\)[\s\S]*stderr_banner="\$version_identity : RockRidge filesystem manipulator, libburnia project[.]"' -Message 'The pinned stderr banner line must derive deterministically from the canonical first stdout line.'
     Assert-Match -Value $linux -Pattern 'verify_codec_round_trip[\s\S]*iso-round-trip-encoder[\s\S]*-osirrox on[\s\S]*-concat overwrite - /payload --[\s\S]*INSPECTION_ROUND_TRIP_STDERR' -Message 'The deterministic ISO round trip must check stdout decoding and strict stderr explicitly.'
-    Assert-Match -Value $linux -Pattern 'append_iso_report[\s\S]*expected_banner=\$\(inspection_evidence_value "\$evidence" iso version\)[\s\S]*assert_exact_xorriso_stderr[\s\S]*BOOT_LAYOUT_REPORT_FAILED' -Message 'Boot reports must validate status and strict stderr against locked xorriso evidence.'
+    Assert-Match -Value $linux -Pattern 'append_iso_report[\s\S]*inspection_evidence_value "\$evidence" iso stderr_banner[\s\S]*inspection_evidence_value "\$evidence" iso stderr_banner_sha256[\s\S]*assert_exact_xorriso_stderr[\s\S]*BOOT_LAYOUT_REPORT_FAILED' -Message 'Boot reports must validate status and strict stderr against separately locked xorriso banner evidence.'
     Assert-Match -Value $linux -Pattern ': > "\$boot_layout[.]partial"[\s\S]*append_iso_report[\s\S]*mv "\$boot_layout[.]partial" "\$boot_layout"' -Message 'Boot-layout evidence must be assembled atomically only from checked reports.'
     Assert-Match -Value $linux -Pattern 'apk --cache-dir "\$online_cache" --repositories-file "\$online_repositories" update' -Message 'APK 3 repository indexes are not explicitly refreshed in an isolated cache.'
     Assert-Match -Value $linux -Pattern '(?s)repositories\.online.*?apk --cache-dir.*? update.*?apk --cache-dir.*? fetch --recursive' -Message 'Closure resolution does not follow the isolated repository update.'
@@ -927,6 +960,17 @@ if ($Scope -in @('Qemu', 'Security', 'All')) {
             Assert-Match -Value $command.retained_apk_sha256 -Pattern '^[0-9a-f]{64}$' -Message 'Retained decoder APK hash is malformed.'
             Assert-Equal -Expected $lock.repository_object_id -Actual $command.retained_repository -Message 'Decoder evidence belongs to another retained repository.'
         }
+        $isoCommand = @($commands | Where-Object format -CEQ 'iso')[0]
+        Assert-Equal -Expected $inputs.inspection_toolchain.iso.version_identity -Actual $isoCommand.version -Message 'Resolved xorriso identity differs from the canonical first version line.'
+        Assert-Equal -Expected $inputs.inspection_toolchain.iso.stderr_banner -Actual $isoCommand.stderr_banner -Message 'Resolved xorriso stderr banner line differs from the public pin.'
+        Assert-Equal -Expected $inputs.inspection_toolchain.iso.stderr_banner_framing -Actual $isoCommand.stderr_banner_framing -Message 'Resolved xorriso stderr framing differs from the public pin.'
+        Assert-Equal -Expected ([long]$inputs.inspection_toolchain.iso.stderr_banner_bytes) -Actual ([long]$isoCommand.stderr_banner_bytes) -Message 'Resolved xorriso stderr byte count differs from the public pin.'
+        Assert-Equal -Expected $inputs.inspection_toolchain.iso.stderr_banner_sha256 -Actual $isoCommand.stderr_banner_sha256 -Message 'Resolved xorriso stderr hash differs from the public pin.'
+        $versionBytes = [Convert]::FromHexString([string]$isoCommand.version_stdout_hex)
+        Assert-Equal -Expected ([long]$isoCommand.version_stdout_bytes) -Actual ([long]$versionBytes.Length) -Message 'Serialized xorriso version stdout byte count differs.'
+        Assert-Equal -Expected $isoCommand.version_stdout_sha256 -Actual ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($versionBytes)).ToLowerInvariant()) -Message 'Serialized xorriso version stdout hash differs.'
+        $versionText = [System.Text.UTF8Encoding]::new($false, $true).GetString($versionBytes)
+        Assert-Equal -Expected $isoCommand.version -Actual $versionText.Substring(0, $versionText.IndexOf("`n", [System.StringComparison]::Ordinal)) -Message 'Serialized xorriso version stdout first line differs from canonical identity.'
 
         $audit = Get-Content -Raw -LiteralPath (Join-Path $artifactRoot 'iso-audit.json') | ConvertFrom-Json -Depth 64
         Assert-Equal -Expected 'IsoAudit' -Actual $audit.schema

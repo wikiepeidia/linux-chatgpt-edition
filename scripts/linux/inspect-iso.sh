@@ -226,10 +226,21 @@ assert_decoder_log_clean() {
     format=$1
     log=$2
     if [ "$format" = iso9660 ]; then
-        expected_banner=$(evidence_field iso version)
-        [ -n "$expected_banner" ] || fail INSPECTION_TOOLCHAIN_VERSION_MISSING "locked xorriso version evidence is absent"
+        stderr_banner=$(evidence_field iso stderr_banner)
+        stderr_banner_framing=$(evidence_field iso stderr_banner_framing)
+        stderr_banner_bytes=$(evidence_field iso stderr_banner_bytes)
+        stderr_banner_sha256=$(evidence_field iso stderr_banner_sha256)
+        [ -n "$stderr_banner" ] || fail INSPECTION_TOOLCHAIN_VERSION_MISSING "locked xorriso stderr banner evidence is absent"
+        [ "$stderr_banner_framing" = lf-lf ] || fail INSPECTION_TOOLCHAIN_VERSION_MISSING "locked xorriso stderr banner framing is invalid"
+        case "$stderr_banner_bytes" in ''|0|*[!0-9]*) fail INSPECTION_TOOLCHAIN_VERSION_MISSING "locked xorriso stderr banner byte evidence is invalid" ;; esac
+        printf '%s' "$stderr_banner_sha256" | grep -Eq '^[0-9a-f]{64}$' \
+            || fail INSPECTION_TOOLCHAIN_VERSION_MISSING "locked xorriso stderr banner hash evidence is invalid"
         expected=$log.expected
-        printf '%s\n\n' "$expected_banner" > "$expected"
+        printf '%s\n\n' "$stderr_banner" > "$expected"
+        [ "$(file_bytes "$expected")" -eq "$stderr_banner_bytes" ] \
+            || fail INSPECTION_TOOLCHAIN_VERSION_MISSING "locked xorriso stderr banner bytes do not reconstruct exactly"
+        [ "$(sha256_file "$expected")" = "$stderr_banner_sha256" ] \
+            || fail INSPECTION_TOOLCHAIN_VERSION_MISSING "locked xorriso stderr banner hash does not reconstruct exactly"
         [ ! -s "$log" ] || cmp "$log" "$expected" >/dev/null \
             || fail INSPECTION_DECODER_WARNING "xorriso stderr differs from the exact locked framed banner"
         : > "$log"

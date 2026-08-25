@@ -178,12 +178,23 @@ json_escape() {
 
 assert_exact_xorriso_stderr() {
     log=$1
-    expected_banner=$2
-    code=$3
-    label=$4
-    [ -n "$expected_banner" ] || fail "$code" "$label lacks locked xorriso banner evidence"
+    stderr_banner=$2
+    stderr_banner_framing=$3
+    stderr_banner_bytes=$4
+    stderr_banner_sha256=$5
+    code=$6
+    label=$7
+    [ -n "$stderr_banner" ] || fail "$code" "$label lacks locked xorriso banner evidence"
+    [ "$stderr_banner_framing" = lf-lf ] || fail "$code" "$label has unsupported xorriso banner framing"
+    case "$stderr_banner_bytes" in ''|0|*[!0-9]*) fail "$code" "$label has invalid xorriso banner byte evidence" ;; esac
+    printf '%s' "$stderr_banner_sha256" | grep -Eq '^[0-9a-f]{64}$' \
+        || fail "$code" "$label has invalid xorriso banner hash evidence"
     expected=$log.expected
-    printf '%s\n\n' "$expected_banner" > "$expected"
+    printf '%s\n\n' "$stderr_banner" > "$expected"
+    [ "$(file_bytes "$expected")" -eq "$stderr_banner_bytes" ] \
+        || fail "$code" "$label xorriso banner byte evidence does not reconstruct exactly"
+    [ "$(sha256_file "$expected")" = "$stderr_banner_sha256" ] \
+        || fail "$code" "$label xorriso banner hash evidence does not reconstruct exactly"
     if [ -s "$log" ] && ! cmp "$log" "$expected" >/dev/null; then
         residue_bytes=$(file_bytes "$log")
         residue_hash=$(sha256_file "$log")
@@ -206,7 +217,11 @@ require_public_contract() {
     grep -F '"lz4=1.10.0-r1"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "lz4 pin missing"
     grep -F '"cpio=2.15-r0"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "cpio pin missing"
     grep -F '"decoder": ["/usr/bin/xorriso", "-report_about", "WARNING", "-osirrox", "on", "-indev", "{container}", "-concat", "overwrite", "-", "/{member}", "--"]' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "ISO decoder contract changed"
+    grep -F '"version_identity": "xorriso 1.5.8"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "xorriso version identity is not exactly pinned"
     grep -F '"stderr_banner": "xorriso 1.5.8 : RockRidge filesystem manipulator, libburnia project."' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "xorriso stderr banner is not exactly pinned"
+    grep -F '"stderr_banner_framing": "lf-lf"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "xorriso stderr banner framing is not exactly pinned"
+    grep -F '"stderr_banner_bytes": 70' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "xorriso stderr banner byte count is not exactly pinned"
+    grep -F '"stderr_banner_sha256": "f2f1edcb0b5c04de61066b76942ae38fc2fdb1ebd1978acfe5108bad01e9c64f"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "xorriso stderr banner hash is not exactly pinned"
     grep -F '"package": "tar=1.35-r5"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "tar decoder package pin missing"
     grep -F '"package": "apk-tools=3.0.7-r0"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "APK decoder package pin missing"
     grep -F '"max_depth": 8' "$INPUTS_FILE" >/dev/null || fail INPUT_INSPECTION_POLICY_INVALID "inspection depth policy changed"
@@ -549,13 +564,17 @@ verify_codec_round_trip() {
             cp "$root$fixture" "$root/tmp/iso-fixture/payload"
             encoder_errors=$root/tmp/iso-round-trip-encoder.stderr
             decoder_errors=$root/tmp/iso-round-trip-decoder.stderr
+            stderr_banner=$(inspection_value iso stderr_banner)
+            stderr_banner_framing=$(inspection_value iso stderr_banner_framing)
+            stderr_banner_bytes=$(inspection_value iso stderr_banner_bytes)
+            stderr_banner_sha256=$(inspection_value iso stderr_banner_sha256)
             chroot "$root" "$encoder_path" -as mkisofs -quiet -output "$fixture.iso" /tmp/iso-fixture 2> "$encoder_errors" \
                 || fail INSPECTION_ROUND_TRIP_FAILED "iso fixture encoder failed"
-            assert_exact_xorriso_stderr "$encoder_errors" "$locked_version" INSPECTION_ROUND_TRIP_STDERR "iso fixture encoder"
+            assert_exact_xorriso_stderr "$encoder_errors" "$stderr_banner" "$stderr_banner_framing" "$stderr_banner_bytes" "$stderr_banner_sha256" INSPECTION_ROUND_TRIP_STDERR "iso fixture encoder"
             chroot "$root" "$command_path" -report_about WARNING -osirrox on -indev "$fixture.iso" -concat overwrite - /payload -- \
                 > "$root$fixture.out" 2> "$decoder_errors" \
                 || fail INSPECTION_ROUND_TRIP_FAILED "iso stdout decoder failed"
-            assert_exact_xorriso_stderr "$decoder_errors" "$locked_version" INSPECTION_ROUND_TRIP_STDERR "iso stdout decoder"
+            assert_exact_xorriso_stderr "$decoder_errors" "$stderr_banner" "$stderr_banner_framing" "$stderr_banner_bytes" "$stderr_banner_sha256" INSPECTION_ROUND_TRIP_STDERR "iso stdout decoder"
             ;;
         tar)
             mkdir -p "$root/tmp/tar-fixture"
@@ -594,19 +613,36 @@ record_inspection_command() {
     esac
     ownership=$(chroot "$root" apk info -W "$resolved_command" 2>/dev/null || true)
     printf '%s' "$ownership" | grep -F "$expected_owner" >/dev/null || fail INSPECTION_OWNER_MISMATCH "$format command ownership mismatch"
-    case "$format" in
-        squashfs|iso) version=$(chroot "$root" "$command_path" -version 2>&1 | head -n 1 | tr -cd '[:alnum:] ._+:/()-') ;;
-        *) version=$(chroot "$root" "$command_path" --version 2>&1 | head -n 1 | tr -cd '[:alnum:] ._+:/()-') ;;
-    esac
-    [ -n "$version" ] || fail INSPECTION_VERSION_MISSING "$format version output is empty"
     if [ "$format" = iso ]; then
-        stderr_banner=$(inspection_value iso stderr_banner)
-        case "$stderr_banner" in
-            "$version "*) ;;
-            *) fail INSPECTION_VERSION_MISMATCH "pinned xorriso banner does not begin with actual -version output" ;;
+        version_stdout=$root/tmp/inspection-version-iso.stdout
+        version_stderr=$root/tmp/inspection-version-iso.stderr
+        chroot "$root" "$command_path" -version > "$version_stdout" 2> "$version_stderr" \
+            || fail INSPECTION_VERSION_MISSING "iso -version command failed"
+        require_file "$version_stdout"
+        version_identity=$(sed -n '1p' "$version_stdout")
+        expected_identity=$(inspection_value iso version_identity)
+        [ "$version_identity" = "$expected_identity" ] \
+            || fail INSPECTION_VERSION_MISMATCH "actual xorriso -version first line differs from the canonical identity"
+        stderr_banner="$version_identity : RockRidge filesystem manipulator, libburnia project."
+        configured_stderr_banner=$(inspection_value iso stderr_banner)
+        [ "$stderr_banner" = "$configured_stderr_banner" ] \
+            || fail INSPECTION_VERSION_MISMATCH "pinned xorriso banner is not the deterministic canonical identity banner"
+        stderr_banner_framing=$(inspection_value iso stderr_banner_framing)
+        stderr_banner_bytes=$(inspection_value iso stderr_banner_bytes)
+        stderr_banner_sha256=$(inspection_value iso stderr_banner_sha256)
+        assert_exact_xorriso_stderr "$version_stderr" "$configured_stderr_banner" "$stderr_banner_framing" "$stderr_banner_bytes" "$stderr_banner_sha256" INSPECTION_VERSION_STDERR "iso -version"
+        version=$version_identity
+        version_stdout_hex=$(od -An -tx1 -v "$version_stdout" | tr -d ' \n')
+        version_stdout_sha256=$(sha256_file "$version_stdout")
+        version_stdout_bytes=$(file_bytes "$version_stdout")
+        [ -n "$version_stdout_hex" ] || fail INSPECTION_VERSION_MISSING "iso -version stdout serialization is empty"
+    else
+        case "$format" in
+            squashfs) version=$(chroot "$root" "$command_path" -version 2>&1 | head -n 1 | tr -cd '[:alnum:] ._+:/()-') ;;
+            *) version=$(chroot "$root" "$command_path" --version 2>&1 | head -n 1 | tr -cd '[:alnum:] ._+:/()-') ;;
         esac
-        version=$stderr_banner
     fi
+    [ -n "$version" ] || fail INSPECTION_VERSION_MISSING "$format version output is empty"
     verify_codec_round_trip "$root" "$format" "$version"
     command_hash=$(chroot "$root" sha256sum "$command_path" | awk '{print $1}')
     retained_apk=$(find "$repository" -maxdepth 1 -type f -name "$package_name-$package_version.apk" | LC_ALL=C sort | head -n 1)
@@ -623,6 +659,19 @@ record_inspection_command() {
       "command": "$command_path",
       "command_sha256": "$command_hash",
       "version": "$(json_escape "$version")",
+EOF
+    if [ "$format" = iso ]; then
+        cat >> "$output_file" <<EOF
+      "version_stdout_hex": "$version_stdout_hex",
+      "version_stdout_sha256": "$version_stdout_sha256",
+      "version_stdout_bytes": $version_stdout_bytes,
+      "stderr_banner": "$(json_escape "$configured_stderr_banner")",
+      "stderr_banner_framing": "$stderr_banner_framing",
+      "stderr_banner_bytes": $stderr_banner_bytes,
+      "stderr_banner_sha256": "$stderr_banner_sha256",
+EOF
+    fi
+    cat >> "$output_file" <<EOF
       "retained_apk_file": "$retained_basename",
       "retained_apk_sha256": "$retained_hash",
       "package_ownership_verified": true,
@@ -693,8 +742,11 @@ append_iso_report() {
     status=0
     chroot "$root" /usr/bin/xorriso -report_about WARNING -indev "$iso" "$@" \
         > "$report" 2> "$errors" || status=$?
-    expected_banner=$(inspection_evidence_value "$evidence" iso version)
-    assert_exact_xorriso_stderr "$errors" "$expected_banner" BOOT_LAYOUT_REPORT_STDERR "$label"
+    stderr_banner=$(inspection_evidence_value "$evidence" iso stderr_banner)
+    stderr_banner_framing=$(inspection_evidence_value "$evidence" iso stderr_banner_framing)
+    stderr_banner_bytes=$(inspection_evidence_value "$evidence" iso stderr_banner_bytes)
+    stderr_banner_sha256=$(inspection_evidence_value "$evidence" iso stderr_banner_sha256)
+    assert_exact_xorriso_stderr "$errors" "$stderr_banner" "$stderr_banner_framing" "$stderr_banner_bytes" "$stderr_banner_sha256" BOOT_LAYOUT_REPORT_STDERR "$label"
     if [ "$status" -ne 0 ]; then
         detail=$(tail -n 5 "$report" | tr -cd '[:alnum:] ._+:/()=-\n' | tr '\n' ' ' | cut -c1-320)
         [ -n "$detail" ] || detail=no-result-channel-diagnostic
