@@ -617,10 +617,12 @@ function Test-ClosedStagingBundle {
         $command = $commands[$index]
         $expected = @($Inputs.inspection_toolchain.PSObject.Properties)[$index].Value
         Assert-ClosedObjectKeys -Object $command -ExpectedKeys @('format','package','command','command_sha256','version','retained_apk_file','retained_apk_sha256','package_ownership_verified','path_verified','round_trip_verified','retained_apk_verified','contract_source','retained_repository') -Code 'INSPECTION_TOOLCHAIN_INVALID' -Label 'inspection command'
+        $expectedVersion = if ($expected.PSObject.Properties.Name -ccontains 'stderr_banner') { [string]$expected.stderr_banner } else { $null }
         if ($command.package -cne $expected.package -or $command.command -cne $expected.command -or $command.command_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
             -not [bool]$command.package_ownership_verified -or -not [bool]$command.path_verified -or -not [bool]$command.round_trip_verified -or -not [bool]$command.retained_apk_verified -or
             $command.retained_apk_sha256 -cnotmatch '^[0-9a-f]{64}$' -or $command.retained_apk_file -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*[.]apk$' -or
-            $command.contract_source -cne 'builder/inputs.json:inspection_toolchain' -or $command.retained_repository -cne $lock.repository_object_id -or [string]::IsNullOrWhiteSpace([string]$command.version)) {
+            $command.contract_source -cne 'builder/inputs.json:inspection_toolchain' -or $command.retained_repository -cne $lock.repository_object_id -or [string]::IsNullOrWhiteSpace([string]$command.version) -or
+            ($null -ne $expectedVersion -and [string]$command.version -cne $expectedVersion)) {
             throw (New-BuildException -Code 'INSPECTION_TOOLCHAIN_INVALID' -Message 'A decoder lacks exact package, path, retained APK, or round-trip evidence.')
         }
     }

@@ -228,11 +228,11 @@ assert_decoder_log_clean() {
     if [ "$format" = iso9660 ]; then
         expected_banner=$(evidence_field iso version)
         [ -n "$expected_banner" ] || fail INSPECTION_TOOLCHAIN_VERSION_MISSING "locked xorriso version evidence is absent"
-        banner_count=$(grep -Fxc -- "$expected_banner" "$log" 2>/dev/null || true)
-        [ "$banner_count" -le 1 ] || fail INSPECTION_DECODER_WARNING "xorriso emitted duplicate startup banners"
-        filtered=$log.filtered
-        grep -Fvx -- "$expected_banner" "$log" > "$filtered" || true
-        mv "$filtered" "$log"
+        expected=$log.expected
+        printf '%s\n\n' "$expected_banner" > "$expected"
+        [ ! -s "$log" ] || cmp "$log" "$expected" >/dev/null \
+            || fail INSPECTION_DECODER_WARNING "xorriso stderr differs from the exact locked framed banner"
+        : > "$log"
     fi
     [ ! -s "$log" ] || fail INSPECTION_DECODER_WARNING "$format decoder emitted warning or parser residue"
 }

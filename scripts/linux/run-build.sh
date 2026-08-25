@@ -181,18 +181,17 @@ assert_exact_xorriso_stderr() {
     expected_banner=$2
     code=$3
     label=$4
-    [ -n "$expected_banner" ] || fail "$code" "$label lacks locked xorriso version evidence"
-    banner_count=$(grep -Fxc -- "$expected_banner" "$log" 2>/dev/null || true)
-    [ "$banner_count" -le 1 ] || fail "$code" "$label emitted duplicate xorriso startup banners"
-    filtered=$log.filtered
-    grep -Fvx -- "$expected_banner" "$log" > "$filtered" || true
-    if [ -s "$filtered" ]; then
-        residue_bytes=$(file_bytes "$filtered")
-        residue_hash=$(sha256_file "$filtered")
-        residue_text=$(head -c 256 "$filtered" | tr '\r\n' '  ' | tr -cd '[:alnum:] ._+:/()=,-')
+    [ -n "$expected_banner" ] || fail "$code" "$label lacks locked xorriso banner evidence"
+    expected=$log.expected
+    printf '%s\n\n' "$expected_banner" > "$expected"
+    if [ -s "$log" ] && ! cmp "$log" "$expected" >/dev/null; then
+        residue_bytes=$(file_bytes "$log")
+        residue_hash=$(sha256_file "$log")
+        residue_text=$(head -c 256 "$log" | tr '\r\n' '  ' | tr -cd '[:alnum:] ._+:/()=,-')
         [ -n "$residue_text" ] || residue_text=no-printable-diagnostic
         fail "$code" "$label emitted non-banner xorriso stderr bytes=$residue_bytes sha256=$residue_hash text=$residue_text"
     fi
+    : > "$log"
 }
 
 require_public_contract() {
@@ -207,6 +206,7 @@ require_public_contract() {
     grep -F '"lz4=1.10.0-r1"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "lz4 pin missing"
     grep -F '"cpio=2.15-r0"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "cpio pin missing"
     grep -F '"decoder": ["/usr/bin/xorriso", "-report_about", "WARNING", "-osirrox", "on", "-indev", "{container}", "-concat", "overwrite", "-", "/{member}", "--"]' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "ISO decoder contract changed"
+    grep -F '"stderr_banner": "xorriso 1.5.8 : RockRidge filesystem manipulator, libburnia project."' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "xorriso stderr banner is not exactly pinned"
     grep -F '"package": "tar=1.35-r5"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "tar decoder package pin missing"
     grep -F '"package": "apk-tools=3.0.7-r0"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "APK decoder package pin missing"
     grep -F '"max_depth": 8' "$INPUTS_FILE" >/dev/null || fail INPUT_INSPECTION_POLICY_INVALID "inspection depth policy changed"
@@ -599,6 +599,14 @@ record_inspection_command() {
         *) version=$(chroot "$root" "$command_path" --version 2>&1 | head -n 1 | tr -cd '[:alnum:] ._+:/()-') ;;
     esac
     [ -n "$version" ] || fail INSPECTION_VERSION_MISSING "$format version output is empty"
+    if [ "$format" = iso ]; then
+        stderr_banner=$(inspection_value iso stderr_banner)
+        case "$stderr_banner" in
+            "$version "*) ;;
+            *) fail INSPECTION_VERSION_MISMATCH "pinned xorriso banner does not begin with actual -version output" ;;
+        esac
+        version=$stderr_banner
+    fi
     verify_codec_round_trip "$root" "$format" "$version"
     command_hash=$(chroot "$root" sha256sum "$command_path" | awk '{print $1}')
     retained_apk=$(find "$repository" -maxdepth 1 -type f -name "$package_name-$package_version.apk" | LC_ALL=C sort | head -n 1)
