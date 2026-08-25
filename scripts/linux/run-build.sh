@@ -453,11 +453,13 @@ build_from_local() {
         > "$build_root/etc/group"
     chmod 0644 "$build_root/etc/passwd" "$build_root/etc/group"
     mkdir -p "$build_root/work/mkimage" "$build_root/export/raw"
+    chmod 0755 "$build_root" "$build_root/home" "$build_root/work" "$build_root/run"
+    chmod -R a-w,a+rX "$build_root/repo" "$build_root/work/aports" "$build_root/workspace"
     chown -R "$builder_uid:$builder_gid" \
         "$build_root/home/$builder_user" "$build_root/work/mkimage" "$build_root/export"
-    chown "$builder_uid:$builder_gid" \
-        "$build_root/run/300k-secrets/300k.rsa" "$build_root/run/300k-secrets/300k.rsa.pub"
-    chmod 0600 "$build_root/run/300k-secrets/300k.rsa"
+    chown -R "$builder_uid:$builder_gid" "$build_root/run/300k-secrets"
+    chmod 0700 "$build_root/run/300k-secrets"
+    chmod 0600 "$build_root/run/300k-secrets/300k.rsa" "$build_root/run/300k-secrets/300k.rsa.pub"
     chmod 0700 "$build_root/home/$builder_user/.mkimage"
     chmod 1777 "$build_root/tmp"
     apk --root "$build_root" --no-network list --installed --manifest | LC_ALL=C sort > "$EXPORT_ROOT/builder-packages.lock"
@@ -492,13 +494,20 @@ build_from_local() {
         fail MKIMAGE_DEV_MOUNT_FAILED "builder device mount failed"
     fi
     mkimage_status=0
-    chroot "$build_root" /bin/su -s /bin/sh -c "$mkimage_command" "$builder_user" \
-        || mkimage_status=$?
+    builder_probe='test "$(id -u)" = 1000 && test -x /bin/sh && test -r /repo/x86_64/APKINDEX.tar.gz && test -r /run/300k-secrets/300k.rsa && test -w /work/mkimage && test -w /export/raw'
+    if ! chroot "$build_root" /bin/su -s /bin/sh -c "$builder_probe" "$builder_user"; then
+        mkimage_status=126
+    else
+        chroot "$build_root" /bin/su -s /bin/sh -c "$mkimage_command" "$builder_user" \
+            || mkimage_status=$?
+    fi
     mount_cleanup_status=0
     umount "$build_root/dev" || mount_cleanup_status=1
     umount "$build_root/proc" || mount_cleanup_status=1
     [ "$mount_cleanup_status" -eq 0 ] \
         || fail MKIMAGE_MOUNT_CLEANUP_FAILED "builder proc/device cleanup failed"
+    [ "$mkimage_status" -ne 126 ] \
+        || fail MKIMAGE_IDENTITY_INVALID "builder uid or path permissions are invalid"
     [ "$mkimage_status" -eq 0 ] \
         || fail MKIMAGE_FAILED "pinned offline aports build failed"
     verify_repository_snapshot "$object_root"
