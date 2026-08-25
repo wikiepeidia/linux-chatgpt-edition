@@ -551,7 +551,7 @@ record_inspection_command() {
     esac
     [ -n "$version" ] || fail INSPECTION_VERSION_MISSING "$format version output is empty"
     verify_codec_round_trip "$root" "$format"
-    command_hash=$(sha256_file "$root$command_path")
+    command_hash=$(chroot "$root" sha256sum "$command_path" | awk '{print $1}')
     retained_apk=$(find "$repository" -maxdepth 1 -type f -name "$package_name-$package_version.apk" | LC_ALL=C sort | head -n 1)
     require_file "$retained_apk"
     retained_basename=$(basename "$retained_apk")
@@ -610,7 +610,11 @@ assert_inspection_toolchain_identity() {
 run_inspector_self_test() {
     root=$1
     chroot "$root" /bin/sh /workspace/scripts/linux/inspect-iso.sh self-test /work/inspection-self-test \
-        || fail INSPECTION_SELF_TEST_FAILED "hostile compressed-layer fixture suite failed"
+        > "$root/work/inspector-self-test.log" 2>&1 \
+        || { tail -n 80 "$root/work/inspector-self-test.log" >&2 || true; fail INSPECTION_SELF_TEST_FAILED "hostile compressed-layer fixture suite failed"; }
+    grep -F '300K_INSPECTOR_SELF_TEST_PASS' "$root/work/inspector-self-test.log" >/dev/null \
+        || fail INSPECTION_SELF_TEST_FAILED "hostile fixture suite returned no non-vacuous pass marker"
+    printf '%s\n' passed > "$root/work/inspector-self-test.passed"
 }
 
 inspect_iso_artifact() {

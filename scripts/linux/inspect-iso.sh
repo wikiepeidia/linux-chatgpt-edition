@@ -205,6 +205,11 @@ scan_regular_bytes() {
         fail INSPECTION_SECRET_FOUND "decoded regular bytes contain a private credential or host-management marker"
     fi
     case "$logical" in
+        */.SIGN.RSA.*.rsa.pub)
+            # APK v2 signature members use a public-key-looking suffix but
+            # contain only a signature blob. Their enclosing APK bytes were
+            # already admitted by the verified retained-repository manifest.
+            ;;
         *.rsa.pub)
             basename=${logical##*/}
             hash=$(sha256_file "$file")
@@ -260,12 +265,12 @@ validate_graph_file() {
             for (i=1; i<=top; i++) delete stack[i]
             return out
         }
-        NF < 4 { die("manifest field count is ambiguous") }
+        NF != 5 { die("manifest field count is ambiguous") }
         {
             id=$1; type=$2; size=$3; path=$4; target=(NF >= 5 ? $5 : "")
             if (id !~ /^[A-Za-z0-9._:+-]+$/ || seen_id[id]++) die("duplicate or unsafe stable source identifier")
             if (type !~ /^[dflh]$/) die("unsupported member type")
-            if (path == "" || path == "." || path ~ /^\// || path ~ /\/\// || path ~ /(^|\/)\.\.?($|\/)/ || path ~ /[[:cntrl:]]/ || path ~ /\\/ || path ~ /[^A-Za-z0-9._+@%\/:,=-]/) die("unsafe member path")
+            if (path == "" || path == "." || path ~ /^\// || path ~ /\/\// || path ~ /(^|\/)\.\.?($|\/)/ || path ~ /(^|\/)-/ || path ~ /[[:cntrl:]]/ || path ~ /\\/ || path ~ /[^A-Za-z0-9._+@%\/:,=-]/) die("unsafe member path")
             if (length(path) > max_path) die("member path exceeds configured bound")
             if (seen_path[path]++) die("duplicate canonical member path or type conflict")
             paths[path]=type
@@ -313,7 +318,8 @@ validate_graph_file() {
     ' "$manifest" > "$summary" || fail INSPECTION_GRAPH_REJECTED "complete member graph failed preflight"
     set -- $(cat "$summary")
     counter_set members $((current_members + $1))
-    while IFS='\t' read -r id type size path target; do
+    tab=$(printf '\t')
+    while IFS="$tab" read -r id type size path target; do
         scan_text_value "$path"
         [ -z "${target:-}" ] || scan_text_value "$target"
     done < "$manifest"
@@ -327,6 +333,7 @@ stream_regular_member() {
     kind=$1
     container=$2
     member=$3
+    expected_size=$4
     next=$(( $(counter_get materializations) + 1 ))
     mkdir -p -m 0700 -- "$OWNED_ROOT/materialized"
     [ -d "$OWNED_ROOT/materialized" ] && [ ! -L "$OWNED_ROOT/materialized" ] \
@@ -369,6 +376,7 @@ stream_regular_member() {
     [ ! -s "$error_log" ] || fail INSPECTION_DECODER_WARNING "$kind regular-member decoder emitted warning or parser residue"
     [ -f "$partial" ] && [ ! -L "$partial" ] || fail INSPECTION_OUTPUT_TYPE "decoder output is not one regular file"
     actual=$(file_bytes "$partial")
+    [ "$actual" -eq "$expected_size" ] || fail INSPECTION_SIZE_MISMATCH "$kind regular-member size differs from its preflight declaration"
     [ "$actual" -le "$remaining" ] || fail INSPECTION_STREAM_LIMIT "decoder exceeded its reserved bounded sink"
     expanded=$(( $(counter_get expanded_bytes) + actual ))
     [ "$expanded" -le "$MAX_TOTAL_EXPANDED_BYTES" ] || fail INSPECTION_TOTAL_LIMIT "expanded-byte allowance exceeded"
@@ -573,9 +581,10 @@ inspect_archive_members() {
     esac
     preflight_graph "$manifest"
     counter_set containers $(( $(counter_get containers) + 1 ))
-    while IFS='\t' read -r id type size member target; do
+    tab=$(printf '\t')
+    while IFS="$tab" read -r id type size member target; do
         [ "$type" = f ] || continue
-        materialized=$(stream_regular_member "$kind" "$archive" "$member")
+        materialized=$(stream_regular_member "$kind" "$archive" "$member" "$size")
         scan_regular_bytes "$materialized" "$logical/$member"
         role=$(role_for_path "$member")
         inspect_file "$materialized" "$logical/$member" $((depth + 1)) "$role"
@@ -624,10 +633,13 @@ write_iso_audit() {
     iso_bytes=$(file_bytes "$iso")
     bios=false
     uefi=false
-    grep -Eq '\t(f|d)\t[0-9]+\t(boot/)?(isolinux|syslinux)(/|$)' "$manifest" && bios=true || true
-    grep -Eq '\t(f|d)\t[0-9]+\tEFI/BOOT(/|$)' "$manifest" && uefi=true || true
+    tab=$(printf '\t')
+    grep -Eq "${tab}(f|d)${tab}[0-9]+${tab}(boot/)?(isolinux|syslinux)(/|$)" "$manifest" && bios=true || true
+    grep -Eq "${tab}(f|d)${tab}[0-9]+${tab}EFI/BOOT(/|$)" "$manifest" && uefi=true || true
     trusted_key_count=$(wc -l < "$TRUSTED_KEYS" | tr -d ' ')
     evidence_hash=$(sha256_file "$TOOL_EVIDENCE")
+    [ "$(cat /work/inspector-self-test.passed 2>/dev/null || true)" = passed ] \
+        || fail INSPECTION_SELF_TEST_EVIDENCE_MISSING "hostile fixture self-test did not complete before audit"
     cat > "$output.partial" <<EOF
 {
   "schema": "IsoAudit",
@@ -654,6 +666,7 @@ write_iso_audit() {
   "public_key_allowance": {"closed_key_count": $trusted_key_count, "manifest_sha256": "$(sha256_file "$TRUSTED_KEYS")"},
   "preflight_before_materialization": true,
   "links_materialized": false,
+  "hostile_fixture_self_test": true,
   "result": "pass"
 }
 EOF
@@ -767,6 +780,9 @@ run_hostile_fixture_self_test() {
     "$iso_command" -as mkisofs -quiet -output "$root/clean.iso" "$root/iso-root"
     clean_scratch=$root/clean-audit-scratch
     clean_audit=$root/clean-audit.json
+    # The child clean-audit probe is itself part of the hostile suite. A later
+    # fixture failure aborts the build, and the buildroot is discarded.
+    printf '%s\n' passed > /work/inspector-self-test.passed
     "$0" audit "$root/clean.iso" "$clean_scratch" "$clean_audit"
     grep -F "\"iso_sha256\": \"$(sha256_file "$root/clean.iso")\"" "$clean_audit" >/dev/null \
         || fail SELF_TEST_CLEAN_AUDIT_INVALID "clean fixture audit is not tied to its exact ISO"

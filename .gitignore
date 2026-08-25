@@ -74,6 +74,13 @@ Desktop.ini
 *.vdi
 *.vmdk
 qemu.log
+management_ed25519
+management_ed25519.pub
+known_hosts
+seed/
+state/host-runs/
+state/runs/
+*.overlay
 
 # --- Linux package/build artifacts ---
 *.deb
@@ -87,10 +94,16 @@ qemu.log
 .env
 .env.*
 !.env.example
+*.rsa
 *.pem
 *.key
 secrets/
 credentials/
+
+# --- Transactional publication scratch ---
+.partial-*/
+*.partial
+LATEST.json.*.partial
 
 # --- AI / local model artifacts ---
 models/

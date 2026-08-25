@@ -179,7 +179,7 @@ function New-BuildRequest {
     if ($Source.git_commit -cnotmatch '^[0-9a-f]{40}$' -or $Source.archive_sha256 -cnotmatch '^[0-9a-f]{64}$' -or [long]$Source.source_date_epoch -le 0 -or [bool]$Source.dirty) {
         throw (New-BuildException -Code 'BUILD_SOURCE_INVALID' -Message 'BuildRequest source identity must be clean, exact, and positive-epoch.')
     }
-    foreach ($name in @('inputs_sha256', 'run_build_sha256', 'profile_sha256')) {
+    foreach ($name in @('inputs_sha256', 'run_build_sha256', 'inspect_iso_sha256', 'profile_sha256')) {
         if ([string](Get-ObjectProperty -Object $InputHashes -Name $name) -cnotmatch '^[0-9a-f]{64}$') {
             throw (New-BuildException -Code 'BUILD_INPUT_HASH_INVALID' -Message "Build input hash '$name' is malformed.")
         }
@@ -204,6 +204,7 @@ function New-BuildRequest {
         public_inputs = [ordered]@{
             inputs_sha256 = [string](Get-ObjectProperty -Object $InputHashes -Name 'inputs_sha256')
             run_build_sha256 = [string](Get-ObjectProperty -Object $InputHashes -Name 'run_build_sha256')
+            inspect_iso_sha256 = [string](Get-ObjectProperty -Object $InputHashes -Name 'inspect_iso_sha256')
             profile_sha256 = [string](Get-ObjectProperty -Object $InputHashes -Name 'profile_sha256')
         }
         builder = [ordered]@{
@@ -353,16 +354,16 @@ function Resolve-ExternalStateRoot {
         throw (New-BuildException -Code 'STATE_PATH_INSIDE_REPOSITORY' -Message 'State and secrets must remain outside the repository.')
     }
     $current = $full
-    while (-not [System.IO.Directory]::Exists($current)) {
+    while (-not [string]::IsNullOrWhiteSpace($current)) {
+        if ([System.IO.Directory]::Exists($current) -or [System.IO.File]::Exists($current)) {
+            $attributes = [System.IO.File]::GetAttributes($current)
+            if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw (New-BuildException -Code 'STATE_PATH_REPARSE_POINT' -Message 'State root may not traverse a reparse point.')
+            }
+        }
         $parent = [System.IO.Path]::GetDirectoryName($current)
         if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $current) { break }
         $current = $parent
-    }
-    if ([System.IO.Directory]::Exists($current)) {
-        $attributes = [System.IO.File]::GetAttributes($current)
-        if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw (New-BuildException -Code 'STATE_PATH_REPARSE_POINT' -Message 'State root may not traverse a reparse point.')
-        }
     }
     return $full
 }
@@ -392,7 +393,7 @@ function Assert-SourceArchiveUnixText {
     param([Parameter(Mandatory)] [string] $Path)
 
     $requiredEntries = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-    foreach ($entryName in @('scripts/linux/run-build.sh', 'builder/profiles/mkimg.300k.sh')) {
+    foreach ($entryName in @('scripts/linux/run-build.sh', 'scripts/linux/inspect-iso.sh', 'builder/profiles/mkimg.300k.sh')) {
         [void]$requiredEntries.Add($entryName)
     }
 
@@ -460,6 +461,355 @@ function Protect-PrivateSigningFile {
     [void](Invoke-CheckedProcess -FilePath $icacls -ArgumentList @($Path, '/inheritance:r', '/grant:r', "${identity}:(R,W)") -TimeoutSeconds 30 -RedactValue @($identity))
 }
 
+function Assert-ClosedObjectKeys {
+    param(
+        [Parameter(Mandatory)] $Object,
+        [Parameter(Mandatory)] [string[]] $ExpectedKeys,
+        [Parameter(Mandatory)] [string] $Code,
+        [Parameter(Mandatory)] [string] $Label
+    )
+    if ($null -eq $Object) { throw (New-BuildException -Code $Code -Message "$Label is null.") }
+    $actual = if ($Object -is [System.Collections.IDictionary]) { @($Object.Keys | ForEach-Object { [string]$_ }) } else { @($Object.PSObject.Properties.Name) }
+    $expectedSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $actualSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($key in $ExpectedKeys) { [void]$expectedSet.Add($key) }
+    foreach ($key in $actual) { [void]$actualSet.Add($key) }
+    if ($actual.Count -ne $ExpectedKeys.Count -or -not $actualSet.SetEquals($expectedSet)) {
+        throw (New-BuildException -Code $Code -Message "$Label has missing or unexpected keys.")
+    }
+}
+
+function Assert-ClosedRelativeArtifactName {
+    param([Parameter(Mandatory)] [string] $Name)
+    if (
+        [string]::IsNullOrWhiteSpace($Name) -or
+        $Name.Length -gt 160 -or
+        $Name -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$' -or
+        $Name.Contains('..', [System.StringComparison]::Ordinal) -or
+        [System.IO.Path]::IsPathRooted($Name) -or
+        $Name.IndexOfAny([char[]]@([char]0, [char]47, [char]92, "`r", "`n", "`t")) -ge 0
+    ) { throw (New-BuildException -Code 'ARTIFACT_NAME_INVALID' -Message 'Artifact names must be flat, relative, normalized, and separator-free.') }
+    return $Name
+}
+
+function Assert-NoReparseAncestors {
+    param([Parameter(Mandatory)] [string] $Path)
+    $current = [System.IO.Path]::GetFullPath($Path)
+    while (-not [string]::IsNullOrWhiteSpace($current)) {
+        if ([System.IO.Directory]::Exists($current) -or [System.IO.File]::Exists($current)) {
+            if (([System.IO.File]::GetAttributes($current) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw (New-BuildException -Code 'STAGING_REPARSE_POINT' -Message 'Artifact paths may not traverse a reparse point.')
+            }
+        }
+        $parent = [System.IO.Path]::GetDirectoryName($current)
+        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $current) { break }
+        $current = $parent
+    }
+}
+
+function Get-ClosedRegularArtifact {
+    param([Parameter(Mandatory)] [string] $BaseDirectory, [Parameter(Mandatory)] [string] $Name)
+    $safeName = Assert-ClosedRelativeArtifactName -Name $Name
+    $root = [System.IO.Path]::GetFullPath($BaseDirectory).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    Assert-NoReparseAncestors -Path $root
+    $path = [System.IO.Path]::GetFullPath((Join-Path $root $safeName))
+    if (-not $path.StartsWith($root + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw (New-BuildException -Code 'STAGING_PATH_ESCAPE' -Message 'Artifact path escaped its staging root.')
+    }
+    if (-not [System.IO.File]::Exists($path)) { throw (New-BuildException -Code 'STAGING_FILE_MISSING' -Message "Required artifact '$safeName' is absent.") }
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.Length -le 0) {
+        throw (New-BuildException -Code 'STAGING_FILE_INVALID' -Message "Artifact '$safeName' is not one positive regular no-follow file.")
+    }
+    return $item
+}
+
+function Read-ClosedJsonArtifact {
+    param([Parameter(Mandatory)] [string] $Path, [Parameter(Mandatory)] [string] $Code)
+    try { return Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json -Depth 64 }
+    catch { throw (New-BuildException -Code $Code -Message "JSON artifact '$([System.IO.Path]::GetFileName($Path))' is malformed." -InnerException $_.Exception) }
+}
+
+function Assert-StagingTextSecretFree {
+    param([Parameter(Mandatory)] [string] $Path, [Parameter(Mandatory)] [string] $Name)
+    $text = [System.IO.File]::ReadAllText($Path)
+    $secretPattern = '(?i)(FICT[A-Z0-9_]*SECRET_TOKEN[=:]|BEGIN [A-Z0-9 ]*PRIVATE KEY|[A-Za-z]:\\Users\\|\\\\[^\\\s]+\\[^\\\s]+|wikiepeidia|management_ed25519|/run/300k-secrets)'
+    if ($text -match $secretPattern) { throw (New-BuildException -Code 'STAGING_SECRET_FOUND' -Message "Artifact '$Name' contains private management material.") }
+    if ($Name -ceq 'serial-diagnostic.log') {
+        $lines = @($text -split "`r?`n" | Where-Object { -not [string]::IsNullOrEmpty($_) })
+        if ($lines.Count -eq 0 -or @($lines | Where-Object { $_ -cnotmatch '^300K_[A-Z0-9_]+(?:\s+[A-Za-z0-9_./:+=-]+)*$' }).Count -ne 0) {
+            throw (New-BuildException -Code 'STAGING_SERIAL_INVALID' -Message 'Sanitized serial diagnostic is empty or contains a non-allowlisted line.')
+        }
+    }
+}
+
+function Test-ClosedStagingBundle {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $StagingDirectory,
+        [Parameter(Mandatory)] [string] $ExpectedBuildRequestSha256,
+        [Parameter(Mandatory)] $Inputs,
+        [Parameter(Mandatory)] $BuildRequest
+    )
+    $root = [System.IO.Path]::GetFullPath($StagingDirectory)
+    if (-not [System.IO.Directory]::Exists($root)) { throw (New-BuildException -Code 'STAGING_DIRECTORY_MISSING' -Message 'Backend staging directory is absent.') }
+    Assert-NoReparseAncestors -Path $root
+    $entries = @(Get-ChildItem -LiteralPath $root -Force)
+    if (@($entries | Where-Object { $_.PSIsContainer -or ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 }).Count -ne 0) {
+        throw (New-BuildException -Code 'STAGING_FILE_SET_INVALID' -Message 'Staging contains a directory, link, or reparse point.')
+    }
+    $isoEntries = @($entries | Where-Object { $_.Name -cmatch '^300k-bootstrap-x86_64-[0-9a-f]{12}[.]iso$' })
+    if ($isoEntries.Count -ne 1) { throw (New-BuildException -Code 'BUILD_ISO_MISSING' -Message 'Staging must contain exactly one hash-qualified ISO.') }
+    $isoName = $isoEntries[0].Name
+    $requiredNames = @(
+        'build-request.json', 'resolved-build-lock.json', 'builder-packages.lock', 'apk-files.sha256',
+        $isoName, 'boot-layout.txt', 'iso-audit.json', 'SHA256SUMS', 'qemu-image-info.json',
+        'environment-report.json', 'serial-diagnostic.log', 'repository-evidence.json', 'resource-inventory.json'
+    )
+    $actualNames = @($entries.Name | Sort-Object -CaseSensitive)
+    $expectedNames = @($requiredNames | Sort-Object -CaseSensitive)
+    if ((ConvertTo-Json $actualNames -Compress) -cne (ConvertTo-Json $expectedNames -Compress)) {
+        throw (New-BuildException -Code 'STAGING_FILE_SET_INVALID' -Message 'Staging file set is missing, duplicated, or contains an unexpected artifact.')
+    }
+    $items = [ordered]@{}
+    foreach ($name in $requiredNames) { $items[$name] = Get-ClosedRegularArtifact -BaseDirectory $root -Name $name }
+    foreach ($name in @('boot-layout.txt', 'serial-diagnostic.log', 'builder-packages.lock', 'apk-files.sha256', 'SHA256SUMS')) {
+        Assert-StagingTextSecretFree -Path $items[$name].FullName -Name $name
+    }
+
+    $requestPath = $items['build-request.json'].FullName
+    if ((Get-LowerFileSha256 -Path $requestPath) -cne $ExpectedBuildRequestSha256 -or [System.IO.File]::ReadAllText($requestPath) -cne (ConvertTo-CanonicalJsonText -Value $BuildRequest)) {
+        throw (New-BuildException -Code 'BUILD_REQUEST_EVIDENCE_INVALID' -Message 'Staged BuildRequest does not match the immutable host request bytes.')
+    }
+    $lock = Read-ClosedJsonArtifact -Path $items['resolved-build-lock.json'].FullName -Code 'RESOLVED_LOCK_INVALID'
+    Assert-ClosedObjectKeys -Object $lock -ExpectedKeys @('schema','schema_version','build_request_sha256','repository_object_id','repository_indexes','aports','trusted_keys','trust_policy','builder_packages_record','apk_files_record','inspection_commands','inspection_toolchain_sha256','offline_install','artifacts') -Code 'RESOLVED_LOCK_INVALID' -Label 'ResolvedBuildLock'
+    [void](Test-ResolvedBuildLock -Lock $lock -ExpectedBuildRequestSha256 $ExpectedBuildRequestSha256)
+    if ([int]$lock.schema_version -ne 1) { throw (New-BuildException -Code 'RESOLVED_LOCK_INVALID' -Message 'ResolvedBuildLock version is unsupported.') }
+    Assert-ClosedObjectKeys -Object $lock.aports -ExpectedKeys @('commit','archive_sha256') -Code 'RESOLVED_LOCK_INVALID' -Label 'ResolvedBuildLock.aports'
+    Assert-ClosedObjectKeys -Object $lock.trust_policy -ExpectedKeys @('mkimage_hostkeys','closed_keyring_verified','signature_bypass') -Code 'RESOLVED_LOCK_INVALID' -Label 'ResolvedBuildLock.trust_policy'
+    Assert-ClosedObjectKeys -Object $lock.offline_install -ExpectedKeys @('repositories','apk_no_network','network_disabled','complete_manifest_verified') -Code 'RESOLVED_LOCK_INVALID' -Label 'ResolvedBuildLock.offline_install'
+    if ($lock.aports.commit -cne $Inputs.aports.commit -or $lock.aports.archive_sha256 -cnotmatch '^[0-9a-f]{64}$' -or -not [bool]$lock.trust_policy.mkimage_hostkeys -or -not [bool]$lock.trust_policy.closed_keyring_verified -or [bool]$lock.trust_policy.signature_bypass -or
+        (ConvertTo-Json @($lock.offline_install.repositories) -Compress) -cne '["file:///repo"]' -or -not [bool]$lock.offline_install.apk_no_network -or -not [bool]$lock.offline_install.network_disabled -or -not [bool]$lock.offline_install.complete_manifest_verified) {
+        throw (New-BuildException -Code 'RESOLVED_LOCK_INVALID' -Message 'ResolvedBuildLock trust, aports, or offline-install contract is invalid.')
+    }
+    $indexes = @($lock.repository_indexes)
+    if ($indexes.Count -ne @($Inputs.alpine.repositories).Count) { throw (New-BuildException -Code 'RESOLVED_LOCK_INVALID' -Message 'Repository index set is not closed.') }
+    for ($index = 0; $index -lt $indexes.Count; $index++) {
+        Assert-ClosedObjectKeys -Object $indexes[$index] -ExpectedKeys @('name','sha256','signature_verified') -Code 'RESOLVED_LOCK_INVALID' -Label 'ResolvedBuildLock.repository_indexes record'
+        if ($indexes[$index].name -cne $Inputs.alpine.repositories[$index].name -or $indexes[$index].sha256 -cne $Inputs.alpine.repositories[$index].apkindex_sha256 -or -not [bool]$indexes[$index].signature_verified) { throw (New-BuildException -Code 'RESOLVED_LOCK_INVALID' -Message 'Repository index evidence differs from public inputs.') }
+    }
+    foreach ($trustedKey in @($lock.trusted_keys)) {
+        Assert-ClosedObjectKeys -Object $trustedKey -ExpectedKeys @('file','sha256','trust') -Code 'RESOLVED_LOCK_TRUSTED_KEYS_INVALID' -Label 'ResolvedBuildLock.trusted_keys record'
+    }
+    [void](Test-ResolvedTrustedKeys -TrustedKeys @($lock.trusted_keys) -RepositoryKeys $Inputs.alpine.repository_keys -SigningPublicSha256 $BuildRequest.signing.public_key_sha256)
+    foreach ($recordName in @('builder_packages_record', 'apk_files_record')) {
+        $generatedRecord = Get-ObjectProperty -Object $lock -Name $recordName
+        Assert-ClosedObjectKeys -Object $generatedRecord -ExpectedKeys @('file','sha256','bytes','producer','validator') -Code 'GENERATED_RECORD_INVALID' -Label $recordName
+        [void](Test-GeneratedFileRecord -Record $generatedRecord -BaseDirectory $root -ExpectedProducer 'run-build.sh:prepare-repository')
+    }
+    if ($lock.inspection_toolchain_sha256 -cnotmatch '^[0-9a-f]{64}$') { throw (New-BuildException -Code 'INSPECTION_TOOLCHAIN_INVALID' -Message 'Inspection toolchain identity is malformed.') }
+    $expectedFormats = @($Inputs.inspection_toolchain.PSObject.Properties.Name)
+    $commands = @($lock.inspection_commands)
+    if ($commands.Count -ne $expectedFormats.Count -or (ConvertTo-Json @($commands.format) -Compress) -cne (ConvertTo-Json $expectedFormats -Compress)) {
+        throw (New-BuildException -Code 'INSPECTION_TOOLCHAIN_INVALID' -Message 'Resolved inspection command set is not closed and ordered.')
+    }
+    for ($index = 0; $index -lt $commands.Count; $index++) {
+        $command = $commands[$index]
+        $expected = @($Inputs.inspection_toolchain.PSObject.Properties)[$index].Value
+        Assert-ClosedObjectKeys -Object $command -ExpectedKeys @('format','package','command','command_sha256','version','retained_apk_file','retained_apk_sha256','package_ownership_verified','path_verified','round_trip_verified','retained_apk_verified','contract_source','retained_repository') -Code 'INSPECTION_TOOLCHAIN_INVALID' -Label 'inspection command'
+        if ($command.package -cne $expected.package -or $command.command -cne $expected.command -or $command.command_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            -not [bool]$command.package_ownership_verified -or -not [bool]$command.path_verified -or -not [bool]$command.round_trip_verified -or -not [bool]$command.retained_apk_verified -or
+            $command.retained_apk_sha256 -cnotmatch '^[0-9a-f]{64}$' -or $command.retained_apk_file -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*[.]apk$' -or
+            $command.contract_source -cne 'builder/inputs.json:inspection_toolchain' -or $command.retained_repository -cne $lock.repository_object_id -or [string]::IsNullOrWhiteSpace([string]$command.version)) {
+            throw (New-BuildException -Code 'INSPECTION_TOOLCHAIN_INVALID' -Message 'A decoder lacks exact package, path, retained APK, or round-trip evidence.')
+        }
+    }
+
+    $isoItem = $items[$isoName]
+    $isoHash = Get-LowerFileSha256 -Path $isoItem.FullName
+    if ($isoName -cne "300k-bootstrap-x86_64-$($isoHash.Substring(0,12)).iso") { throw (New-BuildException -Code 'ISO_REFERENCE_MISMATCH' -Message 'ISO basename does not identify its host-measured bytes.') }
+    $audit = Read-ClosedJsonArtifact -Path $items['iso-audit.json'].FullName -Code 'ISO_AUDIT_INVALID'
+    Assert-ClosedObjectKeys -Object $audit -ExpectedKeys @('schema','schema_version','iso_sha256','iso_bytes','inspection_toolchain_sha256','accepted_decoders','limits','counts','structural_boot_findings','public_key_allowance','preflight_before_materialization','links_materialized','hostile_fixture_self_test','result') -Code 'ISO_AUDIT_INVALID' -Label 'IsoAudit'
+    Assert-ClosedObjectKeys -Object $audit.limits -ExpectedKeys @('max_depth','max_members','max_path_bytes','max_file_bytes','max_total_expanded_bytes') -Code 'ISO_AUDIT_INVALID' -Label 'IsoAudit.limits'
+    Assert-ClosedObjectKeys -Object $audit.counts -ExpectedKeys @('members','regular_files','containers','expanded_bytes','max_observed_depth') -Code 'ISO_AUDIT_INVALID' -Label 'IsoAudit.counts'
+    Assert-ClosedObjectKeys -Object $audit.structural_boot_findings -ExpectedKeys @('bios_tree_present','uefi_tree_present','classification') -Code 'ISO_AUDIT_INVALID' -Label 'IsoAudit.structural_boot_findings'
+    Assert-ClosedObjectKeys -Object $audit.public_key_allowance -ExpectedKeys @('closed_key_count','manifest_sha256') -Code 'ISO_AUDIT_INVALID' -Label 'IsoAudit.public_key_allowance'
+    if ($audit.schema -cne 'IsoAudit' -or [int]$audit.schema_version -ne 1 -or $audit.result -cne 'pass' -or -not [bool]$audit.preflight_before_materialization -or [bool]$audit.links_materialized -or -not [bool]$audit.hostile_fixture_self_test) {
+        throw (New-BuildException -Code 'ISO_AUDIT_INVALID' -Message 'Decoded ISO audit result or safety flags are invalid.')
+    }
+    if ($audit.iso_sha256 -cne $isoHash -or [long]$audit.iso_bytes -ne [long]$isoItem.Length -or $audit.inspection_toolchain_sha256 -cne $lock.inspection_toolchain_sha256) {
+        throw (New-BuildException -Code 'ISO_REFERENCE_MISMATCH' -Message 'Audit, lock, and host-measured ISO identity disagree.')
+    }
+    if ((ConvertTo-Json @($audit.accepted_decoders) -Compress) -cne (ConvertTo-Json $expectedFormats -Compress)) {
+        throw (New-BuildException -Code 'ISO_AUDIT_INVALID' -Message 'Audit decoder set differs from public inputs.')
+    }
+    foreach ($limit in @('max_depth','max_members','max_path_bytes','max_file_bytes','max_total_expanded_bytes')) {
+        if ([long](Get-ObjectProperty -Object $audit.limits -Name $limit) -ne [long](Get-ObjectProperty -Object $Inputs.inspection_policy.limits -Name $limit)) {
+            throw (New-BuildException -Code 'ISO_AUDIT_INVALID' -Message "Audit limit '$limit' differs from public inputs.")
+        }
+    }
+    if ([long]$audit.counts.members -le 0 -or [long]$audit.counts.regular_files -le 0 -or [long]$audit.counts.regular_files -gt [long]$audit.counts.members -or [long]$audit.counts.containers -le 0 -or [long]$audit.counts.expanded_bytes -le 0 -or
+        [long]$audit.counts.expanded_bytes -gt [long]$Inputs.inspection_policy.limits.max_total_expanded_bytes -or [int]$audit.counts.max_observed_depth -lt 0 -or [int]$audit.counts.max_observed_depth -gt [int]$Inputs.inspection_policy.limits.max_depth -or
+        [int]$audit.public_key_allowance.closed_key_count -ne 4 -or $audit.public_key_allowance.manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $audit.structural_boot_findings.classification -cne 'structural' -or -not [bool]$audit.structural_boot_findings.bios_tree_present -or -not [bool]$audit.structural_boot_findings.uefi_tree_present) {
+        throw (New-BuildException -Code 'ISO_AUDIT_INVALID' -Message 'Audit counts or public-key allowance are vacuous.')
+    }
+    $checksumLine = [System.IO.File]::ReadAllText($items['SHA256SUMS'].FullName).Replace("`r`n", "`n")
+    if ($checksumLine -cne "$isoHash  $isoName`n") { throw (New-BuildException -Code 'ISO_REFERENCE_MISMATCH' -Message 'SHA256SUMS does not contain the one exact ISO record.') }
+    $artifactMap = [ordered]@{ bootstrap_iso = $isoName; decoded_iso_audit = 'iso-audit.json'; iso_checksums = 'SHA256SUMS' }
+    if (@($lock.artifacts).Count -ne 3) { throw (New-BuildException -Code 'ISO_REFERENCE_MISMATCH' -Message 'ResolvedBuildLock artifact set is not closed.') }
+    foreach ($record in @($lock.artifacts)) {
+        Assert-ClosedObjectKeys -Object $record -ExpectedKeys @('role','file','sha256','bytes') -Code 'ISO_REFERENCE_MISMATCH' -Label 'ResolvedBuildLock artifact'
+        if (-not $artifactMap.Contains([string]$record.role) -or $artifactMap[[string]$record.role] -cne [string]$record.file) { throw (New-BuildException -Code 'ISO_REFERENCE_MISMATCH' -Message 'ResolvedBuildLock artifact role or filename is unexpected.') }
+        $recordItem = $items[[string]$record.file]
+        if ($record.sha256 -cne (Get-LowerFileSha256 -Path $recordItem.FullName) -or [long]$record.bytes -ne [long]$recordItem.Length) { throw (New-BuildException -Code 'ISO_REFERENCE_MISMATCH' -Message 'ResolvedBuildLock artifact bytes differ from host measurement.') }
+    }
+    $inventory = Read-ClosedJsonArtifact -Path $items['resource-inventory.json'].FullName -Code 'RESOURCE_INVENTORY_INVALID'
+    Assert-ClosedObjectKeys -Object $inventory -ExpectedKeys @('schema_version','cleanup_complete','resources') -Code 'RESOURCE_INVENTORY_INVALID' -Label 'ResourceInventory'
+    Assert-ClosedObjectKeys -Object $inventory.resources -ExpectedKeys @('qemu_lease_live','seed_listener_live','serial_listener_live','port_reservation_live','ssh_identity_present','known_hosts_present','overlay_present','management_scratch_present') -Code 'RESOURCE_INVENTORY_INVALID' -Label 'ResourceInventory.resources'
+    if (-not [bool]$inventory.cleanup_complete -or @($inventory.resources.PSObject.Properties | Where-Object { [bool]$_.Value }).Count -ne 0) { throw (New-BuildException -Code 'RESOURCE_INVENTORY_INVALID' -Message 'QEMU resource inventory is not completely drained.') }
+
+    $repositoryEvidence = Read-ClosedJsonArtifact -Path $items['repository-evidence.json'].FullName -Code 'REPOSITORY_EVIDENCE_INVALID'
+    Assert-ClosedObjectKeys -Object $repositoryEvidence -ExpectedKeys @('schema','schema_version','build_request_sha256','repository_object_id','apk_count','official_indexes_verified','official_signatures_verified','content_addressed_snapshot_verified') -Code 'REPOSITORY_EVIDENCE_INVALID' -Label 'RepositoryEvidence'
+    if ($repositoryEvidence.schema -cne 'RepositoryEvidence' -or [int]$repositoryEvidence.schema_version -ne 1 -or $repositoryEvidence.build_request_sha256 -cne $ExpectedBuildRequestSha256 -or $repositoryEvidence.repository_object_id -cne $lock.repository_object_id -or [long]$repositoryEvidence.apk_count -le 0 -or -not [bool]$repositoryEvidence.official_indexes_verified -or -not [bool]$repositoryEvidence.official_signatures_verified -or -not [bool]$repositoryEvidence.content_addressed_snapshot_verified) { throw (New-BuildException -Code 'REPOSITORY_EVIDENCE_INVALID' -Message 'Repository evidence is malformed or refers to different bytes.') }
+    $qemuInfo = Read-ClosedJsonArtifact -Path $items['qemu-image-info.json'].FullName -Code 'QEMU_IMAGE_INFO_INVALID'
+    Assert-ClosedObjectKeys -Object $qemuInfo -ExpectedKeys @('format','virtual_size','actual_size') -Code 'QEMU_IMAGE_INFO_INVALID' -Label 'QEMU image info'
+    if ($qemuInfo.format -cne 'raw' -or [long]$qemuInfo.actual_size -ne [long]$isoItem.Length -or [long]$qemuInfo.virtual_size -lt [long]$isoItem.Length) { throw (New-BuildException -Code 'QEMU_IMAGE_INFO_INVALID' -Message 'QEMU image report differs from the ISO bytes.') }
+    $environment = Read-ClosedJsonArtifact -Path $items['environment-report.json'].FullName -Code 'ENVIRONMENT_REPORT_INVALID'
+    Assert-ClosedObjectKeys -Object $environment -ExpectedKeys @('schema_version','backend','backend_status','guest_os','guest_arch','alpine_release','qemu_cloud_image_sha512','docker_status','docker_reason','serial_host_fingerprint','live_management_stages','cleanup_complete','source_commit') -Code 'ENVIRONMENT_REPORT_INVALID' -Label 'EnvironmentReport'
+    if ([int]$environment.schema_version -ne 1 -or $environment.backend -cne 'qemu' -or $environment.backend_status -cne 'executed' -or $environment.guest_os -cne 'linux' -or $environment.guest_arch -cne 'x86_64' -or $environment.alpine_release -cne '3.24.1' -or $environment.qemu_cloud_image_sha512 -cne $Inputs.qemu.cloud_image_sha512 -or $environment.serial_host_fingerprint -cnotmatch '^SHA256:[A-Za-z0-9+/]+={0,2}$' -or -not [bool]$environment.cleanup_complete -or $environment.source_commit -cnotmatch '^[0-9a-f]{40}$') { throw (New-BuildException -Code 'ENVIRONMENT_REPORT_INVALID' -Message 'Environment report has an invalid enum, hash, fingerprint, or cleanup result.') }
+
+    return [pscustomobject]@{ IsoFile = $isoName; IsoSha256 = $isoHash; IsoBytes = [long]$isoItem.Length; BuildRequestSha256 = $ExpectedBuildRequestSha256; Files = @($requiredNames) }
+}
+
+function Invoke-PublicationFailureStage {
+    param([string] $FailureStage, [Parameter(Mandatory)] [string] $Stage)
+    if (-not [string]::IsNullOrWhiteSpace($FailureStage) -and $FailureStage -ceq $Stage) {
+        throw (New-BuildException -Code 'PUBLICATION_INJECTED_FAILURE' -Message "Injected publication failure at '$Stage'.")
+    }
+}
+
+function Test-PublishedArtifactDirectory {
+    param([Parameter(Mandatory)] [string] $Directory, [Parameter(Mandatory)] $ValidatedBundle, [Parameter(Mandatory)] [string] $BuildId)
+    $manifestPath = Join-Path $Directory 'artifact-manifest.json'
+    $expectedNames = @(@($ValidatedBundle.Files) + 'artifact-manifest.json' | Sort-Object -CaseSensitive)
+    $actualNames = @(Get-ChildItem -LiteralPath $Directory -Force | ForEach-Object {
+        if ($_.PSIsContainer -or ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $_.Length -le 0) { throw (New-BuildException -Code 'PUBLICATION_DIRECTORY_INVALID' -Message 'Published directory contains a non-regular artifact.') }
+        $_.Name
+    } | Sort-Object -CaseSensitive)
+    if ((ConvertTo-Json $actualNames -Compress) -cne (ConvertTo-Json $expectedNames -Compress)) { throw (New-BuildException -Code 'PUBLICATION_DIRECTORY_INVALID' -Message 'Published directory file set is not closed.') }
+    $manifest = Read-ClosedJsonArtifact -Path $manifestPath -Code 'PUBLICATION_MANIFEST_INVALID'
+    Assert-ClosedObjectKeys -Object $manifest -ExpectedKeys @('schema','schema_version','build_id','build_request_sha256','artifacts') -Code 'PUBLICATION_MANIFEST_INVALID' -Label 'ArtifactManifest'
+    if ($manifest.schema -cne 'ArtifactManifest' -or [int]$manifest.schema_version -ne 1 -or $manifest.build_id -cne $BuildId -or $manifest.build_request_sha256 -cne $ValidatedBundle.BuildRequestSha256 -or @($manifest.artifacts).Count -ne @($ValidatedBundle.Files).Count) {
+        throw (New-BuildException -Code 'PUBLICATION_MANIFEST_INVALID' -Message 'ArtifactManifest identity or count is invalid.')
+    }
+    $recordNames = @()
+    foreach ($record in @($manifest.artifacts)) {
+        Assert-ClosedObjectKeys -Object $record -ExpectedKeys @('file','sha256','bytes') -Code 'PUBLICATION_MANIFEST_INVALID' -Label 'ArtifactManifest.artifacts record'
+        $name = Assert-ClosedRelativeArtifactName -Name ([string]$record.file)
+        $recordNames += $name
+        $item = Get-ClosedRegularArtifact -BaseDirectory $Directory -Name $name
+        if ($record.sha256 -cne (Get-LowerFileSha256 -Path $item.FullName) -or [long]$record.bytes -ne [long]$item.Length) { throw (New-BuildException -Code 'PUBLICATION_MANIFEST_INVALID' -Message "Manifest record '$name' differs from final bytes.") }
+    }
+    if ((ConvertTo-Json @($recordNames | Sort-Object -CaseSensitive) -Compress) -cne (ConvertTo-Json @($ValidatedBundle.Files | Sort-Object -CaseSensitive) -Compress)) {
+        throw (New-BuildException -Code 'PUBLICATION_MANIFEST_INVALID' -Message 'ArtifactManifest record set is missing, duplicated, or unexpected.')
+    }
+    return $true
+}
+
+function Clear-IncompleteBuildNamespace {
+    param(
+        [Parameter(Mandatory)] [string] $DistRoot,
+        [Parameter(Mandatory)] [string] $BuildId
+    )
+    if ($BuildId -cnotmatch '^[a-z0-9][a-z0-9-]{2,95}$') { throw (New-BuildException -Code 'BUILD_ID_INVALID' -Message 'Build identity is not a safe relative namespace.') }
+    $dist = [System.IO.Path]::GetFullPath($DistRoot)
+    if (-not [System.IO.Directory]::Exists($dist)) { return }
+    Assert-NoReparseAncestors -Path $dist
+    $pattern = '^' + [regex]::Escape('.partial-' + $BuildId + '-') + '[0-9a-f]{32}$'
+    foreach ($entry in @(Get-ChildItem -LiteralPath $dist -Force | Where-Object { $_.Name -cmatch $pattern })) {
+        if (-not $entry.PSIsContainer -or ($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw (New-BuildException -Code 'CLEAN_NAMESPACE_INVALID' -Message 'Exact incomplete publication namespace contains a non-directory or reparse point.')
+        }
+        [System.IO.Directory]::Delete($entry.FullName, $true)
+    }
+}
+
+function Publish-ValidatedArtifactBundle {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $StagingDirectory,
+        [Parameter(Mandatory)] [string] $DistRoot,
+        [Parameter(Mandatory)] [string] $BuildId,
+        [Parameter(Mandatory)] $ValidatedBundle,
+        [string] $FailureStage
+    )
+    if ($BuildId -cnotmatch '^[a-z0-9][a-z0-9-]{2,95}$') { throw (New-BuildException -Code 'BUILD_ID_INVALID' -Message 'Build identity is not a safe relative namespace.') }
+    $dist = [System.IO.Path]::GetFullPath($DistRoot)
+    [System.IO.Directory]::CreateDirectory($dist) | Out-Null
+    Assert-NoReparseAncestors -Path $dist
+    $totalBytes = [long]0
+    foreach ($name in @($ValidatedBundle.Files)) { $totalBytes += (Get-ClosedRegularArtifact -BaseDirectory $StagingDirectory -Name $name).Length }
+    $drive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($dist))
+    if ($drive.AvailableFreeSpace -lt ($totalBytes * 2 + 1048576)) { throw (New-BuildException -Code 'PUBLICATION_SPACE_INSUFFICIENT' -Message 'Publication volume lacks the bounded copy allowance.') }
+    $partialDirectory = Join-Path $dist ('.partial-' + $BuildId + '-' + [Guid]::NewGuid().ToString('N'))
+    $finalDirectory = Join-Path $dist $BuildId
+    $latestPath = Join-Path $dist 'LATEST.json'
+    $latestPartial = Join-Path $dist ('LATEST.json.' + [Guid]::NewGuid().ToString('N') + '.partial')
+    if ([System.IO.Directory]::Exists($finalDirectory) -or [System.IO.File]::Exists($finalDirectory)) { throw (New-BuildException -Code 'BUILD_ALREADY_PUBLISHED' -Message "Build '$BuildId' is already published.") }
+    $priorLatest = if ([System.IO.File]::Exists($latestPath)) { [System.IO.File]::ReadAllBytes($latestPath) } else { $null }
+    $renamed = $false
+    $pointerReplaced = $false
+    try {
+        [System.IO.Directory]::CreateDirectory($partialDirectory) | Out-Null
+        Invoke-PublicationFailureStage -FailureStage $FailureStage -Stage 'after-partial-create'
+        $copyIndex = 0
+        foreach ($name in @($ValidatedBundle.Files)) {
+            $source = (Get-ClosedRegularArtifact -BaseDirectory $StagingDirectory -Name $name).FullName
+            $destination = Join-Path $partialDirectory $name
+            $copyPartial = "$destination.partial"
+            [System.IO.File]::Copy($source, $copyPartial, $false)
+            if ($copyIndex++ -eq 0) { Invoke-PublicationFailureStage -FailureStage $FailureStage -Stage 'after-partial-copy' }
+            if ((Get-LowerFileSha256 -Path $source) -cne (Get-LowerFileSha256 -Path $copyPartial)) { throw (New-BuildException -Code 'PUBLICATION_HASH_MISMATCH' -Message "Artifact copy '$name' changed bytes.") }
+            if ($copyIndex -eq 1) { Invoke-PublicationFailureStage -FailureStage $FailureStage -Stage 'after-copy-rehash' }
+            [System.IO.File]::Move($copyPartial, $destination)
+        }
+        $records = @($ValidatedBundle.Files | Sort-Object -CaseSensitive | ForEach-Object {
+            $item = Get-ClosedRegularArtifact -BaseDirectory $partialDirectory -Name $_
+            [ordered]@{ file = $_; sha256 = Get-LowerFileSha256 -Path $item.FullName; bytes = [long]$item.Length }
+        })
+        Write-CanonicalJson -Value ([ordered]@{ schema = 'ArtifactManifest'; schema_version = 1; build_id = $BuildId; build_request_sha256 = $ValidatedBundle.BuildRequestSha256; artifacts = $records }) -Path (Join-Path $partialDirectory 'artifact-manifest.json')
+        Invoke-PublicationFailureStage -FailureStage $FailureStage -Stage 'after-manifest-write'
+        [void](Test-PublishedArtifactDirectory -Directory $partialDirectory -ValidatedBundle $ValidatedBundle -BuildId $BuildId)
+        Invoke-PublicationFailureStage -FailureStage $FailureStage -Stage 'after-directory-revalidation'
+        [System.IO.Directory]::Move($partialDirectory, $finalDirectory)
+        $renamed = $true
+        Invoke-PublicationFailureStage -FailureStage $FailureStage -Stage 'after-final-rename'
+        Write-CanonicalJson -Value ([ordered]@{ schema_version = 1; build_id = $BuildId; directory = $BuildId; iso_file = $ValidatedBundle.IsoFile; iso_sha256 = $ValidatedBundle.IsoSha256; iso_bytes = [long]$ValidatedBundle.IsoBytes }) -Path $latestPartial
+        Invoke-PublicationFailureStage -FailureStage $FailureStage -Stage 'after-pointer-temp-write'
+        [void](Test-PublishedArtifactDirectory -Directory $finalDirectory -ValidatedBundle $ValidatedBundle -BuildId $BuildId)
+        Invoke-PublicationFailureStage -FailureStage $FailureStage -Stage 'before-pointer-replace'
+        [System.IO.File]::Move($latestPartial, $latestPath, $true)
+        $pointerReplaced = $true
+        Invoke-PublicationFailureStage -FailureStage $FailureStage -Stage 'after-pointer-replace'
+        return [pscustomobject]@{ BuildId = $BuildId; Directory = $finalDirectory; IsoFile = $ValidatedBundle.IsoFile; IsoSha256 = $ValidatedBundle.IsoSha256; IsoBytes = [long]$ValidatedBundle.IsoBytes }
+    }
+    catch {
+        if ($pointerReplaced) {
+            if ($null -eq $priorLatest) { [System.IO.File]::Delete($latestPath) }
+            else {
+                $rollback = Join-Path $dist ('LATEST.json.rollback-' + [Guid]::NewGuid().ToString('N') + '.partial')
+                [System.IO.File]::WriteAllBytes($rollback, $priorLatest)
+                [System.IO.File]::Move($rollback, $latestPath, $true)
+            }
+        }
+        if ([System.IO.File]::Exists($latestPartial)) { [System.IO.File]::Delete($latestPartial) }
+        if ([System.IO.Directory]::Exists($partialDirectory)) { [System.IO.Directory]::Delete($partialDirectory, $true) }
+        if ($renamed -and [System.IO.Directory]::Exists($finalDirectory)) { [System.IO.Directory]::Delete($finalDirectory, $true) }
+        throw
+    }
+}
+
 function Publish-BuildArtifacts {
     param(
         [Parameter(Mandatory)] [string] $StagingDirectory,
@@ -472,29 +822,12 @@ function Publish-BuildArtifacts {
         [Parameter(Mandatory)] $Inputs,
         [Parameter(Mandatory)] $BuildRequest
     )
-    $lockPath = Join-Path $StagingDirectory 'resolved-build-lock.json'
-    if (-not [System.IO.File]::Exists($lockPath)) { throw (New-BuildException -Code 'BUILD_OUTPUT_MISSING' -Message 'resolved-build-lock.json is absent.') }
-    $lock = Get-Content -Raw -LiteralPath $lockPath | ConvertFrom-Json -Depth 64
-    [void](Test-ResolvedBuildLock -Lock $lock -ExpectedBuildRequestSha256 $BuildRequestHash)
-    [void](Test-ResolvedTrustedKeys -TrustedKeys @($lock.trusted_keys) -RepositoryKeys $Inputs.alpine.repository_keys -SigningPublicSha256 $BuildRequest.signing.public_key_sha256)
     if (-not [bool]$BackendResult.CleanupComplete) {
         throw (New-BuildException -Code 'QEMU_CLEANUP_INCOMPLETE' -Message 'QEMU cleanup did not complete, so artifact publication is forbidden.')
     }
-
-    foreach ($recordName in @('builder_packages_record', 'apk_files_record')) {
-        $record = Get-ObjectProperty -Object $lock -Name $recordName
-        [void](Test-GeneratedFileRecord -Record $record -BaseDirectory $StagingDirectory -ExpectedProducer 'run-build.sh:prepare-repository')
-    }
-    $iso = Get-ChildItem -LiteralPath $StagingDirectory -File -Filter '*.iso' | Select-Object -First 1
-    if ($null -eq $iso -or $iso.Length -le 0) { throw (New-BuildException -Code 'BUILD_ISO_MISSING' -Message 'The Linux build produced no nonempty ISO.') }
-    $isoHash = Get-LowerFileSha256 -Path $iso.FullName
-    $isoName = "300k-bootstrap-x86_64-$($isoHash.Substring(0,12)).iso"
-    if ($iso.Name -cne $isoName) {
-        $renamed = Join-Path $StagingDirectory $isoName
-        [System.IO.File]::Move($iso.FullName, $renamed)
-        $iso = Get-Item -LiteralPath $renamed
-    }
-
+    $isoCandidates = @(Get-ChildItem -LiteralPath $StagingDirectory -Force | Where-Object { -not $_.PSIsContainer -and $_.Name -cmatch '^300k-bootstrap-x86_64-[0-9a-f]{12}[.]iso$' })
+    if ($isoCandidates.Count -ne 1) { throw (New-BuildException -Code 'BUILD_ISO_MISSING' -Message 'Backend staging did not return one hash-qualified ISO.') }
+    $iso = $isoCandidates[0]
     $qemuInfoResult = Invoke-CheckedProcess -FilePath $QemuImgPath -ArgumentList @('info', '--output=json', $iso.FullName) -TimeoutSeconds 60
     $qemuInfo = $qemuInfoResult.StandardOutput | ConvertFrom-Json -Depth 10
     $sanitizedQemuInfo = [ordered]@{ format = $qemuInfo.format; virtual_size = [long]$qemuInfo.'virtual-size'; actual_size = [long]$iso.Length }
@@ -516,53 +849,9 @@ function Publish-BuildArtifacts {
         source_commit = $SourceCommit
     }
     Write-CanonicalJson -Value $environment -Path (Join-Path $StagingDirectory 'environment-report.json')
-
-    $allowedFiles = @(
-        'build-request.json', 'resolved-build-lock.json', 'builder-packages.lock', 'apk-files.sha256',
-        $isoName, 'boot-layout.txt', 'qemu-image-info.json', 'environment-report.json',
-        'serial-evidence.log', 'repository-evidence.json', 'resource-inventory.json'
-    )
-    foreach ($required in @('resolved-build-lock.json', 'builder-packages.lock', 'apk-files.sha256', $isoName, 'boot-layout.txt', 'qemu-image-info.json', 'environment-report.json', 'serial-evidence.log', 'resource-inventory.json')) {
-        if (-not [System.IO.File]::Exists((Join-Path $StagingDirectory $required))) { throw (New-BuildException -Code 'BUILD_EVIDENCE_MISSING' -Message "Required evidence '$required' is absent.") }
-    }
-
+    $validated = Test-ClosedStagingBundle -StagingDirectory $StagingDirectory -ExpectedBuildRequestSha256 $BuildRequestHash -Inputs $Inputs -BuildRequest $BuildRequest
     $distRoot = Join-Path $script:BuildRepositoryRoot 'dist'
-    [System.IO.Directory]::CreateDirectory($distRoot) | Out-Null
-    $partialDirectory = Join-Path $distRoot ('.partial-' + $BuildId + '-' + [Guid]::NewGuid().ToString('N'))
-    $finalDirectory = Join-Path $distRoot $BuildId
-    [System.IO.Directory]::CreateDirectory($partialDirectory) | Out-Null
-    try {
-        foreach ($name in $allowedFiles) {
-            $source = Join-Path $StagingDirectory $name
-            if ([System.IO.File]::Exists($source)) {
-                $destination = Join-Path $partialDirectory $name
-                [System.IO.File]::Copy($source, $destination, $false)
-                if ((Get-LowerFileSha256 -Path $source) -cne (Get-LowerFileSha256 -Path $destination)) {
-                    throw (New-BuildException -Code 'PUBLICATION_HASH_MISMATCH' -Message "Artifact copy '$name' changed bytes.")
-                }
-            }
-        }
-        $requestSource = Join-Path $StagingDirectory 'build-request.json'
-        if (-not [System.IO.File]::Exists($requestSource)) { throw (New-BuildException -Code 'BUILD_REQUEST_EVIDENCE_MISSING' -Message 'Staged BuildRequest evidence is absent.') }
-
-        $artifacts = @()
-        foreach ($file in Get-ChildItem -LiteralPath $partialDirectory -File | Sort-Object Name) {
-            $artifacts += [ordered]@{ file = $file.Name; sha256 = Get-LowerFileSha256 -Path $file.FullName; bytes = [long]$file.Length }
-        }
-        $manifest = [ordered]@{ schema_version = 1; build_id = $BuildId; build_request_sha256 = $BuildRequestHash; artifacts = $artifacts }
-        Write-CanonicalJson -Value $manifest -Path (Join-Path $partialDirectory 'artifact-manifest.json')
-        if ([System.IO.Directory]::Exists($finalDirectory)) { throw (New-BuildException -Code 'BUILD_ALREADY_PUBLISHED' -Message "Build '$BuildId' is already published; use -Clean only for its exact namespace.") }
-        [System.IO.Directory]::Move($partialDirectory, $finalDirectory)
-        $latest = [ordered]@{ schema_version = 1; build_id = $BuildId; directory = $BuildId; iso_file = $isoName; iso_sha256 = $isoHash; iso_bytes = [long]$iso.Length }
-        $latestPartial = Join-Path $distRoot 'LATEST.json.partial'
-        Write-CanonicalJson -Value $latest -Path $latestPartial
-        [System.IO.File]::Move($latestPartial, (Join-Path $distRoot 'LATEST.json'), $true)
-        return [pscustomobject]@{ BuildId = $BuildId; Directory = $finalDirectory; IsoFile = $isoName; IsoSha256 = $isoHash; IsoBytes = [long]$iso.Length }
-    }
-    catch {
-        if ([System.IO.Directory]::Exists($partialDirectory)) { [System.IO.Directory]::Delete($partialDirectory, $true) }
-        throw
-    }
+    return Publish-ValidatedArtifactBundle -StagingDirectory $StagingDirectory -DistRoot $distRoot -BuildId $BuildId -ValidatedBundle $validated
 }
 
 function Invoke-300kBuild {
@@ -606,6 +895,7 @@ function Invoke-300kBuild {
     $runNonce = [Guid]::NewGuid().ToString('N')
     $runRoot = Join-Path $state "state\host-runs\$runNonce"
     [System.IO.Directory]::CreateDirectory($runRoot) | Out-Null
+    try {
     $sourceArchive = Join-Path $runRoot 'source.tar'
     $archiveHash = New-DeterministicSourceArchive -Destination $sourceArchive
     $source = [pscustomobject]@{
@@ -617,6 +907,7 @@ function Invoke-300kBuild {
     $hashes = [ordered]@{
         inputs_sha256 = Get-LowerFileSha256 -Path $inputsPath
         run_build_sha256 = Get-LowerFileSha256 -Path (Join-Path $script:BuildRepositoryRoot 'scripts/linux/run-build.sh')
+        inspect_iso_sha256 = Get-LowerFileSha256 -Path (Join-Path $script:BuildRepositoryRoot 'scripts/linux/inspect-iso.sh')
         profile_sha256 = Get-LowerFileSha256 -Path (Join-Path $script:BuildRepositoryRoot 'builder/profiles/mkimg.300k.sh')
     }
     $cacheIdentity = $hashes.inputs_sha256
@@ -671,8 +962,7 @@ function Invoke-300kBuild {
     $buildId = 'p01-' + $requestHash.Substring(0,12)
 
     if ($CleanExactNamespace) {
-        $exactOutput = Join-Path $script:BuildRepositoryRoot "dist\$buildId"
-        if ([System.IO.Directory]::Exists($exactOutput)) { [System.IO.Directory]::Delete($exactOutput, $true) }
+        Clear-IncompleteBuildNamespace -DistRoot (Join-Path $script:BuildRepositoryRoot 'dist') -BuildId $buildId
     }
     [System.IO.File]::Copy($requestPath, (Join-Path $backendExport 'build-request.json'), $true)
     $backendResult = Invoke-QemuBackend -Operation build -QemuRoot $SelectedQemuRoot -StateRoot $state -RunId $runNonce `
@@ -681,6 +971,14 @@ function Invoke-300kBuild {
         -SigningPrivateFile (Join-Path $secretRoot '300k.rsa') -SigningPublicFile (Join-Path $secretRoot '300k.rsa.pub')
     [System.IO.File]::Copy($requestPath, (Join-Path $backendExport 'build-request.json'), $true)
     return Publish-BuildArtifacts -StagingDirectory $backendExport -BuildId $buildId -BuildRequestHash $requestHash -BackendResult $backendResult -QemuImgPath $qemuImg -SourceCommit $sourceIdentity.git_commit -DockerProbe $dockerProbe -Inputs $inputs -BuildRequest $request
+    }
+    finally {
+        $expectedHostRuns = [System.IO.Path]::GetFullPath((Join-Path $state 'state\host-runs')).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+        $actualRunRoot = [System.IO.Path]::GetFullPath($runRoot)
+        if ($actualRunRoot.StartsWith($expectedHostRuns + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase) -and [System.IO.Directory]::Exists($actualRunRoot)) {
+            [System.IO.Directory]::Delete($actualRunRoot, $true)
+        }
+    }
 }
 
 if ($MyInvocation.InvocationName -ne '.') {

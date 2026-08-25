@@ -21,6 +21,13 @@ function New-QemuException {
     return $exception
 }
 
+function Invoke-QemuFailureStage {
+    param([string] $FailureStage, [Parameter(Mandatory)] [string] $Stage)
+    if (-not [string]::IsNullOrWhiteSpace($FailureStage) -and $FailureStage -ceq $Stage) {
+        throw (New-QemuException -Code 'QEMU_INJECTED_FAILURE' -Message "Injected QEMU backend failure at '$Stage'.")
+    }
+}
+
 function New-QemuResourceOwner {
     return [pscustomobject]@{
         PSTypeName = '300k.QemuResourceOwner'
@@ -527,6 +534,8 @@ function Invoke-QemuBackend {
         [Parameter(Mandatory)] [string] $CacheIdentity,
         [string] $SigningPrivateFile,
         [string] $SigningPublicFile,
+        [ValidateSet('after-key-creation', 'after-seed-start', 'after-qemu-start', 'after-host-key-milestone', 'after-ssh-readiness', 'after-source-transfer', 'after-secret-copy', 'after-repository-preparation', 'after-build', 'after-export', 'after-shutdown')]
+        [string] $FailureStage,
         [ValidateRange(60, 1800)] [int] $BootTimeoutSeconds = 600,
         [ValidateRange(60, 14400)] [int] $BuildTimeoutSeconds = 7200
     )
@@ -547,8 +556,13 @@ function Invoke-QemuBackend {
     $resultObject = $null
     $runRoot = [System.IO.Path]::GetFullPath((Join-Path $StateRoot "state\runs\$RunId"))
     $evidenceDirectory = [System.IO.Path]::GetFullPath($ExportDirectory)
-    $serialEvidencePath = Join-Path $evidenceDirectory 'serial-evidence.log'
+    $serialEvidencePath = Join-Path $evidenceDirectory 'serial-diagnostic.log'
     [System.IO.Directory]::CreateDirectory($evidenceDirectory) | Out-Null
+    $exportOwnership = [pscustomobject]@{ Path = $evidenceDirectory; Preserve = $false }
+    Add-QemuOwnedResource -Owner $owner -Name 'temporary-export' -Cleanup {
+        param($owned)
+        if (-not $owned.Preserve -and [System.IO.Directory]::Exists($owned.Path)) { [System.IO.Directory]::Delete($owned.Path, $true) }
+    } -CleanupArgument $exportOwnership
 
     try {
         $qemuExe = [System.IO.Path]::GetFullPath((Join-Path $QemuRoot 'qemu-system-x86_64.exe'))
@@ -590,6 +604,7 @@ function Invoke-QemuBackend {
             param($prefix)
             foreach ($candidate in @($prefix, "$prefix.pub")) { if ([System.IO.File]::Exists($candidate)) { [System.IO.File]::Delete($candidate) } }
         } -CleanupArgument $identityPath
+        Invoke-QemuFailureStage -FailureStage $FailureStage -Stage 'after-key-creation'
         $managementPublicKey = [System.IO.File]::ReadAllText("$identityPath.pub").Trim()
         if ($managementPublicKey -notmatch '^ssh-ed25519\s+[A-Za-z0-9+/]+={0,2}\s+') { throw (New-QemuException -Code 'QEMU_MANAGEMENT_KEY_INVALID' -Message 'Ephemeral management public key is malformed.') }
 
@@ -608,6 +623,7 @@ function Invoke-QemuBackend {
         [System.IO.File]::WriteAllText($userDataPath, $userTemplate.Replace('@@SSH_PUBLIC_KEY@@', $managementPublicKey), [System.Text.UTF8Encoding]::new($false))
         $seedServer = Start-NoCloudSeedServer -MetaDataPath $metaDataPath -UserDataPath $userDataPath
         Add-QemuOwnedResource -Owner $owner -Name 'seed-listener' -Cleanup { param($server) $server.Dispose() } -CleanupArgument $seedServer
+        Invoke-QemuFailureStage -FailureStage $FailureStage -Stage 'after-seed-start'
 
         $serialPath = Join-Path $runRoot 'serial.log'
         $serialServer = Start-SerialCaptureServer -DestinationPath $serialPath
@@ -632,12 +648,14 @@ function Invoke-QemuBackend {
         )
         $qemuLease = Start-CheckedProcessLease -FilePath $qemuExe -ArgumentList $qemuArguments -TimeoutSeconds ($BuildTimeoutSeconds + $BootTimeoutSeconds + 300)
         Add-QemuOwnedResource -Owner $owner -Name 'qemu-lease' -Cleanup { param($lease) Close-CheckedProcessLease -Lease $lease -TimeoutSeconds 20 } -CleanupArgument $qemuLease
+        Invoke-QemuFailureStage -FailureStage $FailureStage -Stage 'after-qemu-start'
 
         $verifyFingerprint = {
             param($keyType, $key, $fingerprint)
             Test-QemuSshFingerprint -KeyType $keyType -PublicKey $key -Fingerprint $fingerprint -ScratchDirectory $runRoot -SshKeygenPath $sshKeygenPath
         }.GetNewClosure()
         $serialTrust = Wait-QemuSerialHostKey -Lease $qemuLease -SerialPath $serialPath -VerifyFingerprint $verifyFingerprint -TimeoutSeconds $BootTimeoutSeconds
+        Invoke-QemuFailureStage -FailureStage $FailureStage -Stage 'after-host-key-milestone'
         $managementFingerprintResult = Invoke-CheckedProcess -FilePath $sshKeygenPath -ArgumentList @('-E', 'sha256', '-lf', "$identityPath.pub") -TimeoutSeconds 30
         $managementFingerprintMatch = [regex]::Match($managementFingerprintResult.StandardOutput, 'SHA256:[A-Za-z0-9+/]+={0,2}')
         if (-not $managementFingerprintMatch.Success) {
@@ -679,13 +697,15 @@ function Invoke-QemuBackend {
             throw (New-QemuException -Code 'QEMU_SSH_TIMEOUT' -Message "Strict SSH did not become ready within the boot bound. Last diagnostic: $lastSshDiagnostic")
         }
         $managementStages.Add('ssh-readiness-live')
+        Invoke-QemuFailureStage -FailureStage $FailureStage -Stage 'after-ssh-readiness'
 
         [void](Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('doas', 'sh', '-ceu', 'install -d -m 700 -o builder -g builder /inputs /run/300k-secrets; mkdir -p /workspace /export') -TimeoutSeconds 30 -Stage 'prepare-guest')
         $managementStages.Add('prepare-guest-live')
         [void](Invoke-QemuScp -Lease $qemuLease -ScpPath $scpPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Paths @($SourceArchive, 'builder@127.0.0.1:/inputs/source.tar') -TimeoutSeconds 300 -Stage 'source-transfer')
         [void](Invoke-QemuScp -Lease $qemuLease -ScpPath $scpPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Paths @($RequestFile, 'builder@127.0.0.1:/inputs/request.json') -TimeoutSeconds 120 -Stage 'request-transfer')
         $managementStages.Add('input-transfer-live')
-        [void](Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('doas', 'sh', '-ceu', 'rm -rf /workspace/*; tar -xf /inputs/source.tar -C /workspace; chmod +x /workspace/scripts/linux/run-build.sh') -TimeoutSeconds 120 -Stage 'source-extract')
+        [void](Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('doas', 'sh', '-ceu', 'rm -rf /workspace/*; tar -xf /inputs/source.tar -C /workspace; chmod +x /workspace/scripts/linux/run-build.sh /workspace/scripts/linux/inspect-iso.sh') -TimeoutSeconds 120 -Stage 'source-extract')
+        Invoke-QemuFailureStage -FailureStage $FailureStage -Stage 'after-source-transfer'
 
         if ($Operation -ceq 'build') {
             foreach ($keyFile in @($SigningPrivateFile, $SigningPublicFile)) {
@@ -697,18 +717,30 @@ function Invoke-QemuBackend {
             [void](Invoke-QemuScp -Lease $qemuLease -ScpPath $scpPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Paths @($SigningPublicFile, 'builder@127.0.0.1:/inputs/300k.rsa.pub') -TimeoutSeconds 120 -Stage 'public-key-transfer')
             [void](Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('doas', 'sh', '-ceu', 'chown root:root /run/300k-secrets/300k.rsa; chmod 600 /run/300k-secrets/300k.rsa; install -m 644 /inputs/300k.rsa.pub /run/300k-secrets/300k.rsa.pub; rm -f /inputs/300k.rsa.pub') -TimeoutSeconds 30 -Stage 'private-key-stage')
             $managementStages.Add('private-key-tmpfs-live')
+            Invoke-QemuFailureStage -FailureStage $FailureStage -Stage 'after-secret-copy'
         }
 
-        $mode = if ($Operation -ceq 'init-signing-key') { 'init-signing-key' } else { 'prepare-repository-and-build' }
-        [void](Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('doas', '/bin/sh', '/workspace/scripts/linux/run-build.sh', $mode, '/inputs/request.json') -TimeoutSeconds $BuildTimeoutSeconds -Stage $mode)
-        $managementStages.Add("$mode-live")
+        if ($Operation -ceq 'init-signing-key') {
+            [void](Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('doas', '/bin/sh', '/workspace/scripts/linux/run-build.sh', 'init-signing-key', '/inputs/request.json') -TimeoutSeconds $BuildTimeoutSeconds -Stage 'init-signing-key')
+            $managementStages.Add('init-signing-key-live')
+        }
+        else {
+            [void](Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('doas', '/bin/sh', '/workspace/scripts/linux/run-build.sh', 'prepare-repository', '/inputs/request.json') -TimeoutSeconds $BuildTimeoutSeconds -Stage 'prepare-repository')
+            $managementStages.Add('prepare-repository-live')
+            Invoke-QemuFailureStage -FailureStage $FailureStage -Stage 'after-repository-preparation'
+            [void](Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('doas', '/bin/sh', '/workspace/scripts/linux/run-build.sh', 'build-from-local', '/inputs/request.json') -TimeoutSeconds $BuildTimeoutSeconds -Stage 'build-from-local')
+            $managementStages.Add('build-from-local-live')
+            Invoke-QemuFailureStage -FailureStage $FailureStage -Stage 'after-build'
+        }
 
         [void](Invoke-QemuScp -Lease $qemuLease -ScpPath $scpPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Paths @('-r', 'builder@127.0.0.1:/export/.', $evidenceDirectory) -TimeoutSeconds 1200 -Stage 'artifact-export')
         $managementStages.Add('artifact-export-live')
+        Invoke-QemuFailureStage -FailureStage $FailureStage -Stage 'after-export'
 
         [void](Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('doas', 'poweroff') -TimeoutSeconds 30 -AllowNonZero -Stage 'shutdown')
         [void](Wait-CheckedProcessLease -Lease $qemuLease -TimeoutSeconds 90 -AllowNonZero)
         $managementStages.Add('shutdown-complete')
+        Invoke-QemuFailureStage -FailureStage $FailureStage -Stage 'after-shutdown'
 
         Write-SanitizedSerialEvidence -SerialPath $serialPath -EvidencePath $serialEvidencePath
         $resultObject = [pscustomobject]@{
@@ -725,6 +757,7 @@ function Invoke-QemuBackend {
             SerialEvidenceFile = [System.IO.Path]::GetFileName($serialEvidencePath)
             CleanupComplete    = $false
         }
+        $exportOwnership.Preserve = $true
         return $resultObject
     }
     catch {
@@ -732,6 +765,7 @@ function Invoke-QemuBackend {
         throw
     }
     finally {
+        $sanitizedSerialText = "`n"
         try {
             if ($null -ne $qemuLease -and -not $qemuLease.Closed -and -not $qemuLease.Process.HasExited) {
                 Stop-CheckedProcessLease -Lease $qemuLease -TimeoutSeconds 20
@@ -740,7 +774,8 @@ function Invoke-QemuBackend {
         catch { $cleanupError = $_.Exception }
         try {
             if ($null -ne $serialPath -and [System.IO.File]::Exists($serialPath)) {
-                Write-SanitizedSerialEvidence -SerialPath $serialPath -EvidencePath $serialEvidencePath
+                $allowedSerialLines = @(Read-SharedTextLines -Path $serialPath | Where-Object { $_ -match '^300K_[A-Z0-9_]+(?:\s+[A-Za-z0-9_./:+=-]+)*$' })
+                $sanitizedSerialText = ($allowedSerialLines -join "`n") + "`n"
             }
         }
         catch { if ($null -eq $cleanupError) { $cleanupError = $_.Exception } }
@@ -748,6 +783,13 @@ function Invoke-QemuBackend {
             Close-QemuResourceOwner -Owner $owner
         }
         catch { if ($null -eq $cleanupError) { $cleanupError = $_.Exception } }
+
+        [System.IO.Directory]::CreateDirectory($evidenceDirectory) | Out-Null
+        [System.IO.File]::WriteAllText($serialEvidencePath, $sanitizedSerialText, [System.Text.UTF8Encoding]::new($false))
+        $writtenSerialLines = @(Read-SharedTextLines -Path $serialEvidencePath)
+        if (@($writtenSerialLines | Where-Object { $_ -cnotmatch '^300K_[A-Z0-9_]+(?:\s+[A-Za-z0-9_./:+=-]+)*$' }).Count -ne 0) {
+            if ($null -eq $cleanupError) { $cleanupError = New-QemuException -Code 'QEMU_SERIAL_SANITIZE_FAILED' -Message 'Retained serial diagnostic contains a non-allowlisted line.' }
+        }
 
         $inventory = [ordered]@{
             schema_version = 1
