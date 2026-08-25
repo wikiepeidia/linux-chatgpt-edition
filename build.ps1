@@ -91,6 +91,15 @@ function Assert-PublicInputs {
     if ($Inputs.qemu.cloud_image_sha512 -cnotmatch '^[0-9a-f]{128}$') {
         throw (New-BuildException -Code 'INPUT_QEMU_PIN_INVALID' -Message 'The QEMU cloud-image SHA-512 is malformed.')
     }
+    $repositoryKeys = @($Inputs.alpine.repository_keys.PSObject.Properties)
+    if ($repositoryKeys.Count -ne 3) {
+        throw (New-BuildException -Code 'INPUT_REPOSITORY_KEYS_INVALID' -Message 'Exactly three Alpine x86_64 repository keys must be pinned.')
+    }
+    foreach ($key in $repositoryKeys) {
+        if ($key.Name -cnotmatch '^alpine-devel@lists\.alpinelinux\.org-[0-9a-f]{8}\.rsa\.pub$' -or [string]$key.Value -cnotmatch '^[0-9a-f]{64}$') {
+            throw (New-BuildException -Code 'INPUT_REPOSITORY_KEYS_INVALID' -Message 'An Alpine repository-key basename or SHA-256 is malformed.')
+        }
+    }
 
     $approvedOrigins = @('https://dl-cdn.alpinelinux.org/', 'https://gitlab.alpinelinux.org/')
     foreach ($repository in @($Inputs.alpine.repositories)) {
@@ -237,6 +246,47 @@ function Test-ResolvedBuildLock {
     }
     if (-not $AllowEmptyArtifacts -and @($Lock.artifacts).Count -eq 0) {
         throw (New-BuildException -Code 'RESOLVED_LOCK_ARTIFACTS_MISSING' -Message 'ResolvedBuildLock contains no output artifacts.')
+    }
+    return $true
+}
+
+function Test-ResolvedTrustedKeys {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $TrustedKeys,
+        [Parameter(Mandatory)] $RepositoryKeys,
+        [Parameter(Mandatory)] [string] $SigningPublicSha256
+    )
+    if ($SigningPublicSha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw (New-BuildException -Code 'RESOLVED_LOCK_TRUSTED_KEYS_INVALID' -Message 'The expected project signing-key hash is malformed.')
+    }
+
+    $expected = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::Ordinal)
+    foreach ($property in @($RepositoryKeys.PSObject.Properties)) {
+        if ($property.Name -cnotmatch '^alpine-devel@lists\.alpinelinux\.org-[0-9a-f]{8}\.rsa\.pub$' -or [string]$property.Value -cnotmatch '^[0-9a-f]{64}$') {
+            throw (New-BuildException -Code 'RESOLVED_LOCK_TRUSTED_KEYS_INVALID' -Message 'The expected Alpine repository-key contract is malformed.')
+        }
+        $expected.Add($property.Name, "$([string]$property.Value)|alpine-x86_64")
+    }
+    $expected.Add('300k.rsa.pub', "$SigningPublicSha256|project-signing")
+
+    $actual = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::Ordinal)
+    foreach ($record in @($TrustedKeys)) {
+        $file = [string](Get-ObjectProperty -Object $record -Name 'file')
+        $sha256 = [string](Get-ObjectProperty -Object $record -Name 'sha256')
+        $trust = [string](Get-ObjectProperty -Object $record -Name 'trust')
+        if ($file -cnotmatch '^[A-Za-z0-9@._-]+\.rsa\.pub$' -or $sha256 -cnotmatch '^[0-9a-f]{64}$' -or $trust -notin @('alpine-x86_64', 'project-signing') -or $actual.ContainsKey($file)) {
+            throw (New-BuildException -Code 'RESOLVED_LOCK_TRUSTED_KEYS_INVALID' -Message 'ResolvedBuildLock contains a malformed or duplicated trusted-key record.')
+        }
+        $actual.Add($file, "$sha256|$trust")
+    }
+    if ($actual.Count -ne $expected.Count) {
+        throw (New-BuildException -Code 'RESOLVED_LOCK_TRUSTED_KEYS_INVALID' -Message 'ResolvedBuildLock trusted-key set is not closed.')
+    }
+    foreach ($entry in $expected.GetEnumerator()) {
+        if (-not $actual.ContainsKey($entry.Key) -or $actual[$entry.Key] -cne $entry.Value) {
+            throw (New-BuildException -Code 'RESOLVED_LOCK_TRUSTED_KEYS_INVALID' -Message 'ResolvedBuildLock trusted-key bytes differ from the pinned allowlist.')
+        }
     }
     return $true
 }
@@ -418,12 +468,15 @@ function Publish-BuildArtifacts {
         [Parameter(Mandatory)] $BackendResult,
         [Parameter(Mandatory)] [string] $QemuImgPath,
         [Parameter(Mandatory)] [string] $SourceCommit,
-        [Parameter(Mandatory)] $DockerProbe
+        [Parameter(Mandatory)] $DockerProbe,
+        [Parameter(Mandatory)] $Inputs,
+        [Parameter(Mandatory)] $BuildRequest
     )
     $lockPath = Join-Path $StagingDirectory 'resolved-build-lock.json'
     if (-not [System.IO.File]::Exists($lockPath)) { throw (New-BuildException -Code 'BUILD_OUTPUT_MISSING' -Message 'resolved-build-lock.json is absent.') }
     $lock = Get-Content -Raw -LiteralPath $lockPath | ConvertFrom-Json -Depth 64
     [void](Test-ResolvedBuildLock -Lock $lock -ExpectedBuildRequestSha256 $BuildRequestHash)
+    [void](Test-ResolvedTrustedKeys -TrustedKeys @($lock.trusted_keys) -RepositoryKeys $Inputs.alpine.repository_keys -SigningPublicSha256 $BuildRequest.signing.public_key_sha256)
     if (-not [bool]$BackendResult.CleanupComplete) {
         throw (New-BuildException -Code 'QEMU_CLEANUP_INCOMPLETE' -Message 'QEMU cleanup did not complete, so artifact publication is forbidden.')
     }
@@ -627,7 +680,7 @@ function Invoke-300kBuild {
         -CloudImageUri ([uri]$inputs.qemu.cloud_image_url) -CloudImageSha512 $inputs.qemu.cloud_image_sha512 -CacheIdentity $cacheIdentity `
         -SigningPrivateFile (Join-Path $secretRoot '300k.rsa') -SigningPublicFile (Join-Path $secretRoot '300k.rsa.pub')
     [System.IO.File]::Copy($requestPath, (Join-Path $backendExport 'build-request.json'), $true)
-    return Publish-BuildArtifacts -StagingDirectory $backendExport -BuildId $buildId -BuildRequestHash $requestHash -BackendResult $backendResult -QemuImgPath $qemuImg -SourceCommit $sourceIdentity.git_commit -DockerProbe $dockerProbe
+    return Publish-BuildArtifacts -StagingDirectory $backendExport -BuildId $buildId -BuildRequestHash $requestHash -BackendResult $backendResult -QemuImgPath $qemuImg -SourceCommit $sourceIdentity.git_commit -DockerProbe $dockerProbe -Inputs $inputs -BuildRequest $request
 }
 
 if ($MyInvocation.InvocationName -ne '.') {

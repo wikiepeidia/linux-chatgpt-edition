@@ -401,6 +401,48 @@ Add-TestCase -Name 'BUILD-04 public inputs pin the complete builder and inspecti
     Assert-False -Condition ([bool]($raw -match '(?i)optional|\$PATH|latest-stable|/home/|[A-Z]:\\')) -Message 'Public inputs contain an ambient/moving/host-specific value.'
 }
 
+Add-TestCase -Name 'BUILD-04 mkimage trusts only the verified closed x86_64 keyring' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
+    $inputs = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'builder/inputs.json') | ConvertFrom-Json -Depth 30
+    $expectedRepositoryKeys = [ordered]@{
+        'alpine-devel@lists.alpinelinux.org-4a6a0840.rsa.pub' = '5adcf9349ddd8af1a5e5b5fe3eb1476e308bf3804d5c7e8f2fd81d83df6b7091'
+        'alpine-devel@lists.alpinelinux.org-5261cecb.rsa.pub' = 'e326d8f848ebce832a388b43f6283c9fd43ad0def86d9e7d151b0468a284b805'
+        'alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub' = '426532a8c2e49f3c9187523e350bf3362eb8d7ea0ed293b3a14fe749493e1f35'
+    }
+    $actualRepositoryKeys = $inputs.alpine.repository_keys
+    Assert-Equal -Expected @($expectedRepositoryKeys.Keys) -Actual @($actualRepositoryKeys.PSObject.Properties.Name) -Message 'The Alpine x86_64 repository-key allowlist changed.'
+    foreach ($name in $expectedRepositoryKeys.Keys) {
+        Assert-Equal -Expected $expectedRepositoryKeys[$name] -Actual ([string]$actualRepositoryKeys.$name) -Message "Repository key '$name' has an unpinned hash."
+    }
+
+    $projectKeyHash = 'd' * 64
+    $trustedKeys = @(
+        $actualRepositoryKeys.PSObject.Properties | ForEach-Object {
+            [pscustomobject]@{ file = $_.Name; sha256 = [string]$_.Value; trust = 'alpine-x86_64' }
+        }
+    ) + @([pscustomobject]@{ file = '300k.rsa.pub'; sha256 = $projectKeyHash; trust = 'project-signing' })
+    [void](Test-ResolvedTrustedKeys -TrustedKeys $trustedKeys -RepositoryKeys $actualRepositoryKeys -SigningPublicSha256 $projectKeyHash)
+    foreach ($invalid in @(
+        @($trustedKeys | Select-Object -Skip 1),
+        @($trustedKeys + [pscustomobject]@{ file = 'ambient.rsa.pub'; sha256 = ('e' * 64); trust = 'alpine-x86_64' }),
+        @($trustedKeys | ForEach-Object {
+            if ($_.file -ceq '300k.rsa.pub') { [pscustomobject]@{ file = $_.file; sha256 = ('f' * 64); trust = $_.trust } }
+            else { $_ }
+        })
+    )) {
+        Assert-ThrowsCode -Code 'RESOLVED_LOCK_TRUSTED_KEYS_INVALID' -Body {
+            Test-ResolvedTrustedKeys -TrustedKeys $invalid -RepositoryKeys $actualRepositoryKeys -SigningPublicSha256 $projectKeyHash | Out-Null
+        }
+    }
+
+    $linux = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/linux/run-build.sh')
+    Assert-Match -Value $linux -Pattern 'stage_closed_keyring "\$build_root/etc/apk/keys"' -Message 'The build root does not stage the verified closed keyring.'
+    Assert-Match -Value $linux -Pattern 'verify_closed_keyring "\$build_root/etc/apk/keys"' -Message 'The closed keyring is not reverified before mkimage.'
+    Assert-False -Condition ([bool]($linux -match 'cp /etc/apk/keys/\*')) -Message 'Ambient guest keys are still copied by wildcard.'
+    Assert-Match -Value $linux -Pattern 'mkimage_command=.*?mkimage\.sh.*?--hostkeys.*?--repository file:///repo' -Message 'Pinned mkimage argv does not import the closed buildroot keyring.'
+    Assert-False -Condition ([bool]($linux -match '(?i)--allow-untrusted|--no-signature|--no-check-signature|--insecure')) -Message 'A package-signature bypass was introduced.'
+    Assert-Match -Value $linux -Pattern '"trusted_keys": \[' -Message 'ResolvedBuildLock does not record the exact trusted key set.'
+}
+
 Add-TestCase -Name 'BUILD-04 source archive preserves LF-only guest shell scripts' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
     $attributes = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot '.gitattributes')
     Assert-Match -Value $attributes -Pattern '(?m)^\*\.sh text eol=lf$' -Message 'Git does not pin shell scripts to LF in archive output.'
@@ -585,6 +627,11 @@ if ($Scope -in @('Qemu', 'All')) {
         $requestHash = (Get-FileHash -LiteralPath $requestPath -Algorithm SHA256).Hash.ToLowerInvariant()
         $lock = Get-Content -Raw -LiteralPath (Join-Path $artifactRoot 'resolved-build-lock.json') | ConvertFrom-Json -Depth 64
         Assert-Equal -Expected $requestHash -Actual $lock.build_request_sha256 -Message 'Guest ResolvedBuildLock belongs to a different BuildRequest.'
+        $inputs = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'builder/inputs.json') | ConvertFrom-Json -Depth 30
+        [void](Test-ResolvedTrustedKeys -TrustedKeys @($lock.trusted_keys) -RepositoryKeys $inputs.alpine.repository_keys -SigningPublicSha256 $request.signing.public_key_sha256)
+        Assert-True -Condition ([bool]$lock.trust_policy.mkimage_hostkeys) -Message 'Resolved lock does not prove the exact mkimage --hostkeys path.'
+        Assert-True -Condition ([bool]$lock.trust_policy.closed_keyring_verified) -Message 'Resolved lock does not prove the closed keyring was verified.'
+        Assert-False -Condition ([bool]$lock.trust_policy.signature_bypass) -Message 'Resolved lock reports a signature bypass.'
         Assert-Equal -Expected $sourceCommit -Actual $request.source.git_commit -Message 'Build evidence does not preserve the clean source commit.'
         Assert-False -Condition ([bool]$request.source.dirty) -Message 'BuildRequest marked the committed source dirty.'
         Assert-Match -Value $lock.repository_object_id -Pattern '^[0-9a-f]{64}$' -Message 'Content-addressed repository ID is malformed.'

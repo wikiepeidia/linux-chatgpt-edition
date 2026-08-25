@@ -9,6 +9,11 @@
   "alpine": {
     "release": "3.24.1",
     "branch": "v3.24",
+    "repository_keys": {
+      "alpine-devel@lists.alpinelinux.org-4a6a0840.rsa.pub": "5adcf9349ddd8af1a5e5b5fe3eb1476e308bf3804d5c7e8f2fd81d83df6b7091",
+      "alpine-devel@lists.alpinelinux.org-5261cecb.rsa.pub": "e326d8f848ebce832a388b43f6283c9fd43ad0def86d9e7d151b0468a284b805",
+      "alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub": "426532a8c2e49f3c9187523e350bf3362eb8d7ea0ed293b3a14fe749493e1f35"
+    },
     "repositories": [
       {
         "name": "main",

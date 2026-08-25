@@ -69,6 +69,24 @@ json_array_lines() {
     ' "$file"
 }
 
+json_object_lines() {
+    key=$1
+    file=$2
+    awk -v wanted="\"$key\"" '
+        index($0, wanted) { inside=1; next }
+        inside && /^[[:space:]]*}/ { exit }
+        inside {
+            line=$0
+            sub(/^[[:space:]]*"/, "", line)
+            split(line, parts, /"[[:space:]]*:[[:space:]]*"/)
+            name=parts[1]
+            value=parts[2]
+            sub(/",?[[:space:]]*$/, "", value)
+            if (length(name) > 0 && length(value) > 0) print name "\t" value
+        }
+    ' "$file"
+}
+
 repository_value() {
     repo_name=$1
     field=$2
@@ -139,6 +157,86 @@ verify_repository_snapshot() {
         seen=$((seen + 1))
     done < "$manifest"
     [ "$seen" -gt 0 ] || fail REPOSITORY_MANIFEST_INVALID "repository manifest is empty"
+}
+
+verify_closed_keyring() {
+    destination=$1
+    manifest=$2
+    require_file "$manifest"
+    expected_names=$WORK_ROOT/trusted-key-names.expected
+    actual_names=$WORK_ROOT/trusted-key-names.actual
+    : > "$expected_names"
+    seen=0
+    while IFS='  ' read -r expected basename; do
+        [ -n "$expected" ] || continue
+        printf '%s' "$basename" | grep -Eq '^(alpine-devel@lists\.alpinelinux\.org-[0-9a-f]{8}|300k)\.rsa\.pub$' \
+            || fail TRUSTED_KEY_BASENAME_INVALID "trusted key basename is unsafe"
+        [ "${#expected}" -eq 64 ] && printf '%s' "$expected" | grep -Eq '^[0-9a-f]+$' \
+            || fail TRUSTED_KEY_HASH_INVALID "trusted key SHA-256 is malformed"
+        require_file "$destination/$basename"
+        [ ! -L "$destination/$basename" ] || fail TRUSTED_KEY_TYPE_INVALID "trusted key may not be a symlink"
+        [ "$(sha256_file "$destination/$basename")" = "$expected" ] \
+            || fail TRUSTED_KEY_HASH_MISMATCH "trusted key bytes differ from the public allowlist"
+        printf '%s\n' "$basename" >> "$expected_names"
+        seen=$((seen + 1))
+    done < "$manifest"
+    [ "$seen" -eq 4 ] || fail TRUSTED_KEY_SET_INVALID "closed keyring must contain three Alpine keys and one project key"
+    : > "$actual_names"
+    for path in "$destination"/*; do
+        [ -f "$path" ] || fail TRUSTED_KEY_TYPE_INVALID "closed keyring contains a non-file entry"
+        [ ! -L "$path" ] || fail TRUSTED_KEY_TYPE_INVALID "closed keyring contains a symlink"
+        basename "$path" >> "$actual_names"
+    done
+    LC_ALL=C sort "$actual_names" > "$actual_names.sorted"
+    LC_ALL=C sort "$expected_names" > "$expected_names.sorted"
+    cmp "$expected_names.sorted" "$actual_names.sorted" >/dev/null \
+        || fail TRUSTED_KEY_SET_INVALID "closed keyring contains an unapproved or missing key"
+}
+
+stage_closed_keyring() {
+    destination=$1
+    trusted_items=$2
+    manifest=$3
+    records=$WORK_ROOT/repository-keys.records
+    rm -rf "$destination"
+    mkdir -p "$destination"
+    json_object_lines repository_keys "$INPUTS_FILE" > "$records"
+    : > "$trusted_items"
+    : > "$manifest.partial"
+    repository_key_count=0
+    tab=$(printf '\t')
+    while IFS="$tab" read -r basename expected; do
+        [ -n "$basename" ] || continue
+        printf '%s' "$basename" | grep -Eq '^alpine-devel@lists\.alpinelinux\.org-[0-9a-f]{8}\.rsa\.pub$' \
+            || fail TRUSTED_KEY_BASENAME_INVALID "Alpine repository-key basename is unsafe"
+        [ "${#expected}" -eq 64 ] && printf '%s' "$expected" | grep -Eq '^[0-9a-f]+$' \
+            || fail TRUSTED_KEY_HASH_INVALID "Alpine repository-key SHA-256 is malformed"
+        source=/etc/apk/keys/$basename
+        require_file "$source"
+        [ ! -L "$source" ] || fail TRUSTED_KEY_TYPE_INVALID "Alpine repository-key source may not be a symlink"
+        [ "$(sha256_file "$source")" = "$expected" ] \
+            || fail TRUSTED_KEY_HASH_MISMATCH "Alpine repository-key bytes differ from the pinned aports source"
+        install -m 0644 "$source" "$destination/$basename"
+        printf '%s  %s\n' "$expected" "$basename" >> "$manifest.partial"
+        if [ -s "$trusted_items" ]; then printf ',\n' >> "$trusted_items"; fi
+        printf '    {"file": "%s", "sha256": "%s", "trust": "alpine-x86_64"}' "$basename" "$expected" >> "$trusted_items"
+        repository_key_count=$((repository_key_count + 1))
+    done < "$records"
+    [ "$repository_key_count" -eq 3 ] \
+        || fail TRUSTED_KEY_SET_INVALID "public inputs must pin exactly three Alpine x86_64 repository keys"
+
+    project_hash=$(json_scalar public_key_sha256 "$REQUEST_FILE")
+    [ "${#project_hash}" -eq 64 ] && printf '%s' "$project_hash" | grep -Eq '^[0-9a-f]+$' \
+        || fail TRUSTED_KEY_HASH_INVALID "BuildRequest project signing-key SHA-256 is malformed"
+    require_file "$SECRET_ROOT/300k.rsa.pub"
+    [ "$(sha256_file "$SECRET_ROOT/300k.rsa.pub")" = "$project_hash" ] \
+        || fail TRUSTED_KEY_HASH_MISMATCH "project public key differs from BuildRequest"
+    install -m 0644 "$SECRET_ROOT/300k.rsa.pub" "$destination/300k.rsa.pub"
+    printf '%s  %s\n' "$project_hash" 300k.rsa.pub >> "$manifest.partial"
+    if [ -s "$trusted_items" ]; then printf ',\n' >> "$trusted_items"; fi
+    printf '    {"file": "300k.rsa.pub", "sha256": "%s", "trust": "project-signing"}' "$project_hash" >> "$trusted_items"
+    mv "$manifest.partial" "$manifest"
+    verify_closed_keyring "$destination" "$manifest"
 }
 
 emit_repository_manifest() {
@@ -411,11 +509,12 @@ build_from_local() {
     builder_uid=1000
     builder_gid=1000
     rm -rf "$build_root"
-    mkdir -p "$build_root/etc/apk/keys" "$build_root/repo/x86_64" "$build_root/work" "$build_root/workspace" \
+    mkdir -p "$build_root/repo/x86_64" "$build_root/work" "$build_root/workspace" \
         "$build_root/export" "$build_root/run/300k-secrets" "$build_root/home/$builder_user/.mkimage" \
         "$build_root/tmp" "$build_root/proc" "$build_root/dev"
-    cp /etc/apk/keys/* "$build_root/etc/apk/keys/"
-    cp "$SECRET_ROOT/300k.rsa.pub" "$build_root/etc/apk/keys/300k.rsa.pub"
+    trusted_key_items=$WORK_ROOT/trusted-keys.json.items
+    trusted_key_manifest=$WORK_ROOT/trusted-keys.sha256
+    stage_closed_keyring "$build_root/etc/apk/keys" "$trusted_key_items" "$trusted_key_manifest"
     cp "$object_root"/* "$build_root/repo/x86_64/"
     cp "$SECRET_ROOT/300k.rsa" "$build_root/run/300k-secrets/300k.rsa"
     cp "$SECRET_ROOT/300k.rsa.pub" "$build_root/run/300k-secrets/300k.rsa.pub"
@@ -487,11 +586,15 @@ build_from_local() {
     disable_network
     verify_repository_snapshot "$build_root/repo/x86_64"
     verify_repository_snapshot "$object_root"
+    verify_closed_keyring "$build_root/etc/apk/keys" "$trusted_key_manifest"
     source_date_epoch=$(json_scalar source_date_epoch "$REQUEST_FILE")
     case "$source_date_epoch" in ''|0|*[!0-9]*) fail SOURCE_DATE_EPOCH_INVALID "BuildRequest epoch is invalid" ;; esac
     release_tag=p01-${request_hash%${request_hash#????????????}}
     mkimage_workdir=/work/mkimage/$request_hash
-    mkimage_command="exec /usr/bin/env -i HOME=/home/$builder_user PATH=/usr/sbin:/usr/bin:/sbin:/bin CBUILD=x86_64 SOURCE_DATE_EPOCH=$source_date_epoch PACKAGER_PRIVKEY=/run/300k-secrets/300k.rsa PACKAGER_PUBKEY=/run/300k-secrets/300k.rsa.pub /bin/sh /work/aports/scripts/mkimage.sh --tag $release_tag --outdir /export/raw --workdir $mkimage_workdir --arch x86_64 --repository file:///repo --profile 300k_bootstrap --checksum"
+    # Pinned aports commit 52643b7 copies /etc/apk/keys into its inner APKROOT
+    # only with --hostkeys. The buildroot key directory above is an exact,
+    # hash-verified four-key allowlist, so no ambient guest key crosses here.
+    mkimage_command="exec /usr/bin/env -i HOME=/home/$builder_user PATH=/usr/sbin:/usr/bin:/sbin:/bin CBUILD=x86_64 SOURCE_DATE_EPOCH=$source_date_epoch PACKAGER_PRIVKEY=/run/300k-secrets/300k.rsa PACKAGER_PUBKEY=/run/300k-secrets/300k.rsa.pub /bin/sh /work/aports/scripts/mkimage.sh --tag $release_tag --outdir /export/raw --workdir $mkimage_workdir --arch x86_64 --hostkeys --repository file:///repo --profile 300k_bootstrap --checksum"
     # Pinned aports uses apk add --no-chown for its APKROOT. apk-tools 3 maps
     # that option to usermode and rejects uid 0, so run mkimage as its sole
     # dedicated owner rather than weakening package verification.
@@ -554,6 +657,10 @@ build_from_local() {
     {"name": "community", "sha256": "$community_hash", "signature_verified": true}
   ],
   "aports": {"commit": "52643b7a176095362fd87fe73cdb994cb2e5ffae", "archive_sha256": "$(sha256_file "$object_root/aports.tar")"},
+  "trusted_keys": [
+$(cat "$trusted_key_items")
+  ],
+  "trust_policy": {"mkimage_hostkeys": true, "closed_keyring_verified": true, "signature_bypass": false},
   "builder_packages_record": {
     "file": "builder-packages.lock",
     "sha256": "$builder_hash",
