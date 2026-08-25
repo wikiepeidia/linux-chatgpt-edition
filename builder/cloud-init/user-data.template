@@ -6,7 +6,7 @@ users:
     gecos: 300K ephemeral build user
     groups: [wheel]
     shell: /bin/ash
-    lock_passwd: true
+    lock_passwd: false
     ssh_authorized_keys:
       - @@SSH_PUBLIC_KEY@@
 write_files:
@@ -18,7 +18,9 @@ write_files:
       KbdInteractiveAuthentication no
       ChallengeResponseAuthentication no
       PubkeyAuthentication yes
+      AuthenticationMethods publickey
       PermitRootLogin no
+      PermitEmptyPasswords no
       AllowUsers builder
   - path: /etc/doas.d/300k-builder.conf
     owner: root:root
@@ -47,4 +49,3 @@ runcmd:
       test "$key_type" = ssh-ed25519
       printf '300K_SSH_HOST_KEY %s %s %s\n' "$key_type" "$key_data" "$fingerprint" > /dev/ttyS0
       printf '%s\n' 300K_SSH_READY > /dev/ttyS0
-

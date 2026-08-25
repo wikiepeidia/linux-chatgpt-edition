@@ -228,7 +228,7 @@ Add-TestCase -Name 'BUILD-04 SSH and SCP ignore hostile ambient configuration an
             'PasswordAuthentication=no', 'KbdInteractiveAuthentication=no', 'IdentityAgent=none',
             'StrictHostKeyChecking=yes', "UserKnownHostsFile=$knownHosts", 'GlobalKnownHostsFile=NUL',
             'ProxyCommand=none', 'ProxyJump=none', 'KnownHostsCommand=none', 'ControlMaster=no',
-            'ConnectTimeout=5', 'ConnectionAttempts=1', 'HostKeyAlgorithms=ssh-ed25519', $identity
+            'ConnectTimeout=60', 'ConnectionAttempts=1', 'HostKeyAlgorithms=ssh-ed25519', $identity
         )) {
             Assert-True -Condition $joined.Contains($required) -Message "Missing strict SSH argument '$required'."
         }
@@ -287,6 +287,9 @@ Add-TestCase -Name 'BUILD-04 NoCloud templates are public-only and emit the orde
     Assert-Match -Value $user -Pattern 'ssh-ed25519'
     Assert-Match -Value $user -Pattern 'PasswordAuthentication\s+no'
     Assert-Match -Value $user -Pattern 'KbdInteractiveAuthentication\s+no'
+    Assert-Match -Value $user -Pattern 'lock_passwd:\s*false'
+    Assert-Match -Value $user -Pattern 'AuthenticationMethods\s+publickey'
+    Assert-Match -Value $user -Pattern 'PermitEmptyPasswords\s+no'
     Assert-False -Condition ([bool]($meta + $user -match '(?i)BEGIN .*PRIVATE KEY|password:\s*[^!]|token:\s*\S+')) -Message 'NoCloud templates contain secret-bearing material.'
 }
 

@@ -174,7 +174,7 @@ function New-IsolatedSshArgumentList {
         'ControlMaster=no',
         'ControlPath=none',
         'ClearAllForwardings=yes',
-        'ConnectTimeout=5',
+        'ConnectTimeout=60',
         'ConnectionAttempts=1',
         'HostKeyAlgorithms=ssh-ed25519',
         'LogLevel=ERROR'
@@ -625,17 +625,21 @@ function Invoke-QemuBackend {
 
         $sshDeadline = [System.DateTimeOffset]::UtcNow.AddSeconds($BootTimeoutSeconds)
         $sshReady = $false
+        $sshAttempt = 0
         $lastSshDiagnostic = 'no SSH diagnostic was returned'
-        while (-not $sshReady -and [System.DateTimeOffset]::UtcNow -lt $sshDeadline) {
+        while (-not $sshReady -and $sshAttempt -lt 3 -and [System.DateTimeOffset]::UtcNow -lt $sshDeadline) {
+            $sshAttempt++
+            $remainingSeconds = [Math]::Max(30, [int][Math]::Floor(($sshDeadline - [System.DateTimeOffset]::UtcNow).TotalSeconds))
+            $attemptTimeout = [Math]::Min(180, $remainingSeconds)
             try {
-                $probe = Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('printf', '300K_SSH_PROBE') -TimeoutSeconds 15 -AllowNonZero -Stage 'ssh-readiness'
+                $probe = Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('printf', '300K_SSH_PROBE') -TimeoutSeconds $attemptTimeout -AllowNonZero -Stage 'ssh-readiness'
                 $sshReady = $probe.StandardOutput -match '300K_SSH_PROBE'
                 if (-not $sshReady) {
                     $lastSshDiagnostic = if (-not [string]::IsNullOrWhiteSpace($probe.StandardError)) { $probe.StandardError.Trim() } else { "ssh exited $($probe.ExitCode) without the readiness token" }
                 }
             }
             catch { $lastSshDiagnostic = $_.Exception.Message }
-            if (-not $sshReady) { Start-Sleep -Seconds 2 }
+            if (-not $sshReady -and $sshAttempt -lt 3 -and [System.DateTimeOffset]::UtcNow.AddSeconds(30) -lt $sshDeadline) { Start-Sleep -Seconds 30 }
         }
         if (-not $sshReady) {
             $lastSshDiagnostic = $lastSshDiagnostic.Replace($identityPath, '<run-local-identity>').Replace($knownHostsPath, '<run-local-known-hosts>')
