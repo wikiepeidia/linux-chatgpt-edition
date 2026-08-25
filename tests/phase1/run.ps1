@@ -200,6 +200,7 @@ Add-TestCase -Name 'BUILD-04 serial trust accepts one ordered matching Ed25519 m
 }
 
 Add-TestCase -Name 'BUILD-04 SSH and SCP ignore hostile ambient configuration and use only run-local trust' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
+    Assert-Equal -Expected '''alpha''"''"''beta; touch /tmp/forbidden''' -Actual (ConvertTo-PosixShellLiteral -Value "alpha'beta; touch /tmp/forbidden") -Message 'Remote SSH argv is not encoded as one POSIX literal.'
     $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('300k-hostile-ssh-' + [Guid]::NewGuid().ToString('N'))
     $identity = Join-Path $scratch 'id_ed25519'
     $knownHosts = Join-Path $scratch 'known_hosts'

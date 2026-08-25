@@ -197,6 +197,12 @@ function Test-QemuLeaseAlive {
     }
 }
 
+function ConvertTo-PosixShellLiteral {
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string] $Value)
+    $escapedQuote = [string]::Concat([char]39, [char]34, [char]39, [char]34, [char]39)
+    return [string]::Concat([char]39, $Value.Replace("'", $escapedQuote), [char]39)
+}
+
 function Test-QemuSshFingerprint {
     param(
         [Parameter(Mandatory)] [string] $KeyType,
@@ -458,7 +464,7 @@ function Invoke-QemuSshCommand {
         [string] $Stage = 'ssh'
     )
     Test-QemuLeaseAlive -Lease $Lease -Stage $Stage
-    $payload = @('builder@127.0.0.1') + $Command
+    $payload = @('builder@127.0.0.1') + @($Command | ForEach-Object { ConvertTo-PosixShellLiteral -Value $_ })
     $arguments = New-IsolatedSshArgumentList -Tool ssh -IdentityFile $IdentityFile -KnownHostsFile $KnownHostsFile -Port $Port -RemoteUser builder -Payload $payload
     $result = Invoke-CheckedProcess -FilePath $SshPath -ArgumentList $arguments -TimeoutSeconds $TimeoutSeconds -AllowNonZero
     if (-not $AllowNonZero -and $result.ExitCode -ne 0) {
