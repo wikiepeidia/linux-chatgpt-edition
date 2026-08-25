@@ -168,8 +168,9 @@ Add-TestCase -Name 'BUILD-04 serial trust accepts one ordered matching Ed25519 m
         Remove-Item -LiteralPath $sharedScratch -Force -ErrorAction SilentlyContinue
     }
 
-    $keyBytes = [byte[]](0..31)
-    $publicKey = [Convert]::ToBase64String($keyBytes)
+    $rawKeyBytes = [byte[]](0..31)
+    $wireKeyBytes = [byte[]](@(0, 0, 0, 11) + [System.Text.Encoding]::ASCII.GetBytes('ssh-ed25519') + @(0, 0, 0, 32) + $rawKeyBytes)
+    $publicKey = [Convert]::ToBase64String($wireKeyBytes)
     $valid = @(
         'boot diagnostic',
         '300K_NOCLOUD_BEGIN',
@@ -187,6 +188,7 @@ Add-TestCase -Name 'BUILD-04 serial trust accepts one ordered matching Ed25519 m
         @{ Code = 'SERIAL_MILESTONE_MISSING'; Lines = @('300K_NOCLOUD_BEGIN', '300K_SSH_READY') },
         @{ Code = 'SERIAL_MILESTONE_DUPLICATE'; Lines = @('300K_NOCLOUD_BEGIN', $valid[2], $valid[2], '300K_SSH_READY') },
         @{ Code = 'SERIAL_MILESTONE_MALFORMED'; Lines = @('300K_NOCLOUD_BEGIN', '300K_SSH_HOST_KEY ssh-rsa invalid SHA256:nope', '300K_SSH_READY') },
+        @{ Code = 'SERIAL_MILESTONE_MALFORMED'; Lines = @('300K_NOCLOUD_BEGIN', "300K_SSH_HOST_KEY ssh-ed25519 $([Convert]::ToBase64String($rawKeyBytes)) SHA256:fixtureFingerprint", '300K_SSH_READY') },
         @{ Code = 'SERIAL_MILESTONE_OUT_OF_ORDER'; Lines = @($valid[2], '300K_NOCLOUD_BEGIN', '300K_SSH_READY') }
     )
     foreach ($case in $invalidCases) {

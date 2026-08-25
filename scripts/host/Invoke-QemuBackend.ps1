@@ -107,7 +107,15 @@ function Get-QemuSerialHostKey {
     catch {
         throw (New-QemuException -Code 'SERIAL_MILESTONE_MALFORMED' -Message 'The serial Ed25519 key is not valid base64.' -InnerException $_.Exception)
     }
-    if ($decoded.Length -ne 32) { throw (New-QemuException -Code 'SERIAL_MILESTONE_MALFORMED' -Message 'The serial Ed25519 key is not 32 bytes.') }
+    $wirePrefix = [byte[]](@(0, 0, 0, 11) + [System.Text.Encoding]::ASCII.GetBytes('ssh-ed25519') + @(0, 0, 0, 32))
+    if ($decoded.Length -ne ($wirePrefix.Length + 32)) {
+        throw (New-QemuException -Code 'SERIAL_MILESTONE_MALFORMED' -Message 'The serial Ed25519 key is not a canonical OpenSSH wire blob.')
+    }
+    for ($wireIndex = 0; $wireIndex -lt $wirePrefix.Length; $wireIndex++) {
+        if ($decoded[$wireIndex] -ne $wirePrefix[$wireIndex]) {
+            throw (New-QemuException -Code 'SERIAL_MILESTONE_MALFORMED' -Message 'The serial Ed25519 key has invalid OpenSSH wire framing.')
+        }
+    }
 
     $keyType = $match.Groups['type'].Value
     $key = $match.Groups['key'].Value
