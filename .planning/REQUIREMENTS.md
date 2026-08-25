@@ -98,16 +98,49 @@ The overnight release is done when the final ISO hash has passed every claimed f
 
 ## Traceability
 
-Phase mappings are populated during roadmap creation.
+Each v1 requirement maps to exactly one delivery phase.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
+| BUILD-01 | Phase 1 | Pending |
+| BUILD-02 | Phase 2 | Pending |
+| BUILD-03 | Phase 1 | Pending |
+| BUILD-04 | Phase 1 | Pending |
+| BOOT-01 | Phase 4 | Pending |
+| BOOT-02 | Phase 4 | Pending |
+| BOOT-03 | Phase 2 | Pending |
+| BOOT-04 | Phase 5 | Pending |
+| BOOT-05 | Phase 5 | Pending |
+| BOOT-06 | Phase 3 | Pending |
+| UI-01 | Phase 4 | Pending |
+| UI-02 | Phase 4 | Pending |
+| UI-03 | Phase 4 | Pending |
+| UI-04 | Phase 4 | Pending |
+| TERM-01 | Phase 3 | Pending |
+| TERM-02 | Phase 3 | Pending |
+| TERM-03 | Phase 4 | Pending |
+| TERM-04 | Phase 4 | Pending |
+| TERM-05 | Phase 4 | Pending |
+| FUN-01 | Phase 4 | Pending |
+| FUN-02 | Phase 4 | Pending |
+| FUN-03 | Phase 4 | Pending |
+| FUN-04 | Phase 4 | Pending |
+| FUN-05 | Phase 4 | Pending |
+| TOOL-01 | Phase 4 | Pending |
+| TOOL-02 | Phase 4 | Pending |
+| TOOL-03 | Phase 4 | Pending |
+| TOOL-04 | Phase 4 | Pending |
+| VER-01 | Phase 5 | Pending |
+| VER-02 | Phase 5 | Pending |
+| VER-03 | Phase 5 | Pending |
+| VER-04 | Phase 6 | Pending |
+| VER-05 | Phase 6 | Pending |
 
 **Coverage:**
 - v1 requirements: 33 total
-- Mapped to phases: 0
-- Unmapped: 33
+- Mapped to phases: 33
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-08-25*
-*Last updated: 2026-08-25 after initial definition*
+*Last updated: 2026-08-25 after roadmap creation*
