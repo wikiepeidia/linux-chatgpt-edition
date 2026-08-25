@@ -456,6 +456,9 @@ Add-TestCase -Name 'BUILD-04 repository drift aborts before the offline install 
     foreach ($pattern in @('init-signing-key', 'prepare-repository', 'build-from-local', 'file://', '--no-network', '300K_INJECT_REPOSITORY_DRIFT', 'ResolvedBuildLock', 'inspection_commands', 'network_disabled')) {
         Assert-Match -Value $linux -Pattern ([regex]::Escape($pattern)) -Message "Linux build core is missing '$pattern'."
     }
+    Assert-Match -Value $linux -Pattern "printf '%s\\n' 'file:///repo'" -Message 'The target root does not receive the canonical local-only repository URL.'
+    Assert-Match -Value $linux -Pattern 'apk --root "\$build_root" --arch x86_64 --initdb --keys-dir /etc/apk/keys' -Message 'APK root-relative key lookup or target architecture is not explicit.'
+    Assert-False -Condition ([bool]($linux -match 'file://\$build_root|--keys-dir "\$build_root')) -Message 'APK root-relative paths were incorrectly expanded on the host side.'
     Assert-Match -Value $linux -Pattern '(?s)verify_repository_snapshot.*?disable_network.*?mkimage\.sh' -Message 'Repository verification, network disablement, and mkimage order is not fail-closed.'
 }
 

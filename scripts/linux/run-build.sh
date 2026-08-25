@@ -415,10 +415,10 @@ build_from_local() {
     [ -f "$build_root/work/aports/scripts/mkimage.sh" ] || fail APORTS_ARCHIVE_INVALID "retained aports archive is incomplete"
     cp "$build_root/workspace/builder/profiles/mkimg.300k.sh" "$build_root/root/.mkimage/mkimg.300k.sh"
 
-    repositories_file=$WORK_ROOT/repositories.local
-    printf '%s\n' "file://$build_root/repo" > "$repositories_file"
+    repositories_file=$build_root/etc/apk/repositories
+    printf '%s\n' 'file:///repo' > "$repositories_file"
     builder_packages=$(json_array_lines builder_packages "$INPUTS_FILE" | tr '\n' ' ')
-    apk --root "$build_root" --initdb --keys-dir "$build_root/etc/apk/keys" \
+    apk --root "$build_root" --arch x86_64 --initdb --keys-dir /etc/apk/keys \
         --repositories-file "$repositories_file" --no-network add $builder_packages \
         || fail OFFLINE_INSTALL_FAILED "file-only network-disabled builder installation failed"
     apk --root "$build_root" --no-network list --installed --manifest | LC_ALL=C sort > "$EXPORT_ROOT/builder-packages.lock"
