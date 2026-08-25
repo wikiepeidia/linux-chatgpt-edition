@@ -174,6 +174,8 @@ function New-IsolatedSshArgumentList {
         'ControlMaster=no',
         'ControlPath=none',
         'ClearAllForwardings=yes',
+        'ConnectTimeout=5',
+        'ConnectionAttempts=1',
         'HostKeyAlgorithms=ssh-ed25519',
         'LogLevel=ERROR'
     )) {
@@ -623,14 +625,24 @@ function Invoke-QemuBackend {
 
         $sshDeadline = [System.DateTimeOffset]::UtcNow.AddSeconds($BootTimeoutSeconds)
         $sshReady = $false
+        $lastSshDiagnostic = 'no SSH diagnostic was returned'
         while (-not $sshReady -and [System.DateTimeOffset]::UtcNow -lt $sshDeadline) {
             try {
-                $probe = Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('printf', '300K_SSH_PROBE') -TimeoutSeconds 15 -Stage 'ssh-readiness'
+                $probe = Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('printf', '300K_SSH_PROBE') -TimeoutSeconds 15 -AllowNonZero -Stage 'ssh-readiness'
                 $sshReady = $probe.StandardOutput -match '300K_SSH_PROBE'
+                if (-not $sshReady) {
+                    $lastSshDiagnostic = if (-not [string]::IsNullOrWhiteSpace($probe.StandardError)) { $probe.StandardError.Trim() } else { "ssh exited $($probe.ExitCode) without the readiness token" }
+                }
             }
-            catch { Start-Sleep -Seconds 2 }
+            catch { $lastSshDiagnostic = $_.Exception.Message }
+            if (-not $sshReady) { Start-Sleep -Seconds 2 }
         }
-        if (-not $sshReady) { throw (New-QemuException -Code 'QEMU_SSH_TIMEOUT' -Message 'Strict SSH did not become ready within the boot bound.') }
+        if (-not $sshReady) {
+            $lastSshDiagnostic = $lastSshDiagnostic.Replace($identityPath, '<run-local-identity>').Replace($knownHostsPath, '<run-local-known-hosts>')
+            $lastSshDiagnostic = [regex]::Replace($lastSshDiagnostic, '[\r\n]+', ' ')
+            if ($lastSshDiagnostic.Length -gt 512) { $lastSshDiagnostic = $lastSshDiagnostic.Substring(0, 512) }
+            throw (New-QemuException -Code 'QEMU_SSH_TIMEOUT' -Message "Strict SSH did not become ready within the boot bound. Last diagnostic: $lastSshDiagnostic")
+        }
         $managementStages.Add('ssh-readiness-live')
 
         [void](Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('doas', 'mkdir', '-p', '/inputs', '/workspace', '/export', '/run/300k-secrets') -TimeoutSeconds 30 -Stage 'prepare-guest')

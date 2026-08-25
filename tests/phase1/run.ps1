@@ -228,7 +228,7 @@ Add-TestCase -Name 'BUILD-04 SSH and SCP ignore hostile ambient configuration an
             'PasswordAuthentication=no', 'KbdInteractiveAuthentication=no', 'IdentityAgent=none',
             'StrictHostKeyChecking=yes', "UserKnownHostsFile=$knownHosts", 'GlobalKnownHostsFile=NUL',
             'ProxyCommand=none', 'ProxyJump=none', 'KnownHostsCommand=none', 'ControlMaster=no',
-            'HostKeyAlgorithms=ssh-ed25519', $identity
+            'ConnectTimeout=5', 'ConnectionAttempts=1', 'HostKeyAlgorithms=ssh-ed25519', $identity
         )) {
             Assert-True -Condition $joined.Contains($required) -Message "Missing strict SSH argument '$required'."
         }
