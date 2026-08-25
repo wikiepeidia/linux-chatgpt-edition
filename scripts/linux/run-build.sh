@@ -441,8 +441,17 @@ build_from_local() {
     fi
     umount /repo || fail OFFLINE_REPOSITORY_UNMOUNT_FAILED "canonical local repository unmount failed"
     rmdir /repo
-    chroot "$build_root" /usr/sbin/addgroup -S -g "$builder_gid" "$builder_user"
-    chroot "$build_root" /usr/sbin/adduser -S -D -H -u "$builder_uid" -G "$builder_user" -s /bin/sh "$builder_user"
+    # The intentionally minimal builder closure has no baselayout account
+    # database. Define only the fixed identities needed for the uid transition.
+    printf '%s\n' \
+        'root:x:0:0:root:/root:/bin/sh' \
+        "$builder_user:x:$builder_uid:$builder_gid:300K build user:/home/$builder_user:/bin/sh" \
+        > "$build_root/etc/passwd"
+    printf '%s\n' \
+        'root:x:0:' \
+        "$builder_user:x:$builder_gid:" \
+        > "$build_root/etc/group"
+    chmod 0644 "$build_root/etc/passwd" "$build_root/etc/group"
     mkdir -p "$build_root/work/mkimage" "$build_root/export/raw"
     chown -R "$builder_uid:$builder_gid" \
         "$build_root/home/$builder_user" "$build_root/work/mkimage" "$build_root/export"

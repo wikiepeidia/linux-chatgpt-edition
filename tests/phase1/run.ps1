@@ -461,7 +461,7 @@ Add-TestCase -Name 'BUILD-04 repository drift aborts before the offline install 
     Assert-Match -Value $linux -Pattern '(?s)mount --bind "\$build_root/repo" /repo.*?--no-network add.*?umount /repo' -Message 'The canonical file:///repo URL is not bounded to the target repository during offline installation.'
     Assert-Match -Value $linux -Pattern 'apk --root "\$build_root" --arch x86_64 --initdb --keys-dir etc/apk/keys' -Message 'APK root-relative key lookup or target architecture is not explicit.'
     Assert-False -Condition ([bool]($linux -match '--keys-dir /etc/apk/keys')) -Message 'A leading slash would bypass the APK target root when loading signing keys.'
-    foreach ($pattern in @('/home/\$builder_user/\.mkimage', 'adduser -S -D -H -u "\$builder_uid"', 'HOME=/home/\$builder_user', '/bin/su -s /bin/sh -c "\$mkimage_command" "\$builder_user"')) {
+    foreach ($pattern in @('/home/\$builder_user/\.mkimage', '\$builder_user:x:\$builder_uid:\$builder_gid:300K build user', 'HOME=/home/\$builder_user', '/bin/su -s /bin/sh -c "\$mkimage_command" "\$builder_user"')) {
         Assert-Match -Value $linux -Pattern $pattern -Message "The pinned mkimage usermode boundary is missing '$pattern'."
     }
     Assert-False -Condition ([bool]($linux -match 'chroot "\$build_root" env -i')) -Message 'Pinned mkimage must not execute as the root chroot identity.'
