@@ -338,6 +338,44 @@ function Get-GitSourceIdentity {
     return [pscustomobject]@{ git_commit = $commit; source_date_epoch = [long]$epochText }
 }
 
+function Assert-SourceArchiveUnixText {
+    param([Parameter(Mandatory)] [string] $Path)
+
+    $requiredEntries = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($entryName in @('scripts/linux/run-build.sh', 'builder/profiles/mkimg.300k.sh')) {
+        [void]$requiredEntries.Add($entryName)
+    }
+
+    $archiveStream = [System.IO.File]::OpenRead($Path)
+    $reader = [System.Formats.Tar.TarReader]::new($archiveStream, $false)
+    try {
+        while ($null -ne ($entry = $reader.GetNextEntry())) {
+            if (-not $requiredEntries.Contains($entry.Name)) { continue }
+            if ($null -eq $entry.DataStream) {
+                throw (New-BuildException -Code 'SOURCE_ARCHIVE_ENTRY_INVALID' -Message "Source archive entry '$($entry.Name)' has no file data.")
+            }
+
+            $content = [System.IO.MemoryStream]::new()
+            try {
+                $entry.DataStream.CopyTo($content)
+                if ([System.Array]::IndexOf[byte]($content.ToArray(), [byte]13) -ge 0) {
+                    throw (New-BuildException -Code 'SOURCE_ARCHIVE_LINE_ENDINGS_INVALID' -Message "Source archive entry '$($entry.Name)' contains a carriage return; guest shell scripts must use LF line endings.")
+                }
+            }
+            finally { $content.Dispose() }
+            [void]$requiredEntries.Remove($entry.Name)
+        }
+    }
+    finally {
+        $reader.Dispose()
+        $archiveStream.Dispose()
+    }
+
+    if ($requiredEntries.Count -ne 0) {
+        throw (New-BuildException -Code 'SOURCE_ARCHIVE_ENTRY_MISSING' -Message "Source archive is missing required guest shell entries: $(@($requiredEntries) -join ', ').")
+    }
+}
+
 function New-DeterministicSourceArchive {
     param([Parameter(Mandatory)] [string] $Destination)
     $git = (Get-Command git.exe -CommandType Application -ErrorAction Stop).Source
@@ -345,6 +383,7 @@ function New-DeterministicSourceArchive {
     if (-not [System.IO.File]::Exists($Destination) -or (Get-Item -LiteralPath $Destination).Length -le 0) {
         throw (New-BuildException -Code 'SOURCE_ARCHIVE_FAILED' -Message 'Git did not create a nonempty deterministic source archive.')
     }
+    Assert-SourceArchiveUnixText -Path $Destination
     return Get-LowerFileSha256 -Path $Destination
 }
 

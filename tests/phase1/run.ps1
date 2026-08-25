@@ -396,6 +396,44 @@ Add-TestCase -Name 'BUILD-04 public inputs pin the complete builder and inspecti
     Assert-False -Condition ([bool]($raw -match '(?i)optional|\$PATH|latest-stable|/home/|[A-Z]:\\')) -Message 'Public inputs contain an ambient/moving/host-specific value.'
 }
 
+Add-TestCase -Name 'BUILD-04 source archive preserves LF-only guest shell scripts' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
+    $attributes = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot '.gitattributes')
+    Assert-Match -Value $attributes -Pattern '(?m)^\*\.sh text eol=lf$' -Message 'Git does not pin shell scripts to LF in archive output.'
+
+    $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('300k-source-archive-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $scratch | Out-Null
+    try {
+        foreach ($fixture in @(
+            [pscustomobject]@{ Name = 'valid.tar'; Bytes = [System.Text.Encoding]::UTF8.GetBytes("#!/bin/sh`nset -eu`n"); ErrorCode = $null },
+            [pscustomobject]@{ Name = 'crlf.tar'; Bytes = [System.Text.Encoding]::UTF8.GetBytes("#!/bin/sh`r`nset -eu`r`n"); ErrorCode = 'SOURCE_ARCHIVE_LINE_ENDINGS_INVALID' }
+        )) {
+            $path = Join-Path $scratch $fixture.Name
+            $stream = [System.IO.File]::Create($path)
+            $writer = [System.Formats.Tar.TarWriter]::new($stream, $false)
+            try {
+                foreach ($entryName in @('scripts/linux/run-build.sh', 'builder/profiles/mkimg.300k.sh')) {
+                    $entry = [System.Formats.Tar.PaxTarEntry]::new([System.Formats.Tar.TarEntryType]::RegularFile, $entryName)
+                    $entry.DataStream = [System.IO.MemoryStream]::new($fixture.Bytes, $false)
+                    try { $writer.WriteEntry($entry) }
+                    finally { $entry.DataStream.Dispose() }
+                }
+            }
+            finally {
+                $writer.Dispose()
+                $stream.Dispose()
+            }
+
+            if ($null -eq $fixture.ErrorCode) {
+                Assert-SourceArchiveUnixText -Path $path
+            }
+            else {
+                Assert-ThrowsCode -Code $fixture.ErrorCode -Body { Assert-SourceArchiveUnixText -Path $path }
+            }
+        }
+    }
+    finally { Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 Add-TestCase -Name 'BUILD-04 repository drift aborts before the offline install boundary' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
     $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('300k-repository-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $scratch | Out-Null
