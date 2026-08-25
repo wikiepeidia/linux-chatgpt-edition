@@ -202,7 +202,7 @@ scan_regular_bytes() {
     credential_pattern='(FICT[A-Z0-9_]*SECRET_TOKEN|OPENAI_API_KEY|AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN|PASSWORD)[=:][[:space:]]*[A-Za-z0-9_./+~-]{12,}'
     host_pattern='([A-Za-z]:\\Users\\|\\\\[^\\[:space:]]+\\[^\\[:space:]]+|/run/300k-secrets|wikiepeidia)'
     if grep -aEiq "$private_pattern|$credential_pattern|$host_pattern" "$file"; then
-        fail INSPECTION_SECRET_FOUND "decoded regular bytes contain a private credential or host-management marker"
+        fail INSPECTION_SECRET_FOUND "decoded regular bytes contain a private credential or host-management marker logical=$logical"
     fi
     case "$logical" in
         */.SIGN.RSA.*.rsa.pub)
