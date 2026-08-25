@@ -460,6 +460,7 @@ Add-TestCase -Name 'BUILD-04 repository drift aborts before the offline install 
     Assert-Match -Value $linux -Pattern 'apk --root "\$build_root" --arch x86_64 --initdb --keys-dir /etc/apk/keys' -Message 'APK root-relative key lookup or target architecture is not explicit.'
     Assert-Match -Value $linux -Pattern 'apk --cache-dir "\$online_cache" --repositories-file "\$online_repositories" update' -Message 'APK 3 repository indexes are not explicitly refreshed in an isolated cache.'
     Assert-Match -Value $linux -Pattern '(?s)repositories\.online.*?apk --cache-dir.*? update.*?apk --cache-dir.*? fetch --recursive' -Message 'Closure resolution does not follow the isolated repository update.'
+    Assert-Match -Value $linux -Pattern '! -name repository\.sha256 ! -name repository\.sha256\.partial' -Message 'Repository manifest generation can include its own transient output.'
     Assert-False -Condition ([bool]($linux -match 'file://\$build_root|--keys-dir "\$build_root')) -Message 'APK root-relative paths were incorrectly expanded on the host side.'
     Assert-Match -Value $linux -Pattern '(?s)verify_repository_snapshot.*?disable_network.*?mkimage\.sh' -Message 'Repository verification, network disablement, and mkimage order is not fail-closed.'
 }

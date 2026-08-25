@@ -145,7 +145,7 @@ emit_repository_manifest() {
     repository=$1
     (
         cd "$repository"
-        find . -maxdepth 1 -type f ! -name repository.sha256 \
+        find . -maxdepth 1 -type f ! -name repository.sha256 ! -name repository.sha256.partial \
             | sed 's#^\./##' \
             | LC_ALL=C sort \
             | while IFS= read -r basename; do
