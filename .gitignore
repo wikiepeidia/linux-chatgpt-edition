@@ -111,3 +111,6 @@ docs/_build/
 .codex/
 .ai-cache/
 ai-cache/
+
+# --- GSD runtime coordination ---
+.planning/milestone.lock
