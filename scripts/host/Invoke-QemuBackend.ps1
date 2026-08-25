@@ -480,7 +480,14 @@ function Invoke-QemuScp {
     if ($Recursive) { $payload += '-r' }
     $payload += $Paths
     $arguments = New-IsolatedSshArgumentList -Tool scp -IdentityFile $IdentityFile -KnownHostsFile $KnownHostsFile -Port $Port -RemoteUser builder -Payload $payload
-    return Invoke-CheckedProcess -FilePath $ScpPath -ArgumentList $arguments -TimeoutSeconds $TimeoutSeconds
+    $result = Invoke-CheckedProcess -FilePath $ScpPath -ArgumentList $arguments -TimeoutSeconds $TimeoutSeconds -AllowNonZero
+    if ($result.ExitCode -ne 0) {
+        $diagnostic = if (-not [string]::IsNullOrWhiteSpace($result.StandardError)) { $result.StandardError.Trim() } else { "scp exited $($result.ExitCode) without stderr" }
+        $diagnostic = [regex]::Replace($diagnostic, '[\r\n]+', ' ')
+        if ($diagnostic.Length -gt 512) { $diagnostic = $diagnostic.Substring(0, 512) }
+        throw (New-QemuException -Code 'QEMU_SCP_FAILED' -Message "SCP stage '$Stage' failed: $diagnostic")
+    }
+    return $result
 }
 
 function Write-SanitizedSerialEvidence {
@@ -659,7 +666,7 @@ function Invoke-QemuBackend {
         }
         $managementStages.Add('ssh-readiness-live')
 
-        [void](Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('doas', 'mkdir', '-p', '/inputs', '/workspace', '/export', '/run/300k-secrets') -TimeoutSeconds 30 -Stage 'prepare-guest')
+        [void](Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('doas', 'sh', '-ceu', 'install -d -m 700 -o builder -g builder /inputs /run/300k-secrets; mkdir -p /workspace /export') -TimeoutSeconds 30 -Stage 'prepare-guest')
         $managementStages.Add('prepare-guest-live')
         [void](Invoke-QemuScp -Lease $qemuLease -ScpPath $scpPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Paths @($SourceArchive, 'builder@127.0.0.1:/inputs/source.tar') -TimeoutSeconds 300 -Stage 'source-transfer')
         [void](Invoke-QemuScp -Lease $qemuLease -ScpPath $scpPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Paths @($RequestFile, 'builder@127.0.0.1:/inputs/request.json') -TimeoutSeconds 120 -Stage 'request-transfer')
@@ -672,9 +679,9 @@ function Invoke-QemuBackend {
                     throw (New-QemuException -Code 'QEMU_SIGNING_INPUT_MISSING' -Message 'The ordinary build requires the external APK key pair.')
                 }
             }
-            [void](Invoke-QemuScp -Lease $qemuLease -ScpPath $scpPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Paths @($SigningPrivateFile, 'builder@127.0.0.1:/inputs/300k.rsa') -TimeoutSeconds 120 -Stage 'private-key-transfer')
+            [void](Invoke-QemuScp -Lease $qemuLease -ScpPath $scpPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Paths @($SigningPrivateFile, 'builder@127.0.0.1:/run/300k-secrets/300k.rsa') -TimeoutSeconds 120 -Stage 'private-key-transfer')
             [void](Invoke-QemuScp -Lease $qemuLease -ScpPath $scpPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Paths @($SigningPublicFile, 'builder@127.0.0.1:/inputs/300k.rsa.pub') -TimeoutSeconds 120 -Stage 'public-key-transfer')
-            [void](Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('doas', 'sh', '-ceu', 'install -m 600 /inputs/300k.rsa /run/300k-secrets/300k.rsa; install -m 644 /inputs/300k.rsa.pub /run/300k-secrets/300k.rsa.pub; rm -f /inputs/300k.rsa') -TimeoutSeconds 30 -Stage 'private-key-stage')
+            [void](Invoke-QemuSshCommand -Lease $qemuLease -SshPath $sshPath -IdentityFile $identityPath -KnownHostsFile $knownHostsPath -Port $sshReservation.Port -Command @('doas', 'sh', '-ceu', 'chown root:root /run/300k-secrets/300k.rsa; chmod 600 /run/300k-secrets/300k.rsa; install -m 644 /inputs/300k.rsa.pub /run/300k-secrets/300k.rsa.pub; rm -f /inputs/300k.rsa.pub') -TimeoutSeconds 30 -Stage 'private-key-stage')
             $managementStages.Add('private-key-tmpfs-live')
         }
 

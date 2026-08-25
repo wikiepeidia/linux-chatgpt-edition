@@ -445,6 +445,9 @@ Add-TestCase -Name 'BUILD-04 Linux core owns package/profile decisions and the Q
 
     $qemu = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/host/Invoke-QemuBackend.ps1')
     Assert-False -Condition ([bool]($qemu -match '(?im)^\s*(apk\s+add|.*mkimage\.sh\s+--|profile_virt\s*\()')) -Message 'QEMU transport contains package/profile build logic.'
+    Assert-Match -Value $qemu -Pattern 'install -d -m 700 -o builder -g builder /inputs /run/300k-secrets' -Message 'Guest input and tmpfs transfer directories are not explicitly owned by the ephemeral builder.'
+    Assert-Match -Value $qemu -Pattern 'builder@127\.0\.0\.1:/run/300k-secrets/300k\.rsa' -Message 'The private APK key is not transferred directly into guest tmpfs.'
+    Assert-False -Condition ([bool]($qemu -match 'builder@127\.0\.0\.1:/inputs/300k\.rsa[''"]')) -Message 'The private APK key still crosses the disk-backed guest input directory.'
 }
 
 if ($Scope -in @('Qemu', 'All')) {
