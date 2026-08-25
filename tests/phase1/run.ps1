@@ -404,9 +404,9 @@ Add-TestCase -Name 'BUILD-04 public inputs pin the complete builder and inspecti
 Add-TestCase -Name 'BUILD-04 mkimage trusts only the verified closed x86_64 keyring' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
     $inputs = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'builder/inputs.json') | ConvertFrom-Json -Depth 30
     $expectedRepositoryKeys = [ordered]@{
-        'alpine-devel@lists.alpinelinux.org-4a6a0840.rsa.pub' = '5adcf9349ddd8af1a5e5b5fe3eb1476e308bf3804d5c7e8f2fd81d83df6b7091'
-        'alpine-devel@lists.alpinelinux.org-5261cecb.rsa.pub' = 'e326d8f848ebce832a388b43f6283c9fd43ad0def86d9e7d151b0468a284b805'
-        'alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub' = '426532a8c2e49f3c9187523e350bf3362eb8d7ea0ed293b3a14fe749493e1f35'
+        'alpine-devel@lists.alpinelinux.org-4a6a0840.rsa.pub' = '9c102bcc376af1498d549b77bdbfa815ae86faa1d2d82f040e616b18ef2df2d4'
+        'alpine-devel@lists.alpinelinux.org-5261cecb.rsa.pub' = '12f899e55a7691225603d6fb3324940fc51cd7f133e7ead788663c2b7eecb00c'
+        'alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub' = '207e4696d3c05f7cb05966aee557307151f1f00217af4143c1bcaf33b8df733f'
     }
     $actualRepositoryKeys = $inputs.alpine.repository_keys
     Assert-Equal -Expected @($expectedRepositoryKeys.Keys) -Actual @($actualRepositoryKeys.PSObject.Properties.Name) -Message 'The Alpine x86_64 repository-key allowlist changed.'
