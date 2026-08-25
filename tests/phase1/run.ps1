@@ -160,7 +160,8 @@ Add-TestCase -Name 'BUILD-04 serial trust accepts one ordered matching Ed25519 m
         $bytes = [System.Text.Encoding]::UTF8.GetBytes("300K_NOCLOUD_BEGIN`n")
         $writer.Write($bytes, 0, $bytes.Length)
         $writer.Flush()
-        Assert-Equal -Expected '300K_NOCLOUD_BEGIN' -Actual (Read-SharedTextLines -Path $sharedScratch | Select-Object -First 1) -Message 'Serial log was not readable while its writer remained live.'
+        $sharedLines = @(Read-SharedTextLines -Path $sharedScratch)
+        Assert-Equal -Expected @('300K_NOCLOUD_BEGIN') -Actual $sharedLines -Message 'Serial log was not read cleanly while its writer remained live.'
     }
     finally {
         $writer.Dispose()

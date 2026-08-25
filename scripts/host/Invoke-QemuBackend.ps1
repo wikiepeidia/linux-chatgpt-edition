@@ -432,7 +432,7 @@ function Read-SharedTextLines {
     }
     finally { $stream.Dispose() }
     if ([string]::IsNullOrEmpty($text)) { return @() }
-    return @($text -split "`r?`n")
+    return @($text -split "`r?`n" | Where-Object { -not [string]::IsNullOrEmpty($_) })
 }
 
 function Invoke-QemuSshCommand {
