@@ -542,7 +542,12 @@ record_inspection_command() {
     package_name=${package_pin%%=*}
     package_version=${package_pin#*=}
     expected_owner=$package_name-$package_version
-    ownership=$(chroot "$root" apk info --who-owns "$command_path" 2>/dev/null || true)
+    resolved_command=$(chroot "$root" readlink -f "$command_path" 2>/dev/null || true)
+    case "$resolved_command" in
+        /*) ;;
+        *) fail INSPECTION_PATH_RESOLUTION_FAILED "$format command did not resolve to one absolute chroot path" ;;
+    esac
+    ownership=$(chroot "$root" apk info --who-owns "$resolved_command" 2>/dev/null || true)
     printf '%s' "$ownership" | grep -F "$expected_owner" >/dev/null || fail INSPECTION_OWNER_MISMATCH "$format command ownership mismatch"
     case "$format" in
         squashfs|iso) version=$(chroot "$root" "$command_path" -version 2>&1 | head -n 1 | tr -cd '[:alnum:] ._+:/()-') ;;
