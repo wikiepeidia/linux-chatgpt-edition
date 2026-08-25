@@ -483,7 +483,7 @@ build_from_local() {
     case "$source_date_epoch" in ''|0|*[!0-9]*) fail SOURCE_DATE_EPOCH_INVALID "BuildRequest epoch is invalid" ;; esac
     release_tag=p01-${request_hash%${request_hash#????????????}}
     mkimage_workdir=/work/mkimage/$request_hash
-    mkimage_command="exec /usr/bin/env -i HOME=/home/$builder_user PATH=/usr/sbin:/usr/bin:/sbin:/bin SOURCE_DATE_EPOCH=$source_date_epoch PACKAGER_PRIVKEY=/run/300k-secrets/300k.rsa PACKAGER_PUBKEY=/run/300k-secrets/300k.rsa.pub /bin/sh /work/aports/scripts/mkimage.sh --tag $release_tag --outdir /export/raw --workdir $mkimage_workdir --arch x86_64 --repository file:///repo --profile 300k_bootstrap --checksum"
+    mkimage_command="exec /usr/bin/env -i HOME=/home/$builder_user PATH=/usr/sbin:/usr/bin:/sbin:/bin CBUILD=x86_64 SOURCE_DATE_EPOCH=$source_date_epoch PACKAGER_PRIVKEY=/run/300k-secrets/300k.rsa PACKAGER_PUBKEY=/run/300k-secrets/300k.rsa.pub /bin/sh /work/aports/scripts/mkimage.sh --tag $release_tag --outdir /export/raw --workdir $mkimage_workdir --arch x86_64 --repository file:///repo --profile 300k_bootstrap --checksum"
     # Pinned aports uses apk add --no-chown for its APKROOT. apk-tools 3 maps
     # that option to usermode and rejects uid 0, so run mkimage as its sole
     # dedicated owner rather than weakening package verification.
