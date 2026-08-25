@@ -78,22 +78,19 @@ function Assert-ThrowsCode {
     throw "Expected exception code '$Code', but no exception was thrown."
 }
 
-function Import-Phase1Script {
-    param([Parameter(Mandatory)] [string] $RelativePath)
-    $path = Join-Path $script:RepositoryRoot $RelativePath
-    try {
-        . $path
-    }
-    catch {
-        $script:LoadErrors.Add("$RelativePath :: $($_.Exception.Message)")
-    }
-}
-
 if ($Scope -in @('Unit', 'All')) {
-    Import-Phase1Script 'scripts/host/Invoke-CheckedProcess.ps1'
-    Import-Phase1Script 'scripts/host/Invoke-QemuBackend.ps1'
-    if (Test-Path -LiteralPath (Join-Path $script:RepositoryRoot 'build.ps1')) {
-        Import-Phase1Script 'build.ps1'
+    foreach ($relativeScript in @(
+        'scripts/host/Invoke-CheckedProcess.ps1',
+        'scripts/host/Invoke-QemuBackend.ps1'
+    )) {
+        $importPath = Join-Path $script:RepositoryRoot $relativeScript
+        try { . $importPath }
+        catch { $script:LoadErrors.Add("$relativeScript :: $($_.Exception.Message)") }
+    }
+    $buildEntry = Join-Path $script:RepositoryRoot 'build.ps1'
+    if (Test-Path -LiteralPath $buildEntry) {
+        try { . $buildEntry }
+        catch { $script:LoadErrors.Add("build.ps1 :: $($_.Exception.Message)") }
     }
 }
 
@@ -237,9 +234,9 @@ Add-TestCase -Name 'BUILD-04 one idempotent outer resource owner cleans every ac
                 $label = $stages[$index]
                 $counts[$label] = 0
                 Add-QemuOwnedResource -Owner $owner -Name $label -Cleanup {
-                    param($capturedLabel)
-                    $counts[$capturedLabel] = [int]$counts[$capturedLabel] + 1
-                } -CleanupArgument $label
+                    param($cleanupState)
+                    $cleanupState.Counts[$cleanupState.Label] = [int]$cleanupState.Counts[$cleanupState.Label] + 1
+                } -CleanupArgument ([pscustomobject]@{ Counts = $counts; Label = $label })
                 if ($index -eq $failAt) { throw "injected:$label" }
             }
         }

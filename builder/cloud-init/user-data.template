@@ -1,0 +1,50 @@
+#cloud-config
+disable_root: true
+ssh_pwauth: false
+users:
+  - name: builder
+    gecos: 300K ephemeral build user
+    groups: [wheel]
+    shell: /bin/ash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - @@SSH_PUBLIC_KEY@@
+write_files:
+  - path: /etc/ssh/sshd_config.d/300k-management.conf
+    owner: root:root
+    permissions: '0600'
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      ChallengeResponseAuthentication no
+      PubkeyAuthentication yes
+      PermitRootLogin no
+      AllowUsers builder
+  - path: /etc/doas.d/300k-builder.conf
+    owner: root:root
+    permissions: '0600'
+    content: |
+      permit nopass builder as root
+runcmd:
+  - |
+      set -eu
+      printf '%s\n' 300K_NOCLOUD_BEGIN > /dev/ttyS0
+      ssh-keygen -A
+      cache_device=/dev/disk/by-id/virtio-300k-cache
+      cache_root=/var/lib/300k-cache
+      mkdir -p "$cache_root"
+      if ! blkid "$cache_device" >/dev/null 2>&1; then
+        mkfs.ext4 -F -L 300k-cache "$cache_device"
+      fi
+      mount "$cache_device" "$cache_root"
+      mkdir -p "$cache_root/repositories"
+      chown -R builder:builder "$cache_root"
+      rc-service sshd restart
+      host_key=/etc/ssh/ssh_host_ed25519_key.pub
+      key_type=$(awk '{print $1}' "$host_key")
+      key_data=$(awk '{print $2}' "$host_key")
+      fingerprint=$(ssh-keygen -E sha256 -lf "$host_key" | awk '{print $2}')
+      test "$key_type" = ssh-ed25519
+      printf '300K_SSH_HOST_KEY %s %s %s\n' "$key_type" "$key_data" "$fingerprint" > /dev/ttyS0
+      printf '%s\n' 300K_SSH_READY > /dev/ttyS0
+
