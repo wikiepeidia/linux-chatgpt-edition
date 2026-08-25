@@ -222,6 +222,21 @@ scan_regular_bytes() {
     esac
 }
 
+assert_decoder_log_clean() {
+    format=$1
+    log=$2
+    if [ "$format" = iso9660 ]; then
+        expected_banner=$(evidence_field iso version)
+        [ -n "$expected_banner" ] || fail INSPECTION_TOOLCHAIN_VERSION_MISSING "locked xorriso version evidence is absent"
+        banner_count=$(grep -Fxc -- "$expected_banner" "$log" 2>/dev/null || true)
+        [ "$banner_count" -le 1 ] || fail INSPECTION_DECODER_WARNING "xorriso emitted duplicate startup banners"
+        filtered=$log.filtered
+        grep -Fvx -- "$expected_banner" "$log" > "$filtered" || true
+        mv "$filtered" "$log"
+    fi
+    [ ! -s "$log" ] || fail INSPECTION_DECODER_WARNING "$format decoder emitted warning or parser residue"
+}
+
 assert_root_confined_path() {
     destination=$1
     case "$destination" in "$OWNED_ROOT"/materialized/[0-9]*.partial|"$OWNED_ROOT"/materialized/[0-9]*) ;; *) fail INSPECTION_DESTINATION_ESCAPE "generated destination escaped scratch" ;; esac
@@ -373,7 +388,7 @@ stream_regular_member() {
         *) fail INSPECTION_FORMAT_UNSUPPORTED "member stream format is unsupported" ;;
     esac
     [ "$status" -eq 0 ] || fail INSPECTION_DECODE_FAILED "$kind regular-member decoder failed"
-    [ ! -s "$error_log" ] || fail INSPECTION_DECODER_WARNING "$kind regular-member decoder emitted warning or parser residue"
+    assert_decoder_log_clean "$kind" "$error_log"
     [ -f "$partial" ] && [ ! -L "$partial" ] || fail INSPECTION_OUTPUT_TYPE "decoder output is not one regular file"
     actual=$(file_bytes "$partial")
     [ "$actual" -eq "$expected_size" ] || fail INSPECTION_SIZE_MISMATCH "$kind regular-member size differs from its preflight declaration"
@@ -471,7 +486,7 @@ make_iso_manifest() {
     iso_command=$(tool_field iso command)
     "$iso_command" -report_about WARNING -indev "$iso" -find / -exec lsdl \
         > "$raw" 2> "$errors" || fail INSPECTION_ISO_LIST_FAILED "xorriso could not list the complete ISO graph"
-    [ ! -s "$errors" ] || fail INSPECTION_DECODER_WARNING "xorriso emitted a warning while listing the ISO"
+    assert_decoder_log_clean iso9660 "$errors"
     awk '
         function clean(value) { gsub(/^\047|\047$/, "", value); sub(/^\//, "", value); sub(/^\.\//, "", value); return value }
         /^[bcdlps-][rwxStTs-]{9}[[:space:]]/ {
