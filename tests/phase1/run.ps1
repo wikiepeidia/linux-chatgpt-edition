@@ -151,7 +151,7 @@ Add-TestCase -Name 'BUILD-03 offline build proves decoder identity before inspec
     Assert-Match -Value $linuxCore -Pattern 'assert_inspection_toolchain_identity[\s\S]*disable_network[\s\S]*run_inspector_self_test[\s\S]*mkimage' -Message 'Tool identity and hostile fixtures must pass before network-off ISO construction.'
     Assert-Match -Value $linuxCore -Pattern 'mkimage[\s\S]*inspect_iso_artifact[\s\S]*iso-audit\.json[\s\S]*SHA256SUMS' -Message 'The finished ISO must be decoded and audited before its checksum is staged.'
     Assert-Match -Value $linuxCore -Pattern 'inspection_toolchain[\s\S]*retained_repository' -Message 'Decoder evidence must bind back to the retained repository closure.'
-    Assert-Match -Value $linuxCore -Pattern 'readlink -f "\$command_path"[\s\S]*apk info --who-owns "\$resolved_command"' -Message 'Configured applet paths must resolve inside the chroot before exact package ownership is accepted.'
+    Assert-Match -Value $linuxCore -Pattern 'readlink -f "\$command_path"[\s\S]*apk info -W "\$resolved_command"' -Message 'Configured applet paths must resolve inside the chroot before APK Tools 3 exact package ownership is accepted.'
     Assert-Match -Value $linuxCore -Pattern 'scripts/linux/inspect-iso\.sh' -Message 'The inspector must be included in the normalized source archive contract.'
 }
 

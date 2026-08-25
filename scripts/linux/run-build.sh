@@ -547,7 +547,7 @@ record_inspection_command() {
         /*) ;;
         *) fail INSPECTION_PATH_RESOLUTION_FAILED "$format command did not resolve to one absolute chroot path" ;;
     esac
-    ownership=$(chroot "$root" apk info --who-owns "$resolved_command" 2>/dev/null || true)
+    ownership=$(chroot "$root" apk info -W "$resolved_command" 2>/dev/null || true)
     printf '%s' "$ownership" | grep -F "$expected_owner" >/dev/null || fail INSPECTION_OWNER_MISMATCH "$format command ownership mismatch"
     case "$format" in
         squashfs|iso) version=$(chroot "$root" "$command_path" -version 2>&1 | head -n 1 | tr -cd '[:alnum:] ._+:/()-') ;;
