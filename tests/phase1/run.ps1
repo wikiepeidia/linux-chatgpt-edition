@@ -472,6 +472,7 @@ Add-TestCase -Name 'BUILD-04 repository drift aborts before the offline install 
     Assert-Match -Value $linux -Pattern '(?s)mount --bind /proc "\$build_root/proc".*?mount --bind /dev "\$build_root/dev".*?chroot "\$build_root" /bin/su.*?umount "\$build_root/dev".*?umount "\$build_root/proc"' -Message 'Unprivileged APK usermode lacks its bounded proc/device mount lifecycle.'
     Assert-Match -Value $linux -Pattern '(?s)chmod 0755 "\$build_root".*?chmod -R a-w,a\+rX "\$build_root/repo".*?builder_probe=.*?test -r /repo/x86_64/APKINDEX\.tar\.gz.*?MKIMAGE_IDENTITY_INVALID' -Message 'Builder traversal, immutable inputs, and the pre-mkimage identity probe are not fail-closed.'
     Assert-Match -Value $linux -Pattern '(?s)chmod -R a\+rX "\$build_root/bin".*?builder_probe=.*?/sbin/apk --print-arch.*?x86_64' -Message 'The unprivileged builder does not prove readable package payloads and an executable pinned APK.'
+    Assert-Match -Value $linux -Pattern '(?s)chown -R "\$builder_uid:\$builder_gid" "\$build_root/repo".*?verify_repository_snapshot "\$build_root/repo/x86_64".*?mkimage\.sh.*?verify_repository_snapshot "\$build_root/repo/x86_64"' -Message 'Protected hardlink ownership is not bounded by staged repository verification.'
     Assert-Match -Value $linux -Pattern '(?s)mkimage_log=.*?300k-mkimage\.log.*?2>&1.*?tail -n 80 "\$mkimage_log" >&2' -Message 'A bounded mkimage failure tail is not preserved for the host tracer.'
     Assert-Match -Value $linux -Pattern 'env -i HOME=/home/\$builder_user PATH=/usr/sbin:/usr/bin:/sbin:/bin CBUILD=x86_64 SOURCE_DATE_EPOCH=' -Message 'The clean mkimage environment does not pin its build architecture.'
     Assert-Match -Value $linux -Pattern 'apk --cache-dir "\$online_cache" --repositories-file "\$online_repositories" update' -Message 'APK 3 repository indexes are not explicitly refreshed in an isolated cache.'
@@ -512,6 +513,7 @@ Add-TestCase -Name 'BUILD-04 Linux core owns package/profile decisions and the Q
     Assert-Match -Value $qemu -Pattern 'builder@127\.0\.0\.1:/run/300k-secrets/300k\.rsa' -Message 'The private APK key is not transferred directly into guest tmpfs.'
     Assert-False -Condition ([bool]($qemu -match 'builder@127\.0\.0\.1:/inputs/300k\.rsa[''"]')) -Message 'The private APK key still crosses the disk-backed guest input directory.'
     Assert-Match -Value $qemu -Pattern 'QEMU_SSH_FAILED.*SSH stage ''\$Stage'' failed' -Message 'Remote SSH failures do not retain their exact management stage.'
+    Assert-Match -Value $qemu -Pattern 'Substring\(\$diagnostic\.Length - 512, 512\)' -Message 'Bounded remote diagnostics discard the final command failure.'
 }
 
 if ($Scope -in @('Qemu', 'All')) {

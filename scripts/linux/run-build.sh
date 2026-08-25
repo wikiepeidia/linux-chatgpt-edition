@@ -457,6 +457,9 @@ build_from_local() {
     # The outer umask protects generated state, but package payload modes still
     # need their declared read/execute classes for the non-root image builder.
     chmod -R a+rX "$build_root/bin" "$build_root/sbin" "$build_root/lib" "$build_root/usr" "$build_root/etc"
+    # aports fetches with --link. Ownership permits protected hardlinks while
+    # read-only modes plus before/after manifests keep retained bytes fail-closed.
+    chown -R "$builder_uid:$builder_gid" "$build_root/repo"
     chmod -R a-w,a+rX "$build_root/repo" "$build_root/work/aports" "$build_root/workspace"
     chown -R "$builder_uid:$builder_gid" \
         "$build_root/home/$builder_user" "$build_root/work/mkimage" "$build_root/export"
@@ -479,8 +482,10 @@ build_from_local() {
     record_inspection_command "$build_root" squashfs 'squashfs-tools=4.7.5-r0' /usr/bin/unsquashfs '/usr/bin/unsquashfs -version' "$inspection_file"
     record_inspection_command "$build_root" iso 'xorriso=1.5.8-r0' /usr/bin/xorriso '/usr/bin/xorriso -version' "$inspection_file"
 
+    verify_repository_snapshot "$build_root/repo/x86_64"
     verify_repository_snapshot "$object_root"
     disable_network
+    verify_repository_snapshot "$build_root/repo/x86_64"
     verify_repository_snapshot "$object_root"
     source_date_epoch=$(json_scalar source_date_epoch "$REQUEST_FILE")
     case "$source_date_epoch" in ''|0|*[!0-9]*) fail SOURCE_DATE_EPOCH_INVALID "BuildRequest epoch is invalid" ;; esac
@@ -517,6 +522,7 @@ build_from_local() {
         tail -n 80 "$mkimage_log" >&2 || true
         fail MKIMAGE_FAILED "pinned offline aports build failed"
     fi
+    verify_repository_snapshot "$build_root/repo/x86_64"
     verify_repository_snapshot "$object_root"
 
     iso_in_root=$(find "$build_root/export/raw" -maxdepth 1 -type f -name '*.iso' | LC_ALL=C sort | head -n 1)

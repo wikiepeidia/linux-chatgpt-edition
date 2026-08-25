@@ -470,7 +470,7 @@ function Invoke-QemuSshCommand {
     if (-not $AllowNonZero -and $result.ExitCode -ne 0) {
         $diagnostic = if (-not [string]::IsNullOrWhiteSpace($result.StandardError)) { $result.StandardError.Trim() } else { "ssh exited $($result.ExitCode) without stderr" }
         $diagnostic = [regex]::Replace($diagnostic, '[\r\n]+', ' ')
-        if ($diagnostic.Length -gt 512) { $diagnostic = $diagnostic.Substring(0, 512) }
+        if ($diagnostic.Length -gt 512) { $diagnostic = $diagnostic.Substring($diagnostic.Length - 512, 512) }
         throw (New-QemuException -Code 'QEMU_SSH_FAILED' -Message "SSH stage '$Stage' failed: $diagnostic")
     }
     return $result
@@ -497,7 +497,7 @@ function Invoke-QemuScp {
     if ($result.ExitCode -ne 0) {
         $diagnostic = if (-not [string]::IsNullOrWhiteSpace($result.StandardError)) { $result.StandardError.Trim() } else { "scp exited $($result.ExitCode) without stderr" }
         $diagnostic = [regex]::Replace($diagnostic, '[\r\n]+', ' ')
-        if ($diagnostic.Length -gt 512) { $diagnostic = $diagnostic.Substring(0, 512) }
+        if ($diagnostic.Length -gt 512) { $diagnostic = $diagnostic.Substring($diagnostic.Length - 512, 512) }
         throw (New-QemuException -Code 'QEMU_SCP_FAILED' -Message "SCP stage '$Stage' failed: $diagnostic")
     }
     return $result
