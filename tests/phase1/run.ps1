@@ -94,6 +94,66 @@ if ($Scope -in @('Unit', 'Qemu', 'All')) {
     }
 }
 
+Add-TestCase -Name 'BUILD-03 inspection policy pins every decoder and bounded graph limit' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
+    $inputsPath = Join-Path $script:RepositoryRoot 'builder/inputs.json'
+    $inputs = Get-Content -Raw -LiteralPath $inputsPath | ConvertFrom-Json -Depth 64
+    $formats = @($inputs.inspection_toolchain.formats)
+
+    Assert-Equal -Expected @('gzip', 'xz', 'zstd', 'lz4', 'cpio', 'squashfs', 'iso9660', 'tar', 'apk') -Actual @($formats.name) -Message 'The complete nested decoder graph must be closed and ordered.'
+    foreach ($format in $formats) {
+        Assert-Match -Value ([string] $format.package) -Pattern '^[a-z0-9][a-z0-9+_.-]*=[0-9][a-zA-Z0-9.+_~-]*-r[0-9]+$' -Message "Decoder '$($format.name)' must name an exact APK package version."
+        Assert-Match -Value ([string] $format.command) -Pattern '^/[A-Za-z0-9._+/-]+$' -Message "Decoder '$($format.name)' must use an absolute command path."
+    }
+
+    $limits = $inputs.inspection_policy.limits
+    foreach ($name in @('max_depth', 'max_members', 'max_file_bytes', 'max_total_expanded_bytes')) {
+        Assert-True -Condition ($null -ne $limits.$name -and [int64] $limits.$name -gt 0) -Message "Inspection limit '$name' must be explicit and positive."
+    }
+    Assert-True -Condition ([int64] $limits.max_total_expanded_bytes -ge [int64] $limits.max_file_bytes) -Message 'The total expansion budget must cover at least one maximum-size file.'
+    Assert-Equal -Expected @('regular') -Actual @($inputs.inspection_policy.materialized_types) -Message 'Only regular files may ever be materialized.'
+    Assert-Equal -Expected $false -Actual ([bool] $inputs.inspection_policy.follow_links) -Message 'Inspection must never follow links.'
+
+    $builderPackages = @($inputs.builder_packages)
+    foreach ($format in $formats) {
+        Assert-True -Condition ($builderPackages -ccontains [string] $format.package) -Message "Decoder package '$($format.package)' is outside the retained builder closure."
+    }
+}
+
+Add-TestCase -Name 'BUILD-03 hostile fixture matrix preflights before no-follow streaming' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
+    $inspectorPath = Join-Path $script:RepositoryRoot 'scripts/linux/inspect-iso.sh'
+    Assert-True -Condition (Test-Path -LiteralPath $inspectorPath -PathType Leaf) -Message 'The Linux ISO inspector is missing.'
+    $source = Get-Content -Raw -LiteralPath $inspectorPath
+
+    foreach ($contract in @(
+        'preflight_graph',
+        'stream_regular_member',
+        'assert_root_confined_path',
+        'assert_toolchain_identity',
+        'run_hostile_fixture_self_test',
+        'write_iso_audit'
+    )) {
+        Assert-Match -Value $source -Pattern ([regex]::Escape($contract)) -Message "Inspector contract '$contract' is absent."
+    }
+    foreach ($layer in @('iso9660', 'apkovl', 'initramfs', 'cpio', 'squashfs', 'apk', 'tar', 'gzip', 'xz', 'zstd', 'lz4')) {
+        Assert-Match -Value $source -Pattern ([regex]::Escape($layer)) -Message "Hostile fixture coverage for '$layer' is absent."
+    }
+    foreach ($guard in @('max_depth', 'max_members', 'max_file_bytes', 'max_total_expanded_bytes', 'outside_scratch_sentinel', 'compressed_secret_fixture')) {
+        Assert-Match -Value $source -Pattern ([regex]::Escape($guard)) -Message "Inspector guard '$guard' is absent."
+    }
+    Assert-Match -Value $source -Pattern 'preflight_graph[\s\S]{0,4000}stream_regular_member' -Message 'The source must make preflight precede any regular-file streaming.'
+    Assert-False -Condition ($source -match '(?m)^\s*(eval\s|source\s|\.\s+\$)') -Message 'The inspector must not evaluate ambient or computed shell source.'
+    Assert-False -Condition ($source -match '(?m)\b(mount|losetup)\b') -Message 'The unprivileged inspector must not mount images or allocate loop devices.'
+}
+
+Add-TestCase -Name 'BUILD-03 offline build proves decoder identity before inspecting and publishing' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
+    $linuxCore = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/linux/run-build.sh')
+
+    Assert-Match -Value $linuxCore -Pattern 'assert_inspection_toolchain_identity[\s\S]*disable_network[\s\S]*run_inspector_self_test[\s\S]*mkimage' -Message 'Tool identity and hostile fixtures must pass before network-off ISO construction.'
+    Assert-Match -Value $linuxCore -Pattern 'mkimage[\s\S]*inspect_iso_artifact[\s\S]*iso-audit\.json[\s\S]*SHA256SUMS' -Message 'The finished ISO must be decoded and audited before its checksum is staged.'
+    Assert-Match -Value $linuxCore -Pattern 'inspection_toolchain[\s\S]*retained_repository' -Message 'Decoder evidence must bind back to the retained repository closure.'
+    Assert-Match -Value $linuxCore -Pattern 'scripts/linux/inspect-iso\.sh' -Message 'The inspector must be included in the normalized source archive contract.'
+}
+
 Add-TestCase -Name 'BUILD-04 checked process lease stays live during a second command and drains split streams' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
     $pwshPath = (Get-Command pwsh -ErrorAction Stop).Source
     $lease = $null
