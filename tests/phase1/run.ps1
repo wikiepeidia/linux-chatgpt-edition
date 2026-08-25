@@ -154,6 +154,19 @@ Add-TestCase -Name 'BUILD-04 timeout stops only the captured process tree' -Scop
 }
 
 Add-TestCase -Name 'BUILD-04 serial trust accepts one ordered matching Ed25519 milestone only' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
+    $sharedScratch = Join-Path ([System.IO.Path]::GetTempPath()) ('300k-shared-serial-' + [Guid]::NewGuid().ToString('N'))
+    $writer = [System.IO.FileStream]::new($sharedScratch, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes("300K_NOCLOUD_BEGIN`n")
+        $writer.Write($bytes, 0, $bytes.Length)
+        $writer.Flush()
+        Assert-Equal -Expected '300K_NOCLOUD_BEGIN' -Actual (Read-SharedTextLines -Path $sharedScratch | Select-Object -First 1) -Message 'Serial log was not readable while its writer remained live.'
+    }
+    finally {
+        $writer.Dispose()
+        Remove-Item -LiteralPath $sharedScratch -Force -ErrorAction SilentlyContinue
+    }
+
     $keyBytes = [byte[]](0..31)
     $publicKey = [Convert]::ToBase64String($keyBytes)
     $valid = @(

@@ -407,7 +407,7 @@ function Wait-QemuSerialHostKey {
     while ([System.DateTimeOffset]::UtcNow -lt $deadline) {
         Test-QemuLeaseAlive -Lease $Lease -Stage 'serial-trust'
         if ([System.IO.File]::Exists($SerialPath)) {
-            $lines = [System.IO.File]::ReadAllLines($SerialPath)
+            $lines = Read-SharedTextLines -Path $SerialPath
             if ($lines -contains '300K_SSH_READY') {
                 return Get-QemuSerialHostKey -SerialLines $lines -VerifyFingerprint $VerifyFingerprint
             }
@@ -415,6 +415,24 @@ function Wait-QemuSerialHostKey {
         Start-Sleep -Milliseconds 500
     }
     throw (New-QemuException -Code 'QEMU_SERIAL_TIMEOUT' -Message "Serial trust milestone was not ready within $TimeoutSeconds seconds.")
+}
+
+function Read-SharedTextLines {
+    param([Parameter(Mandatory)] [string] $Path)
+    $stream = [System.IO.FileStream]::new(
+        $Path,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+    )
+    try {
+        $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8, $true, 4096, $true)
+        try { $text = $reader.ReadToEnd() }
+        finally { $reader.Dispose() }
+    }
+    finally { $stream.Dispose() }
+    if ([string]::IsNullOrEmpty($text)) { return @() }
+    return @($text -split "`r?`n")
 }
 
 function Invoke-QemuSshCommand {
@@ -458,7 +476,7 @@ function Invoke-QemuScp {
 function Write-SanitizedSerialEvidence {
     param([string] $SerialPath, [string] $EvidencePath)
     $allowed = if ([System.IO.File]::Exists($SerialPath)) {
-        @([System.IO.File]::ReadAllLines($SerialPath) | Where-Object { $_ -match '^300K_[A-Z0-9_]+(?:\s+[A-Za-z0-9_./:+=-]+)*$' })
+        @(Read-SharedTextLines -Path $SerialPath | Where-Object { $_ -match '^300K_[A-Z0-9_]+(?:\s+[A-Za-z0-9_./:+=-]+)*$' })
     }
     else { @() }
     [System.IO.File]::WriteAllText($EvidencePath, (($allowed -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
