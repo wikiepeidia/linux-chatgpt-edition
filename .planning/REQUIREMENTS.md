@@ -12,7 +12,7 @@ Requirements for the first overnight release. The 100 MB figure is a measured st
 - [ ] **BUILD-01**: A contributor can invoke one documented PowerShell entry point from Windows to build the x86_64 ISO in a pinned Linux/amd64 environment with fixed Alpine, aports, repository, and build-epoch inputs; selecting Docker explicitly requires and verifies a real Linux/amd64 container daemon, while the default may use the QEMU backend.
 - [ ] **BUILD-02**: A clean build produces a uniquely identified ISO plus its SHA-256 checksum, exact byte size, build lock, resolved package manifest, and boot-layout report.
 - [ ] **BUILD-03**: Private signing keys, credentials, tokens, host paths, and build caches remain outside Git and outside the runtime ISO.
-- [ ] **BUILD-04**: If Docker Linux containers are unavailable, the documented fallback can perform the same build inside an Alpine VM without changing the distribution architecture.
+- [x] **BUILD-04**: If Docker Linux containers are unavailable, the documented fallback can perform the same build inside an Alpine VM without changing the distribution architecture.
 
 ### Live Boot
 
@@ -105,7 +105,7 @@ Each v1 requirement maps to exactly one delivery phase.
 | BUILD-01 | Phase 1 | Pending |
 | BUILD-02 | Phase 2 | Pending |
 | BUILD-03 | Phase 1 | Pending |
-| BUILD-04 | Phase 1 | Pending |
+| BUILD-04 | Phase 1 | Complete |
 | BOOT-01 | Phase 4 | Pending |
 | BOOT-02 | Phase 4 | Pending |
 | BOOT-03 | Phase 2 | Pending |
@@ -137,6 +137,7 @@ Each v1 requirement maps to exactly one delivery phase.
 | VER-05 | Phase 6 | Pending |
 
 **Coverage:**
+
 - v1 requirements: 33 total
 - Mapped to phases: 33
 - Unmapped: 0

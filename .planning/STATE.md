@@ -3,16 +3,16 @@ gsd_state_version: 1.0
 current_phase: 01
 current_phase_name: Reproducible Build Foundation
 status: executing
-stopped_at: Phase 1 plans independently verified; ready to execute Wave 1.
-last_updated: "2026-08-25T16:45:24.946Z"
+stopped_at: Completed 01-01-PLAN.md
+last_updated: "2026-08-25T20:30:40.900Z"
 last_activity: 2026-08-25
 last_activity_desc: Phase 01 execution started
-state_head: 39bd7e6a1f743827e0e7e907ea7be4125bd6649c
+state_head: 7c72eee3f001133eb80a94c17a21b2e37191e432
 progress:
   total_phases: 6
   completed_phases: 0
   total_plans: 3
-  completed_plans: 0
+  completed_plans: 1
   percent: 0
 ---
 
@@ -28,8 +28,8 @@ See: .planning/PROJECT.md (updated 2026-08-25)
 ## Current Position
 
 Phase: 01 (Reproducible Build Foundation) — EXECUTING
-Plan: 1 of 3
-Status: Executing Phase 01
+Plan: 2 of 3
+Status: Ready to execute
 Last activity: 2026-08-25 — Phase 01 execution started
 
 Progress: [░░░░░░░░░░] 0%
@@ -54,6 +54,11 @@ Progress: [░░░░░░░░░░] 0%
 - Trend: No execution data
 
 *Updated after each plan completion*
+**Per-Plan Metrics:**
+
+| Plan | Duration | Tasks | Files |
+|------|----------|-------|-------|
+| Phase 01-reproducible-build-foundation P01 | 3h 40m | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -66,6 +71,10 @@ Recent decisions affecting current work:
 - Use one Tcl/Tk shell under Openbox and a fixed xterm launcher into BusyBox `ash`; no browser stack, fake terminal, API, account, Codex, or model runtime.
 - Accept at 1 GiB first; BIOS and non-Secure-Boot UEFI are targets, while USB-hybrid wording requires a raw-disk proof.
 - Preserve a hashed last-known-good result at every gate and optimize size only after the complete experience passes.
+- [Phase 01]: Use QEMU as the executed fallback backend and record Docker as unverified-unavailable when absent.
+- [Phase 01]: Trust loopback SSH only from the owned serial Ed25519 milestone and ignore ambient SSH state.
+- [Phase 01]: Install and assemble only from a content-addressed file:///repo snapshot after networking is disabled.
+- [Phase 01]: Use mkimage --hostkeys only with a closed hash-verified set of three Alpine x86_64 keys plus the project public key.
 
 ### Pending Todos
 
@@ -87,6 +96,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-08-25
-Stopped at: Phase 1 plans independently verified; ready to execute Wave 1.
+Last session: 2026-08-25T20:30:40.889Z
+Stopped at: Completed 01-01-PLAN.md
 Resume file: None

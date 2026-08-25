@@ -33,12 +33,12 @@
   3. Inspection of Git and the bootstrap ISO finds no private signing key, credential, token, host-specific path, or build cache; persistent signing material remains outside both.
   4. When Docker Linux containers are unavailable, a contributor can run the same profile and inputs in the documented Alpine QEMU VM fallback without changing the distribution architecture.
 
-**Plans:** 3 plans
+**Plans:** 1/3 plans executed
 
 Plans:
 **Wave 1**
 
-- [ ] 01-01-PLAN.md — Prove the QEMU-first walking skeleton and freeze the shared build contract.
+- [x] 01-01-PLAN.md — Prove the QEMU-first walking skeleton and freeze the shared build contract.
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -131,7 +131,7 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Reproducible Build Foundation | 0/TBD | Not started | - |
+| 1. Reproducible Build Foundation | 1/3 | In Progress | - |
 | 2. Offline Diskless BIOS Boot | 0/TBD | Not started | - |
 | 3. Graphical Spine and Real Terminal | 0/TBD | Not started | - |
 | 4. 300K Product Slice and Comedy Engine | 0/TBD | Not started | - |
