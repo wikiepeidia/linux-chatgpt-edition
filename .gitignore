@@ -1,0 +1,113 @@
+# ==============================
+# CodexOS - Git Ignore
+# ==============================
+
+# --- Build output ---
+build/
+out/
+dist/
+iso/
+*.iso
+*.img
+*.qcow2
+*.raw
+
+# --- Compiled binaries ---
+*.o
+*.a
+*.so
+*.so.*
+*.ko
+*.bin
+*.elf
+*.exe
+
+# --- Temporary files ---
+tmp/
+temp/
+.cache/
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# --- Node.js ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- IDE / Editors ---
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+.idea/
+*.iml
+
+# --- OS-specific ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- QEMU ---
+*.qcow2
+*.vdi
+*.vmdk
+qemu.log
+
+# --- Linux package/build artifacts ---
+*.deb
+*.rpm
+*.tar
+*.tar.gz
+*.tar.xz
+*.cpio
+
+# --- Credentials / secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials/
+
+# --- AI / local model artifacts ---
+models/
+checkpoints/
+*.safetensors
+*.gguf
+*.bin
+
+# --- Coverage ---
+.coverage
+htmlcov/
+coverage.xml
+
+# --- Generated documentation ---
+docs/_build/
+
+# --- Codex / AI temporary files ---
+.codex/
+.ai-cache/
+ai-cache/
