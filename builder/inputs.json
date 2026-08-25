@@ -134,7 +134,7 @@
     "iso": {
       "package": "xorriso=1.5.8-r0",
       "command": "/usr/bin/xorriso",
-      "decoder": ["/usr/bin/xorriso", "-report_about", "WARNING", "-indev", "{container}", "-concat", "overwrite", "-", "/{member}", "--"],
+      "decoder": ["/usr/bin/xorriso", "-report_about", "WARNING", "-osirrox", "on", "-indev", "{container}", "-concat", "overwrite", "-", "/{member}", "--"],
       "fixture_encoder": ["/usr/bin/xorriso", "-as", "mkisofs", "-quiet", "-output"],
       "version_argv": ["/usr/bin/xorriso", "-version"]
     },

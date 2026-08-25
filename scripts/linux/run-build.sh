@@ -176,6 +176,19 @@ json_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g'
 }
 
+assert_exact_xorriso_stderr() {
+    log=$1
+    expected_banner=$2
+    code=$3
+    label=$4
+    [ -n "$expected_banner" ] || fail "$code" "$label lacks locked xorriso version evidence"
+    banner_count=$(grep -Fxc -- "$expected_banner" "$log" 2>/dev/null || true)
+    [ "$banner_count" -le 1 ] || fail "$code" "$label emitted duplicate xorriso startup banners"
+    filtered=$log.filtered
+    grep -Fvx -- "$expected_banner" "$log" > "$filtered" || true
+    [ ! -s "$filtered" ] || fail "$code" "$label emitted non-banner xorriso stderr"
+}
+
 require_public_contract() {
     require_file "$INPUTS_FILE"
     require_file "$REQUEST_FILE"
@@ -187,7 +200,7 @@ require_public_contract() {
     grep -F '"zstd=1.5.7-r2"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "zstd pin missing"
     grep -F '"lz4=1.10.0-r1"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "lz4 pin missing"
     grep -F '"cpio=2.15-r0"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "cpio pin missing"
-    grep -F '"decoder": ["/usr/bin/xorriso", "-report_about", "WARNING", "-indev", "{container}", "-concat", "overwrite", "-", "/{member}", "--"]' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "ISO decoder contract changed"
+    grep -F '"decoder": ["/usr/bin/xorriso", "-report_about", "WARNING", "-osirrox", "on", "-indev", "{container}", "-concat", "overwrite", "-", "/{member}", "--"]' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "ISO decoder contract changed"
     grep -F '"package": "tar=1.35-r5"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "tar decoder package pin missing"
     grep -F '"package": "apk-tools=3.0.7-r0"' "$INPUTS_FILE" >/dev/null || fail INPUT_TOOLCHAIN_MISSING "APK decoder package pin missing"
     grep -F '"max_depth": 8' "$INPUTS_FILE" >/dev/null || fail INPUT_INSPECTION_POLICY_INVALID "inspection depth policy changed"
@@ -489,6 +502,7 @@ disable_network() {
 verify_codec_round_trip() {
     root=$1
     format=$2
+    locked_version=$3
     fixture=/tmp/300k-inspection-fixture
     rm -rf "$root/tmp/cpio-fixture" "$root/tmp/squash-fixture" "$root/tmp/iso-fixture" "$root/tmp/tar-fixture"
     rm -f "$root$fixture" "$root$fixture".*
@@ -527,8 +541,15 @@ verify_codec_round_trip() {
         iso)
             mkdir -p "$root/tmp/iso-fixture"
             cp "$root$fixture" "$root/tmp/iso-fixture/payload"
-            chroot "$root" "$encoder_path" -as mkisofs -quiet -output "$fixture.iso" /tmp/iso-fixture
-            chroot "$root" "$command_path" -report_about WARNING -indev "$fixture.iso" -concat overwrite - /payload -- > "$root$fixture.out" 2>/dev/null
+            encoder_errors=$root/tmp/iso-round-trip-encoder.stderr
+            decoder_errors=$root/tmp/iso-round-trip-decoder.stderr
+            chroot "$root" "$encoder_path" -as mkisofs -quiet -output "$fixture.iso" /tmp/iso-fixture 2> "$encoder_errors" \
+                || fail INSPECTION_ROUND_TRIP_FAILED "iso fixture encoder failed"
+            assert_exact_xorriso_stderr "$encoder_errors" "$locked_version" INSPECTION_ROUND_TRIP_STDERR "iso fixture encoder"
+            chroot "$root" "$command_path" -report_about WARNING -osirrox on -indev "$fixture.iso" -concat overwrite - /payload -- \
+                > "$root$fixture.out" 2> "$decoder_errors" \
+                || fail INSPECTION_ROUND_TRIP_FAILED "iso stdout decoder failed"
+            assert_exact_xorriso_stderr "$decoder_errors" "$locked_version" INSPECTION_ROUND_TRIP_STDERR "iso stdout decoder"
             ;;
         tar)
             mkdir -p "$root/tmp/tar-fixture"
@@ -572,7 +593,7 @@ record_inspection_command() {
         *) version=$(chroot "$root" "$command_path" --version 2>&1 | head -n 1 | tr -cd '[:alnum:] ._+:/()-') ;;
     esac
     [ -n "$version" ] || fail INSPECTION_VERSION_MISSING "$format version output is empty"
-    verify_codec_round_trip "$root" "$format"
+    verify_codec_round_trip "$root" "$format" "$version"
     command_hash=$(chroot "$root" sha256sum "$command_path" | awk '{print $1}')
     retained_apk=$(find "$repository" -maxdepth 1 -type f -name "$package_name-$package_version.apk" | LC_ALL=C sort | head -n 1)
     require_file "$retained_apk"
@@ -659,15 +680,7 @@ append_iso_report() {
     chroot "$root" /usr/bin/xorriso -report_about WARNING -indev "$iso" "$@" \
         > "$report" 2> "$errors" || status=$?
     expected_banner=$(inspection_evidence_value "$evidence" iso version)
-    [ -n "$expected_banner" ] \
-        || fail BOOT_LAYOUT_TOOLCHAIN_MISSING "$label lacks locked xorriso version evidence"
-    banner_count=$(grep -Fxc -- "$expected_banner" "$errors" 2>/dev/null || true)
-    [ "$banner_count" -le 1 ] \
-        || fail BOOT_LAYOUT_REPORT_STDERR "$label emitted duplicate xorriso startup banners"
-    filtered=$errors.filtered
-    grep -Fvx -- "$expected_banner" "$errors" > "$filtered" || true
-    [ ! -s "$filtered" ] \
-        || fail BOOT_LAYOUT_REPORT_STDERR "$label emitted non-banner xorriso stderr"
+    assert_exact_xorriso_stderr "$errors" "$expected_banner" BOOT_LAYOUT_REPORT_STDERR "$label"
     if [ "$status" -ne 0 ]; then
         detail=$(tail -n 5 "$report" | tr -cd '[:alnum:] ._+:/()=-\n' | tr '\n' ' ' | cut -c1-320)
         [ -n "$detail" ] || detail=no-result-channel-diagnostic
