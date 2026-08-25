@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Unit', 'Docker', 'Qemu', 'Artifact', 'All')]
+    [ValidateSet('Unit', 'Docker', 'Qemu', 'Artifact', 'Security', 'All')]
     [string] $Scope = 'Unit',
 
     [string] $Requirement,
@@ -78,7 +78,7 @@ function Assert-ThrowsCode {
     throw "Expected exception code '$Code', but no exception was thrown."
 }
 
-if ($Scope -in @('Unit', 'Qemu', 'All')) {
+if ($Scope -in @('Unit', 'Qemu', 'Artifact', 'Security', 'All')) {
     foreach ($relativeScript in @(
         'scripts/host/Invoke-CheckedProcess.ps1',
         'scripts/host/Invoke-QemuBackend.ps1'
@@ -152,6 +152,174 @@ Add-TestCase -Name 'BUILD-03 offline build proves decoder identity before inspec
     Assert-Match -Value $linuxCore -Pattern 'mkimage[\s\S]*inspect_iso_artifact[\s\S]*iso-audit\.json[\s\S]*SHA256SUMS' -Message 'The finished ISO must be decoded and audited before its checksum is staged.'
     Assert-Match -Value $linuxCore -Pattern 'inspection_toolchain[\s\S]*retained_repository' -Message 'Decoder evidence must bind back to the retained repository closure.'
     Assert-Match -Value $linuxCore -Pattern 'scripts/linux/inspect-iso\.sh' -Message 'The inspector must be included in the normalized source archive contract.'
+}
+
+function New-ClosedSecurityFixture {
+    param([Parameter(Mandatory)] [string] $Root)
+
+    $staging = Join-Path $Root 'staging'
+    [System.IO.Directory]::CreateDirectory($staging) | Out-Null
+    $inputs = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'builder/inputs.json') | ConvertFrom-Json -Depth 64
+    $projectKeyHash = 'b' * 64
+    $request = [ordered]@{
+        schema = 'BuildRequest'; schema_version = 1; target = 'bootstrap'; source_date_epoch = 1
+        signing = [ordered]@{ public_key_file = '300k.rsa.pub'; public_key_sha256 = $projectKeyHash }
+    }
+    Write-CanonicalJson -Value $request -Path (Join-Path $staging 'build-request.json')
+    $requestHash = Get-LowerFileSha256 -Path (Join-Path $staging 'build-request.json')
+
+    $isoSeed = [byte[]]::new(4096)
+    for ($index = 0; $index -lt $isoSeed.Length; $index++) { $isoSeed[$index] = [byte]($index % 251) }
+    $temporaryIso = Join-Path $staging 'fixture.iso'
+    [System.IO.File]::WriteAllBytes($temporaryIso, $isoSeed)
+    $isoHash = Get-LowerFileSha256 -Path $temporaryIso
+    $isoName = "300k-bootstrap-x86_64-$($isoHash.Substring(0,12)).iso"
+    [System.IO.File]::Move($temporaryIso, (Join-Path $staging $isoName))
+
+    [System.IO.File]::WriteAllText((Join-Path $staging 'builder-packages.lock'), "busybox-1.37.0-r31 x86_64`n", [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $staging 'apk-files.sha256'), "$('c' * 64)  busybox-1.37.0-r31.apk`n", [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $staging 'boot-layout.txt'), "El Torito BIOS`nEFI/BOOT/BOOTX64.EFI`n", [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $staging 'serial-diagnostic.log'), "300K_BUILD_COMPLETE $isoHash`n", [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $staging 'SHA256SUMS'), "$isoHash  $isoName`n", [System.Text.UTF8Encoding]::new($false))
+    foreach ($record in @(
+        [pscustomobject]@{ Name = 'repository-evidence.json'; Value = [ordered]@{ schema = 'RepositoryEvidence'; schema_version = 1; repository_object_id = ('d' * 64); content_addressed_snapshot_verified = $true } },
+        [pscustomobject]@{ Name = 'resource-inventory.json'; Value = [ordered]@{ schema_version = 1; cleanup_complete = $true; resources = [ordered]@{ qemu_lease_live = $false; seed_listener_live = $false; serial_listener_live = $false; port_reservation_live = $false; ssh_identity_present = $false; known_hosts_present = $false; overlay_present = $false; management_scratch_present = $false } } },
+        [pscustomobject]@{ Name = 'qemu-image-info.json'; Value = [ordered]@{ format = 'raw'; virtual_size = 4096; actual_size = 4096 } },
+        [pscustomobject]@{ Name = 'environment-report.json'; Value = [ordered]@{ schema_version = 1; backend = 'qemu'; backend_status = 'executed'; guest_os = 'linux'; guest_arch = 'x86_64'; alpine_release = '3.24.1'; cleanup_complete = $true; source_commit = ('e' * 40) } }
+    )) { Write-CanonicalJson -Value $record.Value -Path (Join-Path $staging $record.Name) }
+
+    $toolItems = @($inputs.inspection_toolchain.PSObject.Properties | ForEach-Object {
+        [ordered]@{
+            format = $_.Name; package = $_.Value.package; command = $_.Value.command
+            command_sha256 = ('f' * 64); version = 'fixture'; package_ownership_verified = $true
+            path_verified = $true; round_trip_verified = $true; retained_apk_verified = $true
+            retained_apk_file = ($_.Value.package.Replace('=', '-') + '.apk'); retained_apk_sha256 = ('a' * 64)
+        }
+    })
+    $toolchainHash = '9' * 64
+    $audit = [ordered]@{
+        schema = 'IsoAudit'; schema_version = 1; iso_sha256 = $isoHash; iso_bytes = 4096
+        inspection_toolchain_sha256 = $toolchainHash
+        accepted_decoders = @('gzip', 'xz', 'zstd', 'lz4', 'cpio', 'squashfs', 'iso', 'tar', 'apk')
+        limits = [ordered]@{ max_depth = 8; max_members = 200000; max_path_bytes = 4096; max_file_bytes = 1073741824; max_total_expanded_bytes = 4294967296 }
+        counts = [ordered]@{ members = 10; regular_files = 5; containers = 4; expanded_bytes = 2048; max_observed_depth = 4 }
+        structural_boot_findings = [ordered]@{ bios_tree_present = $true; uefi_tree_present = $true; classification = 'structural' }
+        public_key_allowance = [ordered]@{ closed_key_count = 4; manifest_sha256 = ('8' * 64) }
+        preflight_before_materialization = $true; links_materialized = $false; result = 'pass'
+    }
+    Write-CanonicalJson -Value $audit -Path (Join-Path $staging 'iso-audit.json')
+
+    $trustedKeys = @($inputs.alpine.repository_keys.PSObject.Properties | ForEach-Object {
+        [ordered]@{ file = $_.Name; sha256 = [string]$_.Value; trust = 'alpine-x86_64' }
+    }) + @([ordered]@{ file = '300k.rsa.pub'; sha256 = $projectKeyHash; trust = 'project-signing' })
+    $builderRecordPath = Join-Path $staging 'builder-packages.lock'
+    $apkRecordPath = Join-Path $staging 'apk-files.sha256'
+    $auditPath = Join-Path $staging 'iso-audit.json'
+    $checksumsPath = Join-Path $staging 'SHA256SUMS'
+    $lock = [ordered]@{
+        schema = 'ResolvedBuildLock'; schema_version = 1; build_request_sha256 = $requestHash; repository_object_id = ('d' * 64)
+        repository_indexes = @([ordered]@{ name = 'main'; sha256 = ('1' * 64); signature_verified = $true }, [ordered]@{ name = 'community'; sha256 = ('2' * 64); signature_verified = $true })
+        aports = [ordered]@{ commit = '52643b7a176095362fd87fe73cdb994cb2e5ffae'; archive_sha256 = ('3' * 64) }
+        trusted_keys = $trustedKeys; trust_policy = [ordered]@{ mkimage_hostkeys = $true; closed_keyring_verified = $true; signature_bypass = $false }
+        builder_packages_record = [ordered]@{ file = 'builder-packages.lock'; sha256 = (Get-LowerFileSha256 -Path $builderRecordPath); bytes = (Get-Item $builderRecordPath).Length; producer = 'run-build.sh:prepare-repository'; validator = 'build.ps1:Test-GeneratedFileRecord' }
+        apk_files_record = [ordered]@{ file = 'apk-files.sha256'; sha256 = (Get-LowerFileSha256 -Path $apkRecordPath); bytes = (Get-Item $apkRecordPath).Length; producer = 'run-build.sh:prepare-repository'; validator = 'build.ps1:Test-GeneratedFileRecord' }
+        inspection_commands = $toolItems; inspection_toolchain_sha256 = $toolchainHash
+        offline_install = [ordered]@{ repositories = @('file:///repo'); apk_no_network = $true; network_disabled = $true; complete_manifest_verified = $true }
+        artifacts = @(
+            [ordered]@{ role = 'bootstrap_iso'; file = $isoName; sha256 = $isoHash; bytes = 4096 },
+            [ordered]@{ role = 'decoded_iso_audit'; file = 'iso-audit.json'; sha256 = (Get-LowerFileSha256 -Path $auditPath); bytes = (Get-Item $auditPath).Length },
+            [ordered]@{ role = 'iso_checksums'; file = 'SHA256SUMS'; sha256 = (Get-LowerFileSha256 -Path $checksumsPath); bytes = (Get-Item $checksumsPath).Length }
+        )
+    }
+    Write-CanonicalJson -Value $lock -Path (Join-Path $staging 'resolved-build-lock.json')
+    return [pscustomobject]@{ Staging = $staging; Inputs = $inputs; Request = $request; RequestHash = $requestHash; IsoName = $isoName; IsoHash = $isoHash }
+}
+
+Add-TestCase -Name 'BUILD-03 closed staging rejects paths schemas hashes sizes links secrets and extras' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
+    $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('300k-closed-staging-' + [Guid]::NewGuid().ToString('N'))
+    [System.IO.Directory]::CreateDirectory($scratch) | Out-Null
+    try {
+        foreach ($unsafe in @('../escape', '/absolute', 'C:\escape', '\\server\share', 'nested/file', 'file..json')) {
+            Assert-ThrowsCode -Code 'ARTIFACT_NAME_INVALID' -Body { Assert-ClosedRelativeArtifactName -Name $unsafe | Out-Null }
+        }
+        Assert-Equal -Expected 'iso-audit.json' -Actual (Assert-ClosedRelativeArtifactName -Name 'iso-audit.json')
+
+        $fixture = New-ClosedSecurityFixture -Root $scratch
+        $validated = Test-ClosedStagingBundle -StagingDirectory $fixture.Staging -ExpectedBuildRequestSha256 $fixture.RequestHash -Inputs $fixture.Inputs -BuildRequest $fixture.Request
+        Assert-Equal -Expected $fixture.IsoHash -Actual $validated.IsoSha256
+        Assert-Equal -Expected $fixture.IsoName -Actual $validated.IsoFile
+
+        $extra = Join-Path $fixture.Staging 'unexpected.bin'
+        [System.IO.File]::WriteAllText($extra, 'unexpected')
+        Assert-ThrowsCode -Code 'STAGING_FILE_SET_INVALID' -Body { Test-ClosedStagingBundle -StagingDirectory $fixture.Staging -ExpectedBuildRequestSha256 $fixture.RequestHash -Inputs $fixture.Inputs -BuildRequest $fixture.Request | Out-Null }
+        Remove-Item -LiteralPath $extra
+
+        $auditPath = Join-Path $fixture.Staging 'iso-audit.json'
+        $auditBytes = [System.IO.File]::ReadAllBytes($auditPath)
+        $audit = Get-Content -Raw -LiteralPath $auditPath | ConvertFrom-Json -Depth 64
+        $audit.iso_sha256 = '0' * 64
+        Write-CanonicalJson -Value $audit -Path $auditPath
+        Assert-ThrowsCode -Code 'ISO_REFERENCE_MISMATCH' -Body { Test-ClosedStagingBundle -StagingDirectory $fixture.Staging -ExpectedBuildRequestSha256 $fixture.RequestHash -Inputs $fixture.Inputs -BuildRequest $fixture.Request | Out-Null }
+        [System.IO.File]::WriteAllBytes($auditPath, $auditBytes)
+
+        $serialPath = Join-Path $fixture.Staging 'serial-diagnostic.log'
+        $serialBytes = [System.IO.File]::ReadAllBytes($serialPath)
+        [System.IO.File]::WriteAllText($serialPath, 'FICT' + 'IONAL_300K_SECRET_TOKEN=' + ('Z' * 32))
+        Assert-ThrowsCode -Code 'STAGING_SECRET_FOUND' -Body { Test-ClosedStagingBundle -StagingDirectory $fixture.Staging -ExpectedBuildRequestSha256 $fixture.RequestHash -Inputs $fixture.Inputs -BuildRequest $fixture.Request | Out-Null }
+        [System.IO.File]::WriteAllBytes($serialPath, $serialBytes)
+    }
+    finally { Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Add-TestCase -Name 'BUILD-03 atomic publication preserves the prior pointer at every transition' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
+    $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('300k-publication-' + [Guid]::NewGuid().ToString('N'))
+    [System.IO.Directory]::CreateDirectory($scratch) | Out-Null
+    try {
+        $fixture = New-ClosedSecurityFixture -Root $scratch
+        $validated = Test-ClosedStagingBundle -StagingDirectory $fixture.Staging -ExpectedBuildRequestSha256 $fixture.RequestHash -Inputs $fixture.Inputs -BuildRequest $fixture.Request
+        $dist = Join-Path $scratch 'dist'
+        $prior = Join-Path $dist 'prior-build'
+        [System.IO.Directory]::CreateDirectory($prior) | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $prior 'sentinel'), 'prior-complete')
+        $latestPath = Join-Path $dist 'LATEST.json'
+        $priorPointer = [System.Text.Encoding]::UTF8.GetBytes('{"schema_version":1,"build_id":"prior-build","directory":"prior-build"}' + "`n")
+        [System.IO.File]::WriteAllBytes($latestPath, $priorPointer)
+
+        foreach ($stage in @('after-partial-create', 'after-partial-copy', 'after-copy-rehash', 'after-manifest-write', 'after-directory-revalidation', 'after-final-rename', 'after-pointer-temp-write', 'before-pointer-replace')) {
+            $buildId = 'failure-' + $stage
+            Assert-ThrowsCode -Code 'PUBLICATION_INJECTED_FAILURE' -Body {
+                Publish-ValidatedArtifactBundle -StagingDirectory $fixture.Staging -DistRoot $dist -BuildId $buildId -ValidatedBundle $validated -FailureStage $stage | Out-Null
+            }
+            Assert-Equal -Expected ([Convert]::ToHexString($priorPointer)) -Actual ([Convert]::ToHexString([System.IO.File]::ReadAllBytes($latestPath))) -Message "LATEST changed at '$stage'."
+            Assert-True -Condition (Test-Path -LiteralPath (Join-Path $prior 'sentinel') -PathType Leaf) -Message "Prior completed bundle disappeared at '$stage'."
+            Assert-False -Condition (Test-Path -LiteralPath (Join-Path $dist $buildId)) -Message "Failed bundle survived at '$stage'."
+            Assert-Equal -Expected 0 -Actual @(Get-ChildItem -LiteralPath $dist -Directory -Filter '.partial-*').Count -Message "Partial publication survived at '$stage'."
+        }
+
+        $published = Publish-ValidatedArtifactBundle -StagingDirectory $fixture.Staging -DistRoot $dist -BuildId 'successful-build' -ValidatedBundle $validated
+        Assert-Equal -Expected $fixture.IsoHash -Actual $published.IsoSha256
+        Assert-True -Condition (Test-Path -LiteralPath (Join-Path $published.Directory 'artifact-manifest.json') -PathType Leaf)
+        $latest = Get-Content -Raw -LiteralPath $latestPath | ConvertFrom-Json -Depth 16
+        Assert-Equal -Expected 'successful-build' -Actual $latest.build_id
+    }
+    finally { Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Add-TestCase -Name 'BUILD-03 named QEMU failures all flow through the single outer owner' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
+    $qemuSource = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/host/Invoke-QemuBackend.ps1')
+    $stages = @('after-key-creation', 'after-seed-start', 'after-qemu-start', 'after-host-key-milestone', 'after-ssh-readiness', 'after-source-transfer', 'after-secret-copy', 'after-repository-preparation', 'after-build', 'after-export', 'after-shutdown')
+    foreach ($stage in $stages) {
+        Assert-Match -Value $qemuSource -Pattern ("Invoke-QemuFailureStage[\\s\\S]{0,240}'" + [regex]::Escape($stage) + "'") -Message "QEMU failure seam '$stage' is not wired at its production boundary."
+        $owned = Join-Path ([System.IO.Path]::GetTempPath()) ('300k-owned-' + [Guid]::NewGuid().ToString('N'))
+        [System.IO.Directory]::CreateDirectory($owned) | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $owned 'ephemeral'), $stage)
+        $owner = New-QemuResourceOwner
+        Add-QemuOwnedResource -Owner $owner -Name $stage -Cleanup { param($path) if ([System.IO.Directory]::Exists($path)) { [System.IO.Directory]::Delete($path, $true) } } -CleanupArgument $owned
+        try { Assert-ThrowsCode -Code 'QEMU_INJECTED_FAILURE' -Body { Invoke-QemuFailureStage -FailureStage $stage -Stage $stage } }
+        finally { Close-QemuResourceOwner -Owner $owner }
+        Assert-False -Condition (Test-Path -LiteralPath $owned) -Message "Outer owner leaked the '$stage' fixture."
+    }
+    Assert-Match -Value $qemuSource -Pattern 'finally[\s\S]*Close-QemuResourceOwner' -Message 'QEMU owner is not closed from the unconditional outer finally.'
 }
 
 Add-TestCase -Name 'BUILD-04 checked process lease stays live during a second command and drains split streams' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
