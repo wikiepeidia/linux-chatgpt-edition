@@ -814,7 +814,9 @@ run_hostile_fixture_self_test() {
     expect_probe_failure INSPECTION_SECRET_FOUND "$root/secret.iso" iso iso9660
 
     cp "$root/content/clean.txt" "$root/iso-root/boot/vmlinuz-test"
-    cp "$root/initramfs.cpio" "$root/clean.cpio"
+    mkdir "$root/clean-cpio"
+    cp "$root/content/clean.txt" "$root/clean-cpio/payload"
+    (cd "$root/clean-cpio" && printf '%s\n' payload | "$cpio_command" --create --format=newc --reproducible --quiet) > "$root/clean.cpio"
     "$gzip_command" -n -c -- "$root/clean.cpio" > "$root/iso-root/boot/initramfs-test"
     mkdir "$root/clean-squash"
     cp "$root/content/clean.txt" "$root/clean-squash/payload"
