@@ -425,9 +425,16 @@ build_from_local() {
     repositories_file=$build_root/etc/apk/repositories
     printf '%s\n' 'file:///repo' > "$repositories_file"
     builder_packages=$(json_array_lines builder_packages "$INPUTS_FILE" | tr '\n' ' ')
-    apk --root "$build_root" --arch x86_64 --initdb --keys-dir /etc/apk/keys \
-        --repositories-file "$repositories_file" --no-network add $builder_packages \
-        || fail OFFLINE_INSTALL_FAILED "file-only network-disabled builder installation failed"
+    mkdir -p /repo
+    mount --bind "$build_root/repo" /repo \
+        || fail OFFLINE_REPOSITORY_MOUNT_FAILED "canonical local repository mount failed"
+    if ! apk --root "$build_root" --arch x86_64 --initdb --keys-dir /etc/apk/keys \
+        --repositories-file "$repositories_file" --no-network add $builder_packages; then
+        umount /repo >/dev/null 2>&1 || true
+        fail OFFLINE_INSTALL_FAILED "file-only network-disabled builder installation failed"
+    fi
+    umount /repo || fail OFFLINE_REPOSITORY_UNMOUNT_FAILED "canonical local repository unmount failed"
+    rmdir /repo
     apk --root "$build_root" --no-network list --installed --manifest | LC_ALL=C sort > "$EXPORT_ROOT/builder-packages.lock"
     require_file "$EXPORT_ROOT/builder-packages.lock"
     cp /etc/resolv.conf "$build_root/etc/resolv.conf" 2>/dev/null || true
