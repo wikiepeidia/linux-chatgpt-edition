@@ -263,7 +263,7 @@ namespace ThreeHundredK {
                             StreamReader reader = new StreamReader(stream, Encoding.ASCII, false, 1024, true);
                             string request = reader.ReadLine() ?? "";
                             string[] parts = request.Split(' ');
-                            byte[] body;
+                            byte[] body = null;
                             bool ok = parts.Length >= 2 && files.TryGetValue(parts[1], out body);
                             if (!ok) body = Encoding.UTF8.GetBytes("not found\n");
                             string header = ok

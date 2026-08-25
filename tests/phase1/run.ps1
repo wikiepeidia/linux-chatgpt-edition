@@ -452,12 +452,16 @@ if ($Scope -in @('Qemu', 'All')) {
             '-QemuRoot', ([System.IO.Path]::GetFullPath($QemuRoot))
         )
 
-        $initialization = Invoke-CheckedProcess -FilePath $pwshPath -ArgumentList ($commonArguments + '-InitializeSigningKey') -WorkingDirectory $script:RepositoryRoot -TimeoutSeconds 5400
-        Assert-Equal -Expected 0 -Actual $initialization.ExitCode -Message 'Signing-key initialization child failed.'
+        $initialization = Invoke-CheckedProcess -FilePath $pwshPath -ArgumentList ($commonArguments + '-InitializeSigningKey') -WorkingDirectory $script:RepositoryRoot -TimeoutSeconds 5400 -AllowNonZero
+        if ($initialization.ExitCode -ne 0) {
+            throw "Signing-key initialization child failed.`nSTDOUT:`n$($initialization.StandardOutput)`nSTDERR:`n$($initialization.StandardError)"
+        }
         Assert-Match -Value $initialization.StandardOutput -Pattern 'signing-key-(?:already-)?initialized' -Message 'Initialization child returned no successful result.'
 
-        $build = Invoke-CheckedProcess -FilePath $pwshPath -ArgumentList ($commonArguments + '-Clean') -WorkingDirectory $script:RepositoryRoot -TimeoutSeconds 14400
-        Assert-Equal -Expected 0 -Actual $build.ExitCode -Message 'QEMU build child failed.'
+        $build = Invoke-CheckedProcess -FilePath $pwshPath -ArgumentList ($commonArguments + '-Clean') -WorkingDirectory $script:RepositoryRoot -TimeoutSeconds 14400 -AllowNonZero
+        if ($build.ExitCode -ne 0) {
+            throw "QEMU build child failed.`nSTDOUT:`n$($build.StandardOutput)`nSTDERR:`n$($build.StandardError)"
+        }
 
         $latestPath = Join-Path $script:RepositoryRoot 'dist\LATEST.json'
         Assert-True -Condition ([System.IO.File]::Exists($latestPath)) -Message 'QEMU build did not publish dist/LATEST.json.'
