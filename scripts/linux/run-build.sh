@@ -454,6 +454,9 @@ build_from_local() {
     chmod 0644 "$build_root/etc/passwd" "$build_root/etc/group"
     mkdir -p "$build_root/work/mkimage" "$build_root/export/raw"
     chmod 0755 "$build_root" "$build_root/home" "$build_root/work" "$build_root/run"
+    # The outer umask protects generated state, but package payload modes still
+    # need their declared read/execute classes for the non-root image builder.
+    chmod -R a+rX "$build_root/bin" "$build_root/sbin" "$build_root/lib" "$build_root/usr" "$build_root/etc"
     chmod -R a-w,a+rX "$build_root/repo" "$build_root/work/aports" "$build_root/workspace"
     chown -R "$builder_uid:$builder_gid" \
         "$build_root/home/$builder_user" "$build_root/work/mkimage" "$build_root/export"
@@ -494,7 +497,7 @@ build_from_local() {
         fail MKIMAGE_DEV_MOUNT_FAILED "builder device mount failed"
     fi
     mkimage_status=0
-    builder_probe='test "$(id -u)" = 1000 && test -x /bin/sh && test -r /repo/x86_64/APKINDEX.tar.gz && test -r /run/300k-secrets/300k.rsa && test -w /work/mkimage && test -w /export/raw'
+    builder_probe='test "$(id -u)" = 1000 && test -x /bin/sh && test "$(/sbin/apk --print-arch)" = x86_64 && test -r /repo/x86_64/APKINDEX.tar.gz && test -r /run/300k-secrets/300k.rsa && test -w /work/mkimage && test -w /export/raw'
     if ! chroot "$build_root" /bin/su -s /bin/sh -c "$builder_probe" "$builder_user"; then
         mkimage_status=126
     else
