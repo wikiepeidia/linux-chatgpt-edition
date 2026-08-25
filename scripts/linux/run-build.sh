@@ -428,7 +428,9 @@ build_from_local() {
     mkdir -p /repo
     mount --bind "$build_root/repo" /repo \
         || fail OFFLINE_REPOSITORY_MOUNT_FAILED "canonical local repository mount failed"
-    if ! apk --root "$build_root" --arch x86_64 --initdb --keys-dir /etc/apk/keys \
+    # apk resolves --keys-dir with openat(root_fd, ...); a leading slash would
+    # bypass the target root and silently load the builder guest's system keys.
+    if ! apk --root "$build_root" --arch x86_64 --initdb --keys-dir etc/apk/keys \
         --repositories-file "$repositories_file" --no-network add $builder_packages; then
         umount /repo >/dev/null 2>&1 || true
         fail OFFLINE_INSTALL_FAILED "file-only network-disabled builder installation failed"
