@@ -233,7 +233,13 @@ prepare_repository() {
     community_url=$(repository_value community url)
     builder_packages=$(json_array_lines builder_packages "$INPUTS_FILE" | tr '\n' ' ')
     image_packages=$(json_array_lines requested_image_packages "$INPUTS_FILE" | tr '\n' ' ')
-    apk --update-cache --repository "$main_url" --repository "$community_url" \
+    online_repositories=$prepare_root/repositories.online
+    online_cache=$prepare_root/apk-cache
+    mkdir -p "$online_cache"
+    printf '%s\n%s\n' "$main_url" "$community_url" > "$online_repositories"
+    apk --cache-dir "$online_cache" --repositories-file "$online_repositories" update \
+        || fail APK_INDEX_REFRESH_FAILED "isolated signed repository indexes could not be refreshed"
+    apk --cache-dir "$online_cache" --repositories-file "$online_repositories" \
         fetch --recursive --output "$prepare_root/apks" \
         $builder_packages $image_packages \
         || fail APK_FETCH_FAILED "complete builder/image APK closure could not be fetched"
