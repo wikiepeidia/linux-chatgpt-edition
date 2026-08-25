@@ -398,7 +398,13 @@ stream_regular_member() {
             ;;
         *) fail INSPECTION_FORMAT_UNSUPPORTED "member stream format is unsupported" ;;
     esac
-    [ "$status" -eq 0 ] || fail INSPECTION_DECODE_FAILED "$kind regular-member decoder failed"
+    if [ "$status" -ne 0 ]; then
+        decoder_error_bytes=$(file_bytes "$error_log")
+        decoder_error_sha256=$(sha256_file "$error_log")
+        decoder_error_text=$(head -c 256 "$error_log" | tr '\r\n' '  ' | tr -cd '[:alnum:] ._+:/()=,-')
+        [ -n "$decoder_error_text" ] || decoder_error_text=no-printable-diagnostic
+        fail INSPECTION_DECODE_FAILED "$kind regular-member decoder failed exit=$status stderr_bytes=$decoder_error_bytes stderr_sha256=$decoder_error_sha256 text=$decoder_error_text"
+    fi
     assert_decoder_log_clean "$kind" "$error_log"
     [ -f "$partial" ] && [ ! -L "$partial" ] || fail INSPECTION_OUTPUT_TYPE "decoder output is not one regular file"
     actual=$(file_bytes "$partial")
