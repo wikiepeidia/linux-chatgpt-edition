@@ -9,7 +9,7 @@ Requirements for the first overnight release. The 100 MB figure is a measured st
 
 ### Reproducible Build
 
-- [ ] **BUILD-01**: A contributor can invoke one documented PowerShell entry point from Windows to build the x86_64 ISO using a Linux/amd64 container with pinned Alpine, aports, repository, and build-epoch inputs.
+- [ ] **BUILD-01**: A contributor can invoke one documented PowerShell entry point from Windows to build the x86_64 ISO in a pinned Linux/amd64 environment with fixed Alpine, aports, repository, and build-epoch inputs; selecting Docker explicitly requires and verifies a real Linux/amd64 container daemon, while the default may use the QEMU backend.
 - [ ] **BUILD-02**: A clean build produces a uniquely identified ISO plus its SHA-256 checksum, exact byte size, build lock, resolved package manifest, and boot-layout report.
 - [ ] **BUILD-03**: Private signing keys, credentials, tokens, host paths, and build caches remain outside Git and outside the runtime ISO.
 - [ ] **BUILD-04**: If Docker Linux containers are unavailable, the documented fallback can perform the same build inside an Alpine VM without changing the distribution architecture.

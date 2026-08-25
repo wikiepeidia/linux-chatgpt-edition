@@ -42,8 +42,8 @@ The ISO must reliably boot into an immediately recognizable, funny ChatGPT-like 
 - The requested experience is “Linux with ChatGPT's own UI,” random hilarious material, a ChatGPT-styled terminal, and only basic applications.
 - The user explicitly does not want Codex, OpenAI API integrations, or similar cloud functionality inside the ISO.
 - The repository was empty at initialization and is already a Git worktree.
-- The development host is Windows. Docker is installed, while WSL, xorriso, a native C compiler, and make are not currently available on the host PATH. QEMU 11.1.0 is installed outside PATH at `D:\\VM\\qemu`.
-- The build should therefore be containerized where possible and avoid depending on an interactive Linux workstation.
+- The development host is Windows. Docker CLI binaries are installed, but no Docker Desktop installation, service, or reachable Linux daemon is available. WSL, xorriso, a native C compiler, and make are not currently available on the host PATH. QEMU 11.1.0 is installed outside PATH at `D:\\VM\\qemu`.
+- The build must therefore run in a pinned Linux/amd64 environment provided by a QEMU Alpine builder now, while keeping Docker as a compatible optional adapter for hosts where a real Linux daemon is available.
 
 ## Constraints
 
@@ -51,7 +51,7 @@ The ISO must reliably boot into an immediately recognizable, funny ChatGPT-like 
 - **Image size**: Aim near 100 MB, but treat it as a stretch target; measure and publish the actual result.
 - **Runtime**: Fully local and offline after boot; never embed API keys, credentials, or user account data.
 - **Compatibility**: Target x86_64 virtual machines; support both BIOS and UEFI when the chosen base/build system makes that reliable within the deadline.
-- **Build host**: Windows with Docker available but no installed WSL or native Linux build chain.
+- **Build host**: Windows with Docker CLI but no usable Docker server, no installed WSL, and no native Linux build chain; the QEMU Alpine builder is the required working backend.
 - **Emulator**: Use the supplied QEMU installation at `D:\\VM\\qemu` for repeatable boot tests.
 - **Quality**: A claimed ISO is not “done” until a boot smoke test reaches the graphical experience and the terminal can execute commands.
 - **Identity**: Clearly label the distribution as an unofficial parody and use original project artwork.
@@ -65,7 +65,7 @@ The ISO must reliably boot into an immediately recognizable, funny ChatGPT-like 
 | Make all entertainment functionality offline | Preserves the joke without secrets, accounts, cost, or network fragility | — Pending |
 | Prioritize boot reliability and experience over a strict 100 MB ceiling | A tiny file that does not reliably boot is not a deliverable | — Pending |
 | Use original parody branding around a ChatGPT-inspired interaction model | Delivers the requested aesthetic while avoiding a false official-product claim | — Pending |
-| Prefer a containerized build pipeline | Matches the available Windows host and improves reproducibility | — Pending |
+| Use one backend-neutral Linux build core with a working QEMU adapter and optional Docker adapter | The host has QEMU but no usable Docker server; both adapters can preserve the same pinned build contract without blocking delivery | — Pending |
 
 ## Evolution
 
