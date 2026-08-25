@@ -672,6 +672,10 @@ Add-TestCase -Name 'BUILD-04 public inputs pin the complete builder and inspecti
     Assert-Equal -Expected 'x86_64' -Actual $inputs.target.arch
     Assert-Equal -Expected '52643b7a176095362fd87fe73cdb994cb2e5ffae' -Actual $inputs.aports.commit
     Assert-Equal -Expected '8d756f6fc7653daa4fb4e2e213d8a66007bcb1e5a846e28891af62c47b90685c694486c2746099ad99e9e8f5278db76b69d11dfe1e9361aa4c8406df16929a9c' -Actual $inputs.qemu.cloud_image_sha512
+    $repositoryPins = @{}
+    foreach ($repository in @($inputs.alpine.repositories)) { $repositoryPins[[string]$repository.name] = [string]$repository.apkindex_sha256 }
+    Assert-Equal -Expected '8e23e3d74cdef0f2d3ea4a1da2066a74276c4dd9055c58430b5b3070cafeb770' -Actual $repositoryPins['main'] -Message 'The twice-observed official v3.24 main APKINDEX bytes are not pinned.'
+    Assert-Equal -Expected '23d7e4a77f658c9e9c4dd50b88ce111fa27fe69282ed4a55234da6a1f4e516ba' -Actual $repositoryPins['community'] -Message 'The verified v3.24 community APKINDEX pin changed unexpectedly.'
 
     $packages = @($inputs.builder_packages)
     foreach ($pin in @('gzip=1.14-r2', 'xz=5.8.3-r0', 'zstd=1.5.7-r2', 'lz4=1.10.0-r1', 'cpio=2.15-r0')) {
