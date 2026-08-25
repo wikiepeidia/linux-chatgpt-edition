@@ -161,7 +161,7 @@ bootstrap_online_tools() {
     main_url=$(repository_value main url)
     community_url=$(repository_value community url)
     # apk verifies the official repository signatures and exact revisions here.
-    apk add --no-cache --repository "$main_url" --repository "$community_url" $packages \
+    apk --no-cache --repository "$main_url" --repository "$community_url" add $packages \
         || fail BOOTSTRAP_PACKAGE_VERIFY_FAILED "official signed builder packages did not verify/install"
 }
 
@@ -233,7 +233,8 @@ prepare_repository() {
     community_url=$(repository_value community url)
     builder_packages=$(json_array_lines builder_packages "$INPUTS_FILE" | tr '\n' ' ')
     image_packages=$(json_array_lines requested_image_packages "$INPUTS_FILE" | tr '\n' ' ')
-    apk fetch --recursive --output "$prepare_root/apks" --repository "$main_url" --repository "$community_url" \
+    apk --update-cache --repository "$main_url" --repository "$community_url" \
+        fetch --recursive --output "$prepare_root/apks" \
         $builder_packages $image_packages \
         || fail APK_FETCH_FAILED "complete builder/image APK closure could not be fetched"
 
