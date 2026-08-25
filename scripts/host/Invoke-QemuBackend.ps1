@@ -286,6 +286,53 @@ namespace ThreeHundredK {
             worker.Join(5000);
         }
     }
+
+    public sealed class SerialCaptureServer : IDisposable {
+        private readonly TcpListener listener;
+        private readonly string destination;
+        private readonly Thread worker;
+        private volatile bool stopping;
+        private TcpClient client;
+
+        public int Port { get { return ((IPEndPoint)listener.LocalEndpoint).Port; } }
+
+        public SerialCaptureServer(string destinationPath) {
+            destination = destinationPath;
+            listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            worker = new Thread(Run) { IsBackground = true, Name = "300k-serial-capture" };
+            worker.Start();
+        }
+
+        private void Run() {
+            try {
+                client = listener.AcceptTcpClient();
+                using (NetworkStream input = client.GetStream())
+                using (FileStream output = new FileStream(destination, FileMode.Create, FileAccess.Write, FileShare.ReadWrite)) {
+                    byte[] buffer = new byte[8192];
+                    while (!stopping) {
+                        int count = input.Read(buffer, 0, buffer.Length);
+                        if (count == 0) break;
+                        output.Write(buffer, 0, count);
+                        output.Flush();
+                    }
+                }
+            } catch (SocketException) { }
+              catch (IOException) { }
+              catch (ObjectDisposedException) { }
+            finally {
+                if (client != null) client.Dispose();
+            }
+        }
+
+        public void Dispose() {
+            if (stopping) return;
+            stopping = true;
+            listener.Stop();
+            if (client != null) client.Close();
+            worker.Join(5000);
+        }
+    }
 }
 '@
 }
@@ -300,6 +347,12 @@ function Start-NoCloudSeedServer {
         [System.IO.File]::ReadAllBytes($MetaDataPath),
         [System.IO.File]::ReadAllBytes($UserDataPath)
     )
+}
+
+function Start-SerialCaptureServer {
+    param([Parameter(Mandatory)] [string] $DestinationPath)
+    Initialize-NoCloudSeedServerType
+    return [ThreeHundredK.SerialCaptureServer]::new($DestinationPath)
 }
 
 function Get-VerifiedQemuBaseImage {
@@ -441,6 +494,7 @@ function Invoke-QemuBackend {
     $knownHostsPath = $null
     $overlayPath = $null
     $seedServer = $null
+    $serialServer = $null
     $sshReservation = $null
     $resultObject = $null
     $runRoot = [System.IO.Path]::GetFullPath((Join-Path $StateRoot "state\runs\$RunId"))
@@ -507,6 +561,8 @@ function Invoke-QemuBackend {
         Add-QemuOwnedResource -Owner $owner -Name 'seed-listener' -Cleanup { param($server) $server.Dispose() } -CleanupArgument $seedServer
 
         $serialPath = Join-Path $runRoot 'serial.log'
+        $serialServer = Start-SerialCaptureServer -DestinationPath $serialPath
+        Add-QemuOwnedResource -Owner $owner -Name 'serial-listener' -Cleanup { param($server) $server.Dispose() } -CleanupArgument $serialServer
         Close-LoopbackPortReservation -Reservation $sshReservation
         $qemuArguments = @(
             '-machine', 'q35',
@@ -521,7 +577,7 @@ function Invoke-QemuBackend {
             '-nic', "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:$($sshReservation.Port)-:22",
             '-smbios', "type=1,serial=ds=nocloud;s=http://10.0.2.2:$($seedServer.Port)/",
             '-display', 'none',
-            '-serial', "file:$serialPath",
+            '-serial', "tcp:127.0.0.1:$($serialServer.Port)",
             '-monitor', 'none',
             '-no-reboot'
         )
@@ -626,6 +682,7 @@ function Invoke-QemuBackend {
             resources = [ordered]@{
                 qemu_lease_live = ($null -ne $qemuLease -and -not $qemuLease.Closed)
                 seed_listener_live = ($null -ne $cleanupError -and $null -ne $seedServer)
+                serial_listener_live = ($null -ne $cleanupError -and $null -ne $serialServer)
                 port_reservation_live = ($null -ne $sshReservation -and -not $sshReservation.Released)
                 ssh_identity_present = ($null -ne $identityPath -and [System.IO.File]::Exists($identityPath))
                 known_hosts_present = ($null -ne $knownHostsPath -and [System.IO.File]::Exists($knownHostsPath))

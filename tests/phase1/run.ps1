@@ -225,7 +225,7 @@ Add-TestCase -Name 'BUILD-04 SSH and SCP ignore hostile ambient configuration an
 }
 
 Add-TestCase -Name 'BUILD-04 one idempotent outer resource owner cleans every acquired stage' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
-    $stages = @('ports', 'seed-listener', 'ssh-key', 'known-hosts', 'overlay', 'qemu-lease', 'management-scratch')
+    $stages = @('ports', 'seed-listener', 'serial-listener', 'ssh-key', 'known-hosts', 'overlay', 'qemu-lease', 'management-scratch')
     foreach ($failAt in 0..($stages.Count - 1)) {
         $counts = @{}
         $owner = New-QemuResourceOwner
@@ -258,6 +258,9 @@ Add-TestCase -Name 'BUILD-04 one idempotent outer resource owner cleans every ac
 }
 
 Add-TestCase -Name 'BUILD-04 NoCloud templates are public-only and emit the ordered Ed25519 serial milestone' -Scopes @('Unit') -Requirements @('BUILD-04') -Body {
+    Initialize-NoCloudSeedServerType
+    Assert-True -Condition ($null -ne ('ThreeHundredK.NoCloudSeedServer' -as [type])) -Message 'NoCloud seed server type did not compile.'
+    Assert-True -Condition ($null -ne ('ThreeHundredK.SerialCaptureServer' -as [type])) -Message 'Serial capture server type did not compile.'
     $meta = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'builder/cloud-init/meta-data.template')
     $user = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'builder/cloud-init/user-data.template')
     Assert-Match -Value $meta -Pattern 'instance-id:\s*@@INSTANCE_ID@@'
