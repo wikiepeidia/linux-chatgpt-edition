@@ -718,8 +718,22 @@ expect_probe_failure() {
     if (inspect_file "$file" "$label" 0 "$role") > /dev/null 2> "$error"; then
         fail SELF_TEST_VACUOUS "$label hostile fixture was accepted"
     fi
-    grep -F "$expected" "$error" >/dev/null \
-        || fail SELF_TEST_WRONG_FAILURE "$label failed for an unrelated reason"
+    if ! grep -F "$expected" "$error" >/dev/null; then
+        actual=$(sed -n 's/^\([A-Z][A-Z0-9_]*\):.*/\1/p' "$error" | head -n 1)
+        [ -n "$actual" ] || actual=NO_DIAGNOSTIC
+        fail SELF_TEST_WRONG_FAILURE "$label expected $expected but got $actual"
+    fi
+}
+
+create_iso_fixture() {
+    label=$1
+    output=$2
+    source=$3
+    iso_command=$(tool_field iso command)
+    errors=$OWNED_ROOT/$label-create.errors
+    "$iso_command" -as mkisofs -quiet -output "$output" "$source" 2> "$errors" \
+        || fail SELF_TEST_FIXTURE_INVALID "$label ISO fixture creation failed"
+    assert_decoder_log_clean iso9660 "$errors"
 }
 
 make_secret_file() {
@@ -741,8 +755,6 @@ run_hostile_fixture_self_test() {
     lz4_command=$(tool_field lz4 command)
     tar_command=$(tool_field tar command)
     cpio_command=$(tool_field cpio command)
-    iso_command=$(tool_field iso command)
-
     "$gzip_command" -n -c -- "$root/content/secret.txt" > "$root/secret.gz"
     "$xz_command" -zc --check=crc32 -- "$root/content/secret.txt" > "$root/secret.xz"
     "$zstd_command" -q -c -- "$root/content/secret.txt" > "$root/secret.zst"
@@ -777,7 +789,7 @@ run_hostile_fixture_self_test() {
 
     mkdir "$root/secret-iso"
     cp "$root/secret.gz" "$root/secret-iso/payload.gz"
-    "$iso_command" -as mkisofs -quiet -output "$root/secret.iso" "$root/secret-iso"
+    create_iso_fixture secret "$root/secret.iso" "$root/secret-iso"
     if grep -aF "$marker" "$root/secret.iso" >/dev/null; then fail SELF_TEST_FIXTURE_INVALID "ISO secret fixture contains the raw marker"; fi
     expect_probe_failure INSPECTION_SECRET_FOUND "$root/secret.iso" iso iso9660
 
@@ -792,7 +804,7 @@ run_hostile_fixture_self_test() {
     "$gzip_command" -n -c -- "$root/clean.tar" > "$root/iso-root/apks/x86_64/clean.apk"
     "$gzip_command" -n -c -- "$root/clean.tar" > "$root/iso-root/clean.apkovl.tar.gz"
     cp /etc/apk/keys/300k.rsa.pub "$root/iso-root/apks/300k.rsa.pub"
-    "$iso_command" -as mkisofs -quiet -output "$root/clean.iso" "$root/iso-root"
+    create_iso_fixture clean "$root/clean.iso" "$root/iso-root"
     clean_scratch=$root/clean-audit-scratch
     clean_audit=$root/clean-audit.json
     # The child clean-audit probe is itself part of the hostile suite. A later

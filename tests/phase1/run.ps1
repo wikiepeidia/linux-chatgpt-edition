@@ -142,6 +142,8 @@ Add-TestCase -Name 'BUILD-03 hostile fixture matrix preflights before no-follow 
     }
     Assert-Match -Value $source -Pattern 'preflight_graph[\s\S]{0,4000}stream_regular_member' -Message 'The source must make preflight precede any regular-file streaming.'
     Assert-Match -Value $source -Pattern 'expected_banner=\$\(evidence_field iso version\)[\s\S]*banner_count[\s\S]*-le 1' -Message 'Only one xorriso banner equal to locked version evidence may be removed from strict decoder stderr.'
+    Assert-Match -Value $source -Pattern 'create_iso_fixture[\s\S]*assert_decoder_log_clean iso9660' -Message 'Hostile ISO fixture encoders must apply the same exact locked-banner stderr contract per invocation.'
+    Assert-Match -Value $source -Pattern 'SELF_TEST_WRONG_FAILURE.*expected \$expected but got \$actual' -Message 'Hostile fixture failures must report a bounded diagnostic code without leaking fixture contents.'
     Assert-False -Condition ($source -match '(?m)^\s*(eval\s|source\s|\.\s+\$)') -Message 'The inspector must not evaluate ambient or computed shell source.'
     Assert-False -Condition ($source -match '(?m)\b(mount|losetup)\b') -Message 'The unprivileged inspector must not mount images or allocate loop devices.'
 }
