@@ -405,7 +405,8 @@ Add-TestCase -Name 'BUILD-04 Docker and QEMU semantic records compare content wi
         guest_roles = Get-CanonicalGuestRoles
     }
     $docker = [pscustomobject]@{ backend = 'docker'; transport = 'volume'; iso_sha256 = ('4' * 64); content = $content }
-    $qemu = [pscustomobject]@{ backend = 'qemu'; transport = 'ssh'; iso_sha256 = ('5' * 64); content = $content }
+    $qemuContent = $content | ConvertTo-Json -Depth 30 | ConvertFrom-Json -Depth 30
+    $qemu = [pscustomobject]@{ backend = 'qemu'; transport = 'ssh'; iso_sha256 = ('5' * 64); content = $qemuContent }
     Assert-True -Condition (Test-BuildSemanticParity -Left $docker -Right $qemu) -Message 'Semantically equal adapters were rejected due to transport/output differences.'
     $qemu.content.profile_sha256 = '6' * 64
     Assert-False -Condition (Test-BuildSemanticParity -Left $docker -Right $qemu) -Message 'A content-field mismatch was ignored.'

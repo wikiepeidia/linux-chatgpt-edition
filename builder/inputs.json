@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "target": {
+    "os": "linux",
+    "arch": "x86_64",
+    "format": "iso",
+    "profile": "300k_bootstrap"
+  },
+  "alpine": {
+    "release": "3.24.1",
+    "branch": "v3.24",
+    "repositories": [
+      {
+        "name": "main",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main",
+        "apkindex_sha256": "0076ecf24f2b49c08d7546e987e070a34af57a90a6831fbd312388eac2b01fd7"
+      },
+      {
+        "name": "community",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/community",
+        "apkindex_sha256": "23d7e4a77f658c9e9c4dd50b88ce111fa27fe69282ed4a55234da6a1f4e516ba"
+      }
+    ]
+  },
+  "docker": {
+    "image": "alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b",
+    "image_index_digest": "sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b",
+    "linux_amd64_manifest_digest": "sha256:79ff19e9084a00eece421b2523fb93e22d730e2c0e525905de047e848e56d95f"
+  },
+  "aports": {
+    "remote": "https://gitlab.alpinelinux.org/alpine/aports.git",
+    "branch": "3.24-stable",
+    "commit": "52643b7a176095362fd87fe73cdb994cb2e5ffae"
+  },
+  "qemu": {
+    "cloud_image_name": "generic_alpine-3.24.1-x86_64-bios-cloudinit-r0.qcow2",
+    "cloud_image_url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/generic_alpine-3.24.1-x86_64-bios-cloudinit-r0.qcow2",
+    "cloud_image_sha512": "8d756f6fc7653daa4fb4e2e213d8a66007bcb1e5a846e28891af62c47b90685c694486c2746099ad99e9e8f5278db76b69d11dfe1e9361aa4c8406df16929a9c",
+    "memory_mib": 4096,
+    "cpus": 4
+  },
+  "builder_packages": [
+    "abuild=3.17.0-r0",
+    "apk-tools=3.0.7-r0",
+    "alpine-conf=3.22.0-r0",
+    "busybox=1.37.0-r31",
+    "fakeroot=1.37.2-r0",
+    "syslinux=6.04_pre1-r19",
+    "xorriso=1.5.8-r0",
+    "squashfs-tools=4.7.5-r0",
+    "mtools=4.0.49-r0",
+    "grub=2.14-r0",
+    "git=2.54.0-r0",
+    "ca-certificates=20260611-r0",
+    "gzip=1.14-r2",
+    "xz=5.8.3-r0",
+    "zstd=1.5.7-r2",
+    "lz4=1.10.0-r1",
+    "cpio=2.15-r0"
+  ],
+  "requested_image_packages": [
+    "alpine-base",
+    "linux-virt"
+  ],
+  "inspection_toolchain": {
+    "gzip": {
+      "package": "gzip=1.14-r2",
+      "command": "/bin/gzip",
+      "decoder": ["/bin/gzip", "-dc", "--"],
+      "fixture_encoder": ["/bin/gzip", "-n", "-c", "--"],
+      "version_argv": ["/bin/gzip", "--version"]
+    },
+    "xz": {
+      "package": "xz=5.8.3-r0",
+      "command": "/usr/bin/xz",
+      "decoder": ["/usr/bin/xz", "-dc", "--single-stream", "--"],
+      "fixture_encoder": ["/usr/bin/xz", "-zc", "--check=crc32", "--"],
+      "version_argv": ["/usr/bin/xz", "--version"]
+    },
+    "zstd": {
+      "package": "zstd=1.5.7-r2",
+      "command": "/usr/bin/zstd",
+      "decoder": ["/usr/bin/zstd", "-q", "-dc", "--"],
+      "fixture_encoder": ["/usr/bin/zstd", "-q", "-c", "--"],
+      "version_argv": ["/usr/bin/zstd", "--version"]
+    },
+    "lz4": {
+      "package": "lz4=1.10.0-r1",
+      "command": "/usr/bin/lz4",
+      "decoder": ["/usr/bin/lz4", "-q", "-d", "-c", "--"],
+      "fixture_encoder": ["/usr/bin/lz4", "-q", "-c", "--"],
+      "version_argv": ["/usr/bin/lz4", "--version"]
+    },
+    "cpio": {
+      "package": "cpio=2.15-r0",
+      "command": "/usr/bin/cpio",
+      "decoder": ["/usr/bin/cpio", "--extract", "--to-stdout", "--quiet"],
+      "fixture_encoder": ["/usr/bin/cpio", "--create", "--format=newc", "--reproducible", "--quiet"],
+      "version_argv": ["/usr/bin/cpio", "--version"]
+    },
+    "squashfs": {
+      "package": "squashfs-tools=4.7.5-r0",
+      "command": "/usr/bin/unsquashfs",
+      "decoder": ["/usr/bin/unsquashfs", "-cat"],
+      "fixture_encoder": ["/usr/bin/mksquashfs", "-noappend", "-no-xattrs", "-all-time", "0"],
+      "version_argv": ["/usr/bin/unsquashfs", "-version"]
+    },
+    "iso": {
+      "package": "xorriso=1.5.8-r0",
+      "command": "/usr/bin/xorriso",
+      "decoder": ["/usr/bin/xorriso", "-osirrox", "on:o_excl_on", "-indev"],
+      "fixture_encoder": ["/usr/bin/xorriso", "-as", "mkisofs", "-quiet", "-output"],
+      "version_argv": ["/usr/bin/xorriso", "-version"]
+    }
+  },
+  "canonical_guest_roles": {
+    "source": "/workspace",
+    "request": "/inputs/build-request.json",
+    "work": "/work",
+    "apk_cache": "/var/cache/apk",
+    "secrets": "/run/300k-secrets",
+    "export": "/export",
+    "entry": "/workspace/scripts/linux/run-build.sh"
+  }
+}
