@@ -408,11 +408,11 @@ build_from_local() {
 
     build_root=$WORK_ROOT/buildroots/$request_hash
     rm -rf "$build_root"
-    mkdir -p "$build_root/etc/apk/keys" "$build_root/repo" "$build_root/work" "$build_root/workspace" \
+    mkdir -p "$build_root/etc/apk/keys" "$build_root/repo/x86_64" "$build_root/work" "$build_root/workspace" \
         "$build_root/export" "$build_root/run/300k-secrets" "$build_root/root/.mkimage" "$build_root/tmp"
     cp /etc/apk/keys/* "$build_root/etc/apk/keys/"
     cp "$SECRET_ROOT/300k.rsa.pub" "$build_root/etc/apk/keys/300k.rsa.pub"
-    cp "$object_root"/* "$build_root/repo/"
+    cp "$object_root"/* "$build_root/repo/x86_64/"
     cp "$SECRET_ROOT/300k.rsa" "$build_root/run/300k-secrets/300k.rsa"
     cp "$SECRET_ROOT/300k.rsa.pub" "$build_root/run/300k-secrets/300k.rsa.pub"
     chmod 0600 "$build_root/run/300k-secrets/300k.rsa"

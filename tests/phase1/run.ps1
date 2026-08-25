@@ -457,6 +457,7 @@ Add-TestCase -Name 'BUILD-04 repository drift aborts before the offline install 
         Assert-Match -Value $linux -Pattern ([regex]::Escape($pattern)) -Message "Linux build core is missing '$pattern'."
     }
     Assert-Match -Value $linux -Pattern "printf '%s\\n' 'file:///repo'" -Message 'The target root does not receive the canonical local-only repository URL.'
+    Assert-Match -Value $linux -Pattern '"\$build_root/repo/x86_64"' -Message 'The local v2 repository is not staged below its target architecture.'
     Assert-Match -Value $linux -Pattern 'apk --root "\$build_root" --arch x86_64 --initdb --keys-dir /etc/apk/keys' -Message 'APK root-relative key lookup or target architecture is not explicit.'
     Assert-Match -Value $linux -Pattern 'apk --cache-dir "\$online_cache" --repositories-file "\$online_repositories" update' -Message 'APK 3 repository indexes are not explicitly refreshed in an isolated cache.'
     Assert-Match -Value $linux -Pattern '(?s)repositories\.online.*?apk --cache-dir.*? update.*?apk --cache-dir.*? fetch --recursive' -Message 'Closure resolution does not follow the isolated repository update.'
