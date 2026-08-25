@@ -60,7 +60,27 @@
   ],
   "requested_image_packages": [
     "alpine-base",
-    "linux-virt"
+    "apk-cron",
+    "busybox",
+    "chrony",
+    "dhcpcd",
+    "doas",
+    "e2fsprogs",
+    "grub-efi",
+    "iw",
+    "kbd-bkeymaps",
+    "linux-firmware",
+    "linux-virt",
+    "network-extras",
+    "openntpd",
+    "openssl",
+    "openssh",
+    "syslinux",
+    "tiny-cloud-alpine",
+    "tzdata",
+    "wget",
+    "wireless-regdb",
+    "wpa_supplicant"
   ],
   "inspection_toolchain": {
     "gzip": {

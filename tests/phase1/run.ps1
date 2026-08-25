@@ -387,6 +387,10 @@ Add-TestCase -Name 'BUILD-04 public inputs pin the complete builder and inspecti
     foreach ($pin in @('gzip=1.14-r2', 'xz=5.8.3-r0', 'zstd=1.5.7-r2', 'lz4=1.10.0-r1', 'cpio=2.15-r0')) {
         Assert-True -Condition ($packages -ccontains $pin) -Message "Missing exact inspection package pin '$pin'."
     }
+    $imagePackages = @($inputs.requested_image_packages)
+    foreach ($package in @('alpine-base', 'apk-cron', 'busybox', 'chrony', 'dhcpcd', 'doas', 'e2fsprogs', 'grub-efi', 'iw', 'kbd-bkeymaps', 'linux-firmware', 'linux-virt', 'network-extras', 'openntpd', 'openssl', 'openssh', 'syslinux', 'tiny-cloud-alpine', 'tzdata', 'wget', 'wireless-regdb', 'wpa_supplicant')) {
+        Assert-True -Condition ($imagePackages -ccontains $package) -Message "Pinned profile_virt direct package '$package' is missing from repository resolution."
+    }
     foreach ($format in @('gzip', 'xz', 'zstd', 'lz4', 'cpio', 'squashfs', 'iso')) {
         $entry = $inputs.inspection_toolchain.$format
         Assert-True -Condition ($null -ne $entry) -Message "Inspection format '$format' is absent."
@@ -468,6 +472,7 @@ Add-TestCase -Name 'BUILD-04 repository drift aborts before the offline install 
     Assert-Match -Value $linux -Pattern '(?s)mount --bind /proc "\$build_root/proc".*?mount --bind /dev "\$build_root/dev".*?chroot "\$build_root" /bin/su.*?umount "\$build_root/dev".*?umount "\$build_root/proc"' -Message 'Unprivileged APK usermode lacks its bounded proc/device mount lifecycle.'
     Assert-Match -Value $linux -Pattern '(?s)chmod 0755 "\$build_root".*?chmod -R a-w,a\+rX "\$build_root/repo".*?builder_probe=.*?test -r /repo/x86_64/APKINDEX\.tar\.gz.*?MKIMAGE_IDENTITY_INVALID' -Message 'Builder traversal, immutable inputs, and the pre-mkimage identity probe are not fail-closed.'
     Assert-Match -Value $linux -Pattern '(?s)chmod -R a\+rX "\$build_root/bin".*?builder_probe=.*?/sbin/apk --print-arch.*?x86_64' -Message 'The unprivileged builder does not prove readable package payloads and an executable pinned APK.'
+    Assert-Match -Value $linux -Pattern '(?s)mkimage_log=.*?300k-mkimage\.log.*?2>&1.*?tail -n 80 "\$mkimage_log" >&2' -Message 'A bounded mkimage failure tail is not preserved for the host tracer.'
     Assert-Match -Value $linux -Pattern 'env -i HOME=/home/\$builder_user PATH=/usr/sbin:/usr/bin:/sbin:/bin CBUILD=x86_64 SOURCE_DATE_EPOCH=' -Message 'The clean mkimage environment does not pin its build architecture.'
     Assert-Match -Value $linux -Pattern 'apk --cache-dir "\$online_cache" --repositories-file "\$online_repositories" update' -Message 'APK 3 repository indexes are not explicitly refreshed in an isolated cache.'
     Assert-Match -Value $linux -Pattern '(?s)repositories\.online.*?apk --cache-dir.*? update.*?apk --cache-dir.*? fetch --recursive' -Message 'Closure resolution does not follow the isolated repository update.'

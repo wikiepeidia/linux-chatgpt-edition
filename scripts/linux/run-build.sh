@@ -497,11 +497,13 @@ build_from_local() {
         fail MKIMAGE_DEV_MOUNT_FAILED "builder device mount failed"
     fi
     mkimage_status=0
+    mkimage_log=$build_root/tmp/300k-mkimage.log
     builder_probe='test "$(id -u)" = 1000 && test -x /bin/sh && test "$(/sbin/apk --print-arch)" = x86_64 && test -r /repo/x86_64/APKINDEX.tar.gz && test -r /run/300k-secrets/300k.rsa && test -w /work/mkimage && test -w /export/raw'
     if ! chroot "$build_root" /bin/su -s /bin/sh -c "$builder_probe" "$builder_user"; then
         mkimage_status=126
     else
         chroot "$build_root" /bin/su -s /bin/sh -c "$mkimage_command" "$builder_user" \
+            > "$mkimage_log" 2>&1 \
             || mkimage_status=$?
     fi
     mount_cleanup_status=0
@@ -511,8 +513,10 @@ build_from_local() {
         || fail MKIMAGE_MOUNT_CLEANUP_FAILED "builder proc/device cleanup failed"
     [ "$mkimage_status" -ne 126 ] \
         || fail MKIMAGE_IDENTITY_INVALID "builder uid or path permissions are invalid"
-    [ "$mkimage_status" -eq 0 ] \
-        || fail MKIMAGE_FAILED "pinned offline aports build failed"
+    if [ "$mkimage_status" -ne 0 ]; then
+        tail -n 80 "$mkimage_log" >&2 || true
+        fail MKIMAGE_FAILED "pinned offline aports build failed"
+    fi
     verify_repository_snapshot "$object_root"
 
     iso_in_root=$(find "$build_root/export/raw" -maxdepth 1 -type f -name '*.iso' | LC_ALL=C sort | head -n 1)
