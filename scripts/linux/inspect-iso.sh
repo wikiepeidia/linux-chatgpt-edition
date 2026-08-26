@@ -280,8 +280,9 @@ validate_graph_file() {
         function die(message) { print message > "/dev/stderr"; bad=1; exit 2 }
         function parent(path, at) { at=match(path, /\/[^\/]*$/); return at ? substr(path,1,at-1) : "." }
         function resolve(path, target, base,n,i,part,out,top) {
-            if (target ~ /^\// || target ~ /[[:cntrl:]]/ || target ~ /\\/) return "!"
-            base=parent(path)
+            if (target ~ /^\/\// || target ~ /[[:cntrl:]]/ || target ~ /\\/) return "!"
+            if (target ~ /^\/+/) { sub(/^\/+/, "", target); base="." }
+            else base=parent(path)
             n=split((base == "." ? target : base "/" target), part, "/")
             top=0
             for (i=1; i<=n; i++) {
@@ -334,13 +335,17 @@ validate_graph_file() {
             }
             for (path in link_target) {
                 target=link_target[path]
-                if (!(target in paths)) die("link target is not present in the complete graph")
-                if (paths[path] == "h" && paths[target] != "f") die("hardlink target is not a regular file")
+                if (paths[path] == "h") {
+                    if (!(target in paths)) die("hardlink target is not present in the complete graph")
+                    if (paths[target] != "f") die("hardlink target is not a regular file")
+                }
                 delete chain
                 cursor=path
                 while (cursor in link_target) {
                     if (chain[cursor]++) die("cyclic link graph")
-                    cursor=link_target[cursor]
+                    cursor_target=link_target[cursor]
+                    if (!(cursor_target in paths)) break
+                    cursor=cursor_target
                 }
             }
             print members, regulars, declared
@@ -853,6 +858,13 @@ run_hostile_fixture_self_test() {
     sandbox=$root/hostile-sandbox
     probe=$sandbox/probe
     mkdir "$sandbox" "$probe"
+    root_confined_external_symlinks=$probe/root-confined-external-symlinks.manifest
+    printf 'a\td\t0\tvar\t\nb\tl\t0\tvar/lock\t../run/lock\nc\td\t0\tbin\t\nd\tl\t0\tbin/sh\t/bin/busybox\n' > "$root_confined_external_symlinks"
+    fixture_reset_state
+    preflight_graph "$root_confined_external_symlinks" \
+        || fail SELF_TEST_WRONG_FAILURE "root-confined external package symlinks were rejected"
+    [ "$(counter_get materializations)" -eq 0 ] \
+        || fail SELF_TEST_PREMATERIALIZED "root-confined external symlink graph was materialized"
     outside_scratch_sentinel=$sandbox/outside_scratch_sentinel
     printf '%s\n' 'outside scratch sentinel' > "$outside_scratch_sentinel"
     sentinel_before=$(sha256_file "$outside_scratch_sentinel")
