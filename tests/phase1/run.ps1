@@ -199,6 +199,12 @@ Add-TestCase -Name 'BUILD-03 offline build proves decoder identity before inspec
     Assert-Match -Value $linuxCore -Pattern ([regex]::Escape('"package": "tar=1.35-r5"')) -Message 'The Linux public-contract guard must require the exact retained GNU tar decoder package.'
     Assert-Match -Value $linuxCore -Pattern 'readlink -f "\$command_path"[\s\S]*apk info -W "\$resolved_command"' -Message 'Configured applet paths must resolve inside the chroot before APK Tools 3 exact package ownership is accepted.'
     Assert-Match -Value $linuxCore -Pattern 'scripts/linux/inspect-iso\.sh' -Message 'The inspector must be included in the normalized source archive contract.'
+    $selfTestBlock = [regex]::Match($linuxCore, 'run_inspector_self_test\(\) \{[\s\S]*?\n\}').Value
+    Assert-Match -Value $linuxCore -Pattern 'inspector_self_test_diagnostic\(\)[\s\S]{0,1800}sed -n ''s/\^\\\(\[A-Z\]\[A-Z0-9_\]\*\\\):[.]\*/\\1/p''[\s\S]{0,500}head -n 1' -Message 'The build must extract only the first uppercase diagnostic code, never an arbitrary self-test log line.'
+    Assert-Match -Value $linuxCore -Pattern 'inspector_self_test_diagnostic\(\)[\s\S]{0,1800}\[ "\$\{#code\}" -le 64 \][\s\S]{0,500}grep -F "fail \$code " "\$inspector"' -Message 'A self-test diagnostic must be length-bounded and already present in the trusted inspector fail-code allowlist.'
+    Assert-Match -Value $linuxCore -Pattern 'inspector_self_test_diagnostic\(\)[\s\S]{0,1800}NO_DIAGNOSTIC' -Message 'Malformed or unapproved self-test diagnostics must collapse to a fixed non-sensitive code.'
+    Assert-Match -Value $selfTestBlock -Pattern 'INSPECTION_SELF_TEST_FAILED "hostile compressed-layer fixture suite failed code=\$self_test_code"' -Message 'The outer failure must report only the sanitized diagnostic code.'
+    Assert-False -Condition ([bool]($selfTestBlock -match '(tail|cat)[^\r\n]*inspector-self-test[.]log')) -Message 'The build must never echo raw self-test log lines into the host failure channel.'
 }
 
 function New-ClosedSecurityFixture {
