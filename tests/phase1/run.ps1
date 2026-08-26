@@ -149,6 +149,8 @@ Add-TestCase -Name 'BUILD-03 hostile fixture matrix preflights before no-follow 
     Assert-Match -Value $source -Pattern 'clean-key-template[\s\S]{0,900}inspect_file' -Message 'The runtime self-test must accept header/footer serialization constants without a private-key payload.'
     Assert-Match -Value $source -Pattern 'framed-private-key[\s\S]{0,900}expect_probe_failure INSPECTION_SECRET_FOUND' -Message 'The runtime self-test must still reject a complete framed private-key payload.'
     Assert-Match -Value $source -Pattern 'mkdir "\$root/clean-cpio"[\s\S]*cp "\$root/content/clean[.]txt" "\$root/clean-cpio/payload"[\s\S]*> "\$root/clean[.]cpio"' -Message 'The positive clean ISO must build an independent cpio payload from clean bytes.'
+    Assert-Match -Value $source -Pattern ([regex]::Escape('if (type == "d" && (path == "." || path == "./")) next')) -Message 'Only the CPIO parser may discard its virtual archive-root directory sentinel before global path validation.'
+    Assert-Match -Value $source -Pattern ([regex]::Escape("printf '%s\n' . payload")) -Message 'Runtime CPIO fixtures must include the standard virtual-root directory entry as well as a real payload.'
     Assert-False -Condition ([bool]($source -match 'cp "\$root/initramfs[.]cpio" "\$root/clean[.]cpio"')) -Message 'The clean ISO must never reuse the hostile secret-bearing initramfs fixture.'
     Assert-False -Condition ([bool]($source -match 'find "\$sandbox"[^\r\n]*-printf')) -Message 'The hostile fixture must not depend on GNU find -printf inside the pinned Alpine builder.'
     Assert-Match -Value $source -Pattern 'find "\$sandbox"[^\r\n]*-exec stat -c' -Message 'The hostile fixture inventory must use BusyBox-compatible find -exec with no-follow stat evidence.'
