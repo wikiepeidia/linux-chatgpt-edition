@@ -316,7 +316,8 @@ validate_graph_file() {
             } else if (size != "0") die("non-regular member declares bytes")
             if (type ~ /^[lh]$/) {
                 if (target == "" || length(target) > max_path) die("link target is empty or overlong")
-                canonical=resolve(path,target)
+                if (type == "h") canonical=resolve(".",target)
+                else canonical=resolve(path,target)
                 if (canonical == "!") die("link target escapes or is malformed")
                 link_target[path]=canonical
             } else if (target != "") die("non-link has a link target")
@@ -878,6 +879,13 @@ run_hostile_fixture_self_test() {
         || fail SELF_TEST_WRONG_FAILURE "root-confined external package symlinks were rejected"
     [ "$(counter_get materializations)" -eq 0 ] \
         || fail SELF_TEST_PREMATERIALIZED "root-confined external symlink graph was materialized"
+    root_relative_hardlink=$probe/root-relative-hardlink.manifest
+    printf 'a\td\t0\tusr\t\nb\td\t0\tusr/sbin\t\nc\tf\t1\tusr/sbin/ntpctl\t\nd\th\t0\tusr/sbin/ntpd\tusr/sbin/ntpctl\n' > "$root_relative_hardlink"
+    fixture_reset_state
+    preflight_graph "$root_relative_hardlink" \
+        || fail SELF_TEST_WRONG_FAILURE "archive-root-relative tar hardlink was rejected"
+    [ "$(counter_get materializations)" -eq 0 ] \
+        || fail SELF_TEST_PREMATERIALIZED "root-relative hardlink graph was materialized"
     outside_scratch_sentinel=$sandbox/outside_scratch_sentinel
     printf '%s\n' 'outside scratch sentinel' > "$outside_scratch_sentinel"
     sentinel_before=$(sha256_file "$outside_scratch_sentinel")
