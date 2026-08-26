@@ -599,6 +599,7 @@ make_cpio_manifest() {
             else if (rawtype == "d") { type="d"; size=0 }
             else if (rawtype == "l") { type="l"; size=0; if ($(NF-1) != "->") exit 2; target=$NF; path=$(NF-2) }
             else exit 2
+            if (type == "d" && (path == "." || path == "./")) next
             path=clean(path); target=clean(target)
             if (path == "") next
             printf "cpio:%08d\t%s\t%s\t%s\t%s\n", ++id, type, size, path, target
@@ -853,7 +854,7 @@ run_hostile_fixture_self_test() {
     expect_probe_failure INSPECTION_SECRET_FOUND "$root/secret.apkovl.tar.gz" apkovl apkovl
 
     cp "$root/content/secret.txt" "$root/cpio/payload"
-    (cd "$root/cpio" && printf '%s\n' payload | "$cpio_command" --create --format=newc --reproducible --quiet) > "$root/initramfs.cpio"
+    (cd "$root/cpio" && printf '%s\n' . payload | "$cpio_command" --create --format=newc --reproducible --quiet) > "$root/initramfs.cpio"
     "$gzip_command" -n -c -- "$root/initramfs.cpio" > "$root/initramfs-secret"
     expect_probe_failure INSPECTION_SECRET_FOUND "$root/initramfs-secret" initramfs initramfs-cpio
 
@@ -878,7 +879,7 @@ run_hostile_fixture_self_test() {
     cp "$root/content/clean.txt" "$root/iso-root/boot/vmlinuz-test"
     mkdir "$root/clean-cpio"
     cp "$root/content/clean.txt" "$root/clean-cpio/payload"
-    (cd "$root/clean-cpio" && printf '%s\n' payload | "$cpio_command" --create --format=newc --reproducible --quiet) > "$root/clean.cpio"
+    (cd "$root/clean-cpio" && printf '%s\n' . payload | "$cpio_command" --create --format=newc --reproducible --quiet) > "$root/clean.cpio"
     "$gzip_command" -n -c -- "$root/clean.cpio" > "$root/iso-root/boot/initramfs-test"
     mkdir "$root/clean-squash"
     cp "$root/content/clean.txt" "$root/clean-squash/payload"
