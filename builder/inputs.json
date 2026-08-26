@@ -18,7 +18,7 @@
       {
         "name": "main",
         "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main",
-        "apkindex_sha256": "8e23e3d74cdef0f2d3ea4a1da2066a74276c4dd9055c58430b5b3070cafeb770"
+        "apkindex_sha256": "33971e63c06dac7ab71e96e6fc88eec8edc44f465881e123c4893f1345b2360b"
       },
       {
         "name": "community",
