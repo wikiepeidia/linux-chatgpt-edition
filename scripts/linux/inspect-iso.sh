@@ -36,9 +36,13 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-require_regular() {
+require_regular_member() {
     [ -f "$1" ] || fail INSPECTION_INPUT_MISSING "required regular file is absent"
     [ ! -L "$1" ] || fail INSPECTION_INPUT_LINK "required input may not be a link"
+}
+
+require_regular() {
+    require_regular_member "$1"
     [ -s "$1" ] || fail INSPECTION_INPUT_EMPTY "required input is empty"
 }
 
@@ -636,7 +640,7 @@ inspect_file() {
     [ "$depth" -le "$MAX_DEPTH" ] || fail INSPECTION_DEPTH_LIMIT "nested decoder depth exceeded"
     observed=$(counter_get observed_depth)
     [ "$depth" -le "$observed" ] || counter_set observed_depth "$depth"
-    require_regular "$file"
+    require_regular_member "$file"
     format=$(detect_format "$file")
     case "$role:$format" in
         iso:iso9660|apk:gzip|apk:tar|apkovl:gzip|apkovl:tar|initramfs:gzip|initramfs:xz|initramfs:zstd|initramfs:lz4|initramfs:cpio|modloop:squashfs|modloop:gzip|modloop:xz|modloop:zstd|modloop:lz4|archive:tar|archive:gzip|cpio-chain:cpio|cpio-chain:gzip|cpio-chain:xz|cpio-chain:zstd|cpio-chain:lz4|compressed:gzip|compressed:xz|compressed:zstd|compressed:lz4|auto:*) ;;
@@ -828,6 +832,7 @@ run_hostile_fixture_self_test() {
     "$gzip_command" -n -c -- "$root/clean.tar" > "$root/iso-root/apks/x86_64/clean.apk"
     "$gzip_command" -n -c -- "$root/clean.tar" > "$root/iso-root/clean.apkovl.tar.gz"
     cp /etc/apk/keys/300k.rsa.pub "$root/iso-root/apks/300k.rsa.pub"
+    : > "$root/iso-root/empty-member"
     create_iso_fixture clean "$root/clean.iso" "$root/iso-root"
     clean_scratch=$root/clean-audit-scratch
     clean_audit=$root/clean-audit.json
