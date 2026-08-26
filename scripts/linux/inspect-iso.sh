@@ -198,15 +198,38 @@ scan_text_value() {
     return 0
 }
 
+contains_private_key() {
+    awk '
+        function reset_candidate() { label=""; payload=0 }
+        {
+            line=$0
+            sub(/\r$/, "", line)
+            if (line ~ /^-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----$/) {
+                label=line
+                sub(/^-----BEGIN /, "", label)
+                sub(/-----$/, "", label)
+                payload=0
+                next
+            }
+            if (label != "") {
+                if (line ~ /^[A-Za-z0-9+\/=]+$/ && length(line) >= 16) { payload=1; next }
+                if (line == "-----END " label "-----" && payload) { found=1; exit }
+                if (line == "" || line ~ /^[A-Za-z0-9-]+:[[:space:]][[:print:]]+$/) next
+                reset_candidate()
+            }
+        }
+        END { exit found ? 0 : 1 }
+    ' "$1"
+}
+
 scan_regular_bytes() {
     file=$1
     logical=$2
     scan_text_value "$logical"
-    private_pattern='BEGIN [A-Z0-9 ]*PRIVATE KEY'
     credential_pattern='(FICT[A-Z0-9_]*SECRET_TOKEN|OPENAI_API_KEY|AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN|PASSWORD)[=:][[:space:]]*[A-Za-z0-9_./+~-]{12,}'
     windows_unc_pattern="(^|[[:space:]\"'=:])\\\\\\\\[A-Za-z0-9._-]+\\\\[A-Za-z0-9\$._-]+(\\\\[^[:space:]\"']*)?"
     host_pattern="([A-Za-z]:\\\\Users\\\\|$windows_unc_pattern|/run/300k-secrets|wikiepeidia)"
-    if grep -aEiq "$private_pattern|$credential_pattern|$host_pattern" "$file"; then
+    if contains_private_key "$file" || grep -aEiq "$credential_pattern|$host_pattern" "$file"; then
         fail INSPECTION_SECRET_FOUND "decoded regular bytes contain a private credential or host-management marker logical=$logical"
     fi
     case "$logical" in
@@ -796,6 +819,20 @@ run_hostile_fixture_self_test() {
         if grep -aF "$marker" "$compressed_secret_fixture" >/dev/null; then fail SELF_TEST_FIXTURE_INVALID "compressed secret fixture leaked plaintext into outer bytes"; fi
         expect_probe_failure INSPECTION_SECRET_FOUND "$compressed_secret_fixture" compressed "compressed-$(basename "$compressed_secret_fixture")"
     done
+    key_label=OPENSSH
+    key_label="$key_label PRIVATE KEY"
+    printf '%s%s%s\n%s%s%s\n' '-----BEGIN ' "$key_label" '-----' '-----END ' "$key_label" '-----' > "$root/content/clean-key-template"
+    "$gzip_command" -n -c -- "$root/content/clean-key-template" > "$root/clean-key-template.gz"
+    fixture_reset_state
+    clean_key_error=$root/clean-key-template.error
+    if ! inspect_file "$root/clean-key-template.gz" clean-key-template 0 compressed > /dev/null 2> "$clean_key_error"; then
+        clean_key_actual=$(sed -n 's/^\([A-Z][A-Z0-9_]*\):.*/\1/p' "$clean_key_error" | head -n 1)
+        [ -n "$clean_key_actual" ] || clean_key_actual=NO_DIAGNOSTIC
+        fail SELF_TEST_WRONG_FAILURE "clean key serialization constants failed with $clean_key_actual"
+    fi
+    printf '%s%s%s\n%s\n%s%s%s\n' '-----BEGIN ' "$key_label" '-----' 'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=' '-----END ' "$key_label" '-----' > "$root/content/framed-private-key"
+    "$gzip_command" -n -c -- "$root/content/framed-private-key" > "$root/framed-private-key.gz"
+    expect_probe_failure INSPECTION_SECRET_FOUND "$root/framed-private-key.gz" compressed framed-private-key
     printf '%s\n' '\\${root}\${entry}' > "$root/content/clean-escaped-shell"
     "$gzip_command" -n -c -- "$root/content/clean-escaped-shell" > "$root/clean-escaped-shell.gz"
     fixture_reset_state
