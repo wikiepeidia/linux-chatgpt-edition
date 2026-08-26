@@ -713,11 +713,41 @@ assert_inspection_toolchain_identity() {
     [ "$seen" -eq 9 ] || fail INSPECTION_TOOLCHAIN_SET_INVALID "inspection evidence is incomplete"
 }
 
+inspector_self_test_diagnostic() {
+    log=$1
+    inspector=$2
+    if [ ! -f "$log" ] || [ -L "$log" ] || [ ! -f "$inspector" ] || [ -L "$inspector" ]; then
+        printf '%s\n' NO_DIAGNOSTIC
+        return
+    fi
+    code=$(awk '
+        /^[A-Z][A-Z0-9_]*:/ {
+            candidate=$0
+            sub(/:.*/, "", candidate)
+            if (length(candidate) > 64 ||
+                (candidate !~ /^INSPECTION_[A-Z0-9_]+$/ && candidate !~ /^SELF_TEST_[A-Z0-9_]+$/)) {
+                invalid=1
+            }
+            count++
+            code=candidate
+        }
+        END { if (!invalid && count == 1) print code }
+    ' "$log" 2>/dev/null || true)
+    if [ -n "$code" ] && grep -F "fail $code " "$inspector" >/dev/null; then
+        printf '%s\n' "$code"
+        return
+    fi
+    printf '%s\n' NO_DIAGNOSTIC
+}
+
 run_inspector_self_test() {
     root=$1
-    chroot "$root" /bin/sh /workspace/scripts/linux/inspect-iso.sh self-test /work/inspection-self-test \
-        > "$root/work/inspector-self-test.log" 2>&1 \
-        || { tail -n 80 "$root/work/inspector-self-test.log" >&2 || true; fail INSPECTION_SELF_TEST_FAILED "hostile compressed-layer fixture suite failed"; }
+    self_test_log=$root/work/inspector-self-test.log
+    if ! chroot "$root" /bin/sh /workspace/scripts/linux/inspect-iso.sh self-test /work/inspection-self-test \
+        > "$self_test_log" 2>&1; then
+        self_test_code=$(inspector_self_test_diagnostic "$self_test_log" "$root/workspace/scripts/linux/inspect-iso.sh")
+        fail INSPECTION_SELF_TEST_FAILED "hostile compressed-layer fixture suite failed code=$self_test_code"
+    fi
     grep -F '300K_INSPECTOR_SELF_TEST_PASS' "$root/work/inspector-self-test.log" >/dev/null \
         || fail INSPECTION_SELF_TEST_FAILED "hostile fixture suite returned no non-vacuous pass marker"
     printf '%s\n' passed > "$root/work/inspector-self-test.passed"
