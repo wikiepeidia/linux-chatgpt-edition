@@ -599,7 +599,10 @@ make_cpio_manifest() {
             else if (rawtype == "d") { type="d"; size=0 }
             else if (rawtype == "l") { type="l"; size=0; if ($(NF-1) != "->") exit 2; target=$NF; path=$(NF-2) }
             else exit 2
-            if (type == "d" && (path == "." || path == "./")) next
+            if (type == "d" && (path == "." || path == "./")) {
+                if (cpio_root_seen++) { print "duplicate CPIO archive root" > "/dev/stderr"; exit 2 }
+                next
+            }
             path=clean(path); target=clean(target)
             if (path == "") next
             printf "cpio:%08d\t%s\t%s\t%s\t%s\n", ++id, type, size, path, target
@@ -857,6 +860,8 @@ run_hostile_fixture_self_test() {
     (cd "$root/cpio" && printf '%s\n' . payload | "$cpio_command" --create --format=newc --reproducible --quiet) > "$root/initramfs.cpio"
     "$gzip_command" -n -c -- "$root/initramfs.cpio" > "$root/initramfs-secret"
     expect_probe_failure INSPECTION_SECRET_FOUND "$root/initramfs-secret" initramfs initramfs-cpio
+    (cd "$root/cpio" && printf '%s\n' . . payload | "$cpio_command" --create --format=newc --reproducible --quiet) > "$root/duplicate-root.cpio"
+    expect_probe_failure INSPECTION_CPIO_MANIFEST_INVALID "$root/duplicate-root.cpio" initramfs duplicate-cpio-root
 
     cp "$root/secret.gz" "$root/tar/payload.gz"
     (cd "$root/tar" && "$tar_command" -cf "$root/secret.tar" payload.gz)
