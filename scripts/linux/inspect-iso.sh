@@ -222,6 +222,22 @@ contains_private_key() {
     ' "$1"
 }
 
+assert_project_modloop_signature_shape() {
+    file=$1
+    signature_bytes=$(file_bytes "$file")
+    [ "$signature_bytes" -eq 512 ] \
+        || fail INSPECTION_MODLOOP_SIGNATURE_INVALID "project modloop signature has an invalid detached-signature width"
+    project_key_records=$(awk '
+        $2 == "300k.rsa.pub" && $3 == "" && length($1) == 64 && $1 ~ /^[0-9a-f]+$/ { n++ }
+        END { print n + 0 }
+    ' "$TRUSTED_KEYS")
+    [ "$project_key_records" -eq 1 ] \
+        || fail INSPECTION_MODLOOP_SIGNATURE_INVALID "project modloop signature does not name exactly one approved signer"
+    if grep -aEq '^-----BEGIN (RSA )?PUBLIC KEY-----$|^-----END (RSA )?PUBLIC KEY-----$' "$file"; then
+        fail INSPECTION_MODLOOP_SIGNATURE_INVALID "project modloop signature contains public-key framing"
+    fi
+}
+
 scan_regular_bytes() {
     file=$1
     logical=$2
@@ -237,6 +253,11 @@ scan_regular_bytes() {
             # APK v2 signature members use a public-key-looking suffix but
             # contain only a signature blob. Their enclosing APK bytes were
             # already admitted by the verified retained-repository manifest.
+            ;;
+        image.iso/boot/initramfs-virt.decoded/var/cache/misc/modloop-virt.SIGN.RSA.300k.rsa.pub)
+            # Alpine stores this one detached RSA-4096 modloop signature under
+            # the public signer suffix. It is opaque signature data, not a key.
+            assert_project_modloop_signature_shape "$file"
             ;;
         *.rsa.pub)
             basename=${logical##*/}
@@ -785,6 +806,22 @@ expect_probe_failure() {
     fi
 }
 
+expect_scan_failure() {
+    expected=$1
+    file=$2
+    logical=$3
+    label=$4
+    error=$OWNED_ROOT/$label.error
+    if (scan_regular_bytes "$file" "$logical") > /dev/null 2> "$error"; then
+        fail SELF_TEST_VACUOUS "$label hostile scan fixture was accepted"
+    fi
+    if ! grep -F "$expected" "$error" >/dev/null; then
+        actual=$(sed -n 's/^\([A-Z][A-Z0-9_]*\):.*/\1/p' "$error" | head -n 1)
+        [ -n "$actual" ] || actual=NO_DIAGNOSTIC
+        fail SELF_TEST_WRONG_FAILURE "$label expected $expected but got $actual"
+    fi
+}
+
 create_iso_fixture() {
     label=$1
     output=$2
@@ -849,6 +886,29 @@ run_hostile_fixture_self_test() {
     printf '\\\\%s\\%s\\%s\n' buildhost.example private_share artifact.iso > "$root/content/host-unc"
     "$gzip_command" -n -c -- "$root/content/host-unc" > "$root/host-unc.gz"
     expect_probe_failure INSPECTION_SECRET_FOUND "$root/host-unc.gz" compressed host-unc
+
+    modloop_signature_logical=image.iso/boot/initramfs-virt.decoded/var/cache/misc/modloop-virt.SIGN.RSA.300k.rsa.pub
+    valid_modloop_signature=$root/content/valid-modloop-signature
+    dd if=/dev/zero of="$valid_modloop_signature" bs=512 count=1 2>/dev/null
+    [ "$(file_bytes "$valid_modloop_signature")" -eq 512 ] \
+        || fail SELF_TEST_FIXTURE_INVALID "valid modloop signature fixture has the wrong width"
+    valid_modloop_error=$root/valid-modloop-signature.error
+    if ! scan_regular_bytes "$valid_modloop_signature" "$modloop_signature_logical" > /dev/null 2> "$valid_modloop_error"; then
+        valid_modloop_actual=$(sed -n 's/^\([A-Z][A-Z0-9_]*\):.*/\1/p' "$valid_modloop_error" | head -n 1)
+        [ -n "$valid_modloop_actual" ] || valid_modloop_actual=NO_DIAGNOSTIC
+        fail SELF_TEST_WRONG_FAILURE "valid-modloop-signature failed with $valid_modloop_actual"
+    fi
+    short_modloop_signature=$root/content/short-modloop-signature
+    head -c 511 "$valid_modloop_signature" > "$short_modloop_signature"
+    expect_scan_failure INSPECTION_MODLOOP_SIGNATURE_INVALID "$short_modloop_signature" "$modloop_signature_logical" short-modloop-signature
+    pem_modloop_signature=$root/content/pem-modloop-signature
+    head -c 512 /etc/apk/keys/300k.rsa.pub > "$pem_modloop_signature"
+    [ "$(file_bytes "$pem_modloop_signature")" -eq 512 ] \
+        || fail SELF_TEST_FIXTURE_INVALID "PEM modloop signature fixture has the wrong width"
+    expect_scan_failure INSPECTION_MODLOOP_SIGNATURE_INVALID "$pem_modloop_signature" "$modloop_signature_logical" pem-modloop-signature
+    wrong_path_modloop_signature=image.iso/boot/initramfs-virt.decoded/var/cache/misc/unapproved.rsa.pub
+    wrong_path_modloop_label=wrong-path-modloop-signature
+    expect_scan_failure INSPECTION_PUBLIC_KEY_UNAPPROVED "$valid_modloop_signature" "$wrong_path_modloop_signature" "$wrong_path_modloop_label"
 
     mkdir "$root/apkovl" "$root/cpio" "$root/tar"
     cp "$root/content/secret.txt" "$root/apkovl/payload"
