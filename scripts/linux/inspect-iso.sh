@@ -850,7 +850,7 @@ run_hostile_fixture_self_test() {
     printf '%s\n' 'outside scratch sentinel' > "$outside_scratch_sentinel"
     sentinel_before=$(sha256_file "$outside_scratch_sentinel")
     stat -c '%f:%s:%Y' "$outside_scratch_sentinel" > "$sandbox/metadata.before"
-    find "$sandbox" -mindepth 1 -maxdepth 1 ! -name probe -printf '%f\t%y\t%s\n' | LC_ALL=C sort > "$sandbox/inventory.before"
+    find "$sandbox" -mindepth 1 -maxdepth 1 ! -name probe -exec stat -c '%n:%f:%s' {} \; | LC_ALL=C sort > "$sandbox/inventory.before"
     for hostile in absolute traversal control-character device FIFO socket escaping-symlink escaping-hardlink cyclic-link link-parent duplicate-type oversized pathname member-count total-expanded-byte; do
         manifest=$probe/$hostile.manifest
         case "$hostile" in
@@ -885,7 +885,7 @@ run_hostile_fixture_self_test() {
     [ "$(sha256_file "$outside_scratch_sentinel")" = "$sentinel_before" ] \
         || fail SELF_TEST_ESCAPE "hostile graph changed the adjacent sentinel bytes"
     stat -c '%f:%s:%Y' "$outside_scratch_sentinel" > "$sandbox/metadata.after"
-    find "$sandbox" -mindepth 1 -maxdepth 1 ! -name probe -printf '%f\t%y\t%s\n' | LC_ALL=C sort > "$sandbox/inventory.after"
+    find "$sandbox" -mindepth 1 -maxdepth 1 ! -name probe -exec stat -c '%n:%f:%s' {} \; | LC_ALL=C sort > "$sandbox/inventory.after"
     cmp "$sandbox/metadata.before" "$sandbox/metadata.after" >/dev/null \
         || fail SELF_TEST_ESCAPE "hostile graph changed adjacent sentinel metadata"
     # Inventory snapshots include their own snapshot filenames, so compare the
