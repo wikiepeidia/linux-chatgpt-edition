@@ -889,7 +889,8 @@ run_hostile_fixture_self_test() {
 
     modloop_signature_logical=image.iso/boot/initramfs-virt.decoded/var/cache/misc/modloop-virt.SIGN.RSA.300k.rsa.pub
     valid_modloop_signature=$root/content/valid-modloop-signature
-    dd if=/dev/zero of="$valid_modloop_signature" bs=512 count=1 2>/dev/null
+    awk 'BEGIN { for (i = 0; i < 512; i++) printf "S" }' > "$valid_modloop_signature" \
+        || fail SELF_TEST_FIXTURE_INVALID "valid modloop signature fixture generation failed"
     [ "$(file_bytes "$valid_modloop_signature")" -eq 512 ] \
         || fail SELF_TEST_FIXTURE_INVALID "valid modloop signature fixture has the wrong width"
     valid_modloop_error=$root/valid-modloop-signature.error
