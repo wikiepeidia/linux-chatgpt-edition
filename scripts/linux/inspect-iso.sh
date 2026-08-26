@@ -204,7 +204,8 @@ scan_regular_bytes() {
     scan_text_value "$logical"
     private_pattern='BEGIN [A-Z0-9 ]*PRIVATE KEY'
     credential_pattern='(FICT[A-Z0-9_]*SECRET_TOKEN|OPENAI_API_KEY|AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN|PASSWORD)[=:][[:space:]]*[A-Za-z0-9_./+~-]{12,}'
-    host_pattern='([A-Za-z]:\\Users\\|\\\\[^\\[:space:]]+\\[^\\[:space:]]+|/run/300k-secrets|wikiepeidia)'
+    windows_unc_pattern="(^|[[:space:]\"'=:])\\\\\\\\[A-Za-z0-9._-]+\\\\[A-Za-z0-9\$._-]+(\\\\[^[:space:]\"']*)?"
+    host_pattern="([A-Za-z]:\\\\Users\\\\|$windows_unc_pattern|/run/300k-secrets|wikiepeidia)"
     if grep -aEiq "$private_pattern|$credential_pattern|$host_pattern" "$file"; then
         fail INSPECTION_SECRET_FOUND "decoded regular bytes contain a private credential or host-management marker logical=$logical"
     fi
@@ -794,6 +795,18 @@ run_hostile_fixture_self_test() {
         if grep -aF "$marker" "$compressed_secret_fixture" >/dev/null; then fail SELF_TEST_FIXTURE_INVALID "compressed secret fixture leaked plaintext into outer bytes"; fi
         expect_probe_failure INSPECTION_SECRET_FOUND "$compressed_secret_fixture" compressed "compressed-$(basename "$compressed_secret_fixture")"
     done
+    printf '%s\n' '\\${root}\${entry}' > "$root/content/clean-escaped-shell"
+    "$gzip_command" -n -c -- "$root/content/clean-escaped-shell" > "$root/clean-escaped-shell.gz"
+    fixture_reset_state
+    clean_escape_error=$root/clean-escaped-shell.error
+    if ! inspect_file "$root/clean-escaped-shell.gz" clean-escaped-shell 0 compressed > /dev/null 2> "$clean_escape_error"; then
+        clean_escape_actual=$(sed -n 's/^\([A-Z][A-Z0-9_]*\):.*/\1/p' "$clean_escape_error" | head -n 1)
+        [ -n "$clean_escape_actual" ] || clean_escape_actual=NO_DIAGNOSTIC
+        fail SELF_TEST_WRONG_FAILURE "clean escaped shell syntax failed with $clean_escape_actual"
+    fi
+    printf '\\\\%s\\%s\\%s\n' buildhost.example private_share artifact.iso > "$root/content/host-unc"
+    "$gzip_command" -n -c -- "$root/content/host-unc" > "$root/host-unc.gz"
+    expect_probe_failure INSPECTION_SECRET_FOUND "$root/host-unc.gz" compressed host-unc
 
     mkdir "$root/apkovl" "$root/cpio" "$root/tar"
     cp "$root/content/secret.txt" "$root/apkovl/payload"
