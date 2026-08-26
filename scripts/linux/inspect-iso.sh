@@ -506,9 +506,11 @@ make_iso_manifest() {
     assert_decoder_log_clean iso9660 "$errors"
     awk '
         function clean(value) { gsub(/^\047|\047$/, "", value); sub(/^\//, "", value); sub(/^\.\//, "", value); return value }
-        /^[bcdlps-][rwxStTs-]{9}[[:space:]]/ {
-            type=substr($1,1,1); size=(type == "-" ? $5 : 0); target=""
-            if (type == "-") type="f"; else if (type == "d") type="d"; else if (type == "l") type="l"; else { print "unsupported ISO type" > "/dev/stderr"; exit 2 }
+        # xorriso uses type e for the byte-bearing El Torito catalog and may
+        # append one closed ACL/hidden-namespace indicator to the mode field.
+        /^[bcdelps-][rwxStTs-]{9}[+IJAHijah]?[[:space:]]/ {
+            type=substr($1,1,1); size=((type == "-" || type == "e") ? $5 : 0); target=""
+            if (type == "-" || type == "e") type="f"; else if (type == "d") type="d"; else if (type == "l") type="l"; else { print "unsupported ISO type" > "/dev/stderr"; exit 2 }
             if (type == "l") { if ($(NF-1) != "->") { print "ambiguous ISO link" > "/dev/stderr"; exit 2 }; target=clean($NF); path=clean($(NF-2)) }
             else path=clean($NF)
             if (path == "") next
