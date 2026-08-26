@@ -222,6 +222,12 @@ contains_private_key() {
     ' "$1"
 }
 
+PROJECT_MODLOOP_SIGNATURE_LOGICAL=image.iso/boot/initramfs-virt.decoded/var/cache/misc/modloop-virt.SIGN.RSA.300k.rsa.pub
+
+is_project_modloop_signature_path() {
+    [ "$1" = "$PROJECT_MODLOOP_SIGNATURE_LOGICAL" ]
+}
+
 assert_project_modloop_signature_shape() {
     file=$1
     signature_bytes=$(file_bytes "$file")
@@ -248,16 +254,17 @@ scan_regular_bytes() {
     if contains_private_key "$file" || grep -aEiq "$credential_pattern|$host_pattern" "$file"; then
         fail INSPECTION_SECRET_FOUND "decoded regular bytes contain a private credential or host-management marker logical=$logical"
     fi
+    if is_project_modloop_signature_path "$logical"; then
+        # Alpine stores this one detached RSA-4096 modloop signature under
+        # the public signer suffix. It is opaque signature data, not a key.
+        assert_project_modloop_signature_shape "$file"
+        return 0
+    fi
     case "$logical" in
         */.SIGN.RSA.*.rsa.pub)
             # APK v2 signature members use a public-key-looking suffix but
             # contain only a signature blob. Their enclosing APK bytes were
             # already admitted by the verified retained-repository manifest.
-            ;;
-        image.iso/boot/initramfs-virt.decoded/var/cache/misc/modloop-virt.SIGN.RSA.300k.rsa.pub)
-            # Alpine stores this one detached RSA-4096 modloop signature under
-            # the public signer suffix. It is opaque signature data, not a key.
-            assert_project_modloop_signature_shape "$file"
             ;;
         *.rsa.pub)
             basename=${logical##*/}
@@ -536,6 +543,11 @@ detect_format() {
 
 role_for_path() {
     path=$1
+    logical=$2
+    if is_project_modloop_signature_path "$logical"; then
+        printf '%s\n' auto
+        return 0
+    fi
     case "$path" in
         *.iso) printf '%s\n' iso ;;
         *.apk) printf '%s\n' apk ;;
@@ -681,7 +693,7 @@ inspect_archive_members() {
             materialized=$(stream_regular_member "$kind" "$archive" "$member" "$size")
             member_logical=$logical/$member
             scan_regular_bytes "$materialized" "$member_logical"
-            role=$(role_for_path "$member")
+            role=$(role_for_path "$member" "$member_logical")
             inspect_file "$materialized" "$member_logical" $((depth + 1)) "$role"
         )
     done < "$manifest"
@@ -822,6 +834,16 @@ expect_scan_failure() {
     fi
 }
 
+expect_role() {
+    expected_role=$1
+    role_member=$2
+    role_logical=$3
+    role_label=$4
+    actual_role=$(role_for_path "$role_member" "$role_logical")
+    [ "$actual_role" = "$expected_role" ] \
+        || fail SELF_TEST_WRONG_FAILURE "$role_label expected role $expected_role but got $actual_role"
+}
+
 create_iso_fixture() {
     label=$1
     output=$2
@@ -887,18 +909,29 @@ run_hostile_fixture_self_test() {
     "$gzip_command" -n -c -- "$root/content/host-unc" > "$root/host-unc.gz"
     expect_probe_failure INSPECTION_SECRET_FOUND "$root/host-unc.gz" compressed host-unc
 
-    modloop_signature_logical=image.iso/boot/initramfs-virt.decoded/var/cache/misc/modloop-virt.SIGN.RSA.300k.rsa.pub
+    modloop_signature_logical=$PROJECT_MODLOOP_SIGNATURE_LOGICAL
+    modloop_signature_member=var/cache/misc/modloop-virt.SIGN.RSA.300k.rsa.pub
     valid_modloop_signature=$root/content/valid-modloop-signature
     awk 'BEGIN { for (i = 0; i < 512; i++) printf "S" }' > "$valid_modloop_signature" \
         || fail SELF_TEST_FIXTURE_INVALID "valid modloop signature fixture generation failed"
     [ "$(file_bytes "$valid_modloop_signature")" -eq 512 ] \
         || fail SELF_TEST_FIXTURE_INVALID "valid modloop signature fixture has the wrong width"
+    valid_modloop_signature_role=$(role_for_path "$modloop_signature_member" "$modloop_signature_logical")
+    fixture_reset_state
     valid_modloop_error=$root/valid-modloop-signature.error
-    if ! scan_regular_bytes "$valid_modloop_signature" "$modloop_signature_logical" > /dev/null 2> "$valid_modloop_error"; then
+    if ! (
+        scan_regular_bytes "$valid_modloop_signature" "$modloop_signature_logical"
+        inspect_file "$valid_modloop_signature" "$modloop_signature_logical" 0 "$valid_modloop_signature_role"
+    ) > /dev/null 2> "$valid_modloop_error"; then
         valid_modloop_actual=$(sed -n 's/^\([A-Z][A-Z0-9_]*\):.*/\1/p' "$valid_modloop_error" | head -n 1)
         [ -n "$valid_modloop_actual" ] || valid_modloop_actual=NO_DIAGNOSTIC
         fail SELF_TEST_WRONG_FAILURE "valid-modloop-signature failed with $valid_modloop_actual"
     fi
+    near_miss_modloop_signature_logical=image.iso/boot/initramfs-virt.decoded/var/cache/other/modloop-virt.SIGN.RSA.300k.rsa.pub
+    near_miss_modloop_signature_role_label=near-miss-modloop-signature-role
+    expect_role modloop "$modloop_signature_member" "$near_miss_modloop_signature_logical" "$near_miss_modloop_signature_role_label"
+    genuine_modloop_container_role_label=genuine-modloop-container-role
+    expect_role modloop boot/modloop-virt image.iso/boot/modloop-virt "$genuine_modloop_container_role_label"
     short_modloop_signature=$root/content/short-modloop-signature
     head -c 511 "$valid_modloop_signature" > "$short_modloop_signature"
     expect_scan_failure INSPECTION_MODLOOP_SIGNATURE_INVALID "$short_modloop_signature" "$modloop_signature_logical" short-modloop-signature
