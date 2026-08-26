@@ -872,6 +872,11 @@ Add-TestCase -Name 'BUILD-04 Linux core owns package/profile decisions and the Q
     $profile = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'builder/profiles/mkimg.300k.sh')
     Assert-Match -Value $profile -Pattern 'profile_300k_bootstrap'
     Assert-Match -Value $profile -Pattern 'profile_virt'
+    Assert-Match -Value $profile -Pattern 'for _300k_package in \$apks; do[\s\S]{0,300}\[ "\$_300k_package" = alpine-base \][\s\S]{0,300}done' -Message 'The ISO package set must remove the alpine-base meta-package that pulls the broad alpine-keys payload.'
+    foreach ($basePackage in @('alpine-baselayout', 'alpine-conf', 'apk-tools', 'busybox', 'busybox-mdev-openrc', 'busybox-openrc', 'busybox-suid', 'musl-utils', 'openrc')) {
+        Assert-Match -Value $profile -Pattern ([regex]::Escape($basePackage)) -Message "Explicit bootstrap constituent '$basePackage' is missing after alpine-base removal."
+    }
+    Assert-False -Condition ([bool]($profile -match '(?m)^\s*apks=.*\balpine-(release|keys)\b')) -Message 'The published ISO profile must not directly restore broad Alpine release-key packages.'
     Assert-False -Condition ([bool]($profile -match '(?i)apk add|xorriso|mkimage\.sh|linux-virt')) -Message 'The thin profile duplicated upstream assembly decisions.'
     Assert-True -Condition (($profile -split "`n").Count -le 12) -Message 'The bootstrap profile is no longer a thin profile_virt extension.'
 
