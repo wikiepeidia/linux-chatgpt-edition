@@ -233,7 +233,7 @@ assert_project_modloop_signature_shape() {
     ' "$TRUSTED_KEYS")
     [ "$project_key_records" -eq 1 ] \
         || fail INSPECTION_MODLOOP_SIGNATURE_INVALID "project modloop signature does not name exactly one approved signer"
-    if grep -aEq '^-----BEGIN (RSA )?PUBLIC KEY-----$|^-----END (RSA )?PUBLIC KEY-----$' "$file"; then
+    if grep -aEq '^-----BEGIN (RSA )?PUBLIC KEY-----[[:space:]]*$|^-----END (RSA )?PUBLIC KEY-----[[:space:]]*$|^-----BEGIN (RSA )?PUBLIC KEY|^-----END (RSA )?PUBLIC KEY' "$file"; then
         fail INSPECTION_MODLOOP_SIGNATURE_INVALID "project modloop signature contains public-key framing"
     fi
 }
@@ -906,6 +906,23 @@ run_hostile_fixture_self_test() {
     [ "$(file_bytes "$pem_modloop_signature")" -eq 512 ] \
         || fail SELF_TEST_FIXTURE_INVALID "PEM modloop signature fixture has the wrong width"
     expect_scan_failure INSPECTION_MODLOOP_SIGNATURE_INVALID "$pem_modloop_signature" "$modloop_signature_logical" pem-modloop-signature
+    crlf_pem_modloop_signature=$root/content/crlf-pem-modloop-signature
+    printf '%s\r\n' '-----BEGIN PUBLIC KEY-----' > "$crlf_pem_modloop_signature"
+    crlf_pem_prefix_bytes=$(file_bytes "$crlf_pem_modloop_signature")
+    awk -v n=$((512 - crlf_pem_prefix_bytes)) 'BEGIN { for (i = 0; i < n; i++) printf "A" }' >> "$crlf_pem_modloop_signature"
+    [ "$(file_bytes "$crlf_pem_modloop_signature")" -eq 512 ] \
+        || fail SELF_TEST_FIXTURE_INVALID "CRLF PEM modloop signature fixture has the wrong width"
+    expect_scan_failure INSPECTION_MODLOOP_SIGNATURE_INVALID "$crlf_pem_modloop_signature" "$modloop_signature_logical" crlf-pem-modloop-signature
+    partial_pem_modloop_signature=$root/content/partial-pem-modloop-signature
+    printf '%s' '-----BEGIN PUBLIC KEY' > "$partial_pem_modloop_signature"
+    partial_pem_prefix_bytes=$(file_bytes "$partial_pem_modloop_signature")
+    awk -v n=$((512 - partial_pem_prefix_bytes)) 'BEGIN { for (i = 0; i < n; i++) printf "A" }' >> "$partial_pem_modloop_signature"
+    expect_scan_failure INSPECTION_MODLOOP_SIGNATURE_INVALID "$partial_pem_modloop_signature" "$modloop_signature_logical" partial-pem-modloop-signature
+    extra_pem_modloop_signature=$root/content/extra-pem-modloop-signature
+    printf '%s' '-----BEGIN PUBLIC KEY-----X' > "$extra_pem_modloop_signature"
+    extra_pem_prefix_bytes=$(file_bytes "$extra_pem_modloop_signature")
+    awk -v n=$((512 - extra_pem_prefix_bytes)) 'BEGIN { for (i = 0; i < n; i++) printf "A" }' >> "$extra_pem_modloop_signature"
+    expect_scan_failure INSPECTION_MODLOOP_SIGNATURE_INVALID "$extra_pem_modloop_signature" "$modloop_signature_logical" extra-pem-modloop-signature
     wrong_path_modloop_signature=image.iso/boot/initramfs-virt.decoded/var/cache/misc/unapproved.rsa.pub
     wrong_path_modloop_label=wrong-path-modloop-signature
     expect_scan_failure INSPECTION_PUBLIC_KEY_UNAPPROVED "$valid_modloop_signature" "$wrong_path_modloop_signature" "$wrong_path_modloop_label"
