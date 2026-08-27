@@ -1,5 +1,5 @@
 ---
-status: awaiting_human_verify
+status: resolved
 trigger: "Corrected Deadline MVP applies its apkovl and hostname but reaches login without ROOTFS_READY or graphical runtime"
 created: 2026-08-28
 updated: 2026-08-28T02:44:00+07:00
@@ -38,7 +38,7 @@ tdd_checkpoint:
   test_name: "BusyBox live-user locking is idempotent before ROOTFS readiness"
   status: "green"
   failure_output: "Prior RED: RESULT scope=RuntimeStatic passed=8 failed=1; GREEN: RESULT scope=RuntimeStatic passed=9 failed=0"
-next_action: "Await a separately authorized rebuild from commit `cc612a4` and real-guest verification of ordered ROOTFS_READY/X_READY/UI_READY/TERM_EXEC_OK markers; do not archive this session or update LATEST/LKG before that evidence exists."
+next_action: "Resolved and archived after rebuilt-guest proof of ROOTFS_READY. Track the later tty1 helper-argv failure independently as `tty1-autologin-argv`; do not conflate it with this startup defect."
 bug_class: bohrbug
 - constraints:
     - preserve_all_candidates_attempts_latest_lkg: true
@@ -48,6 +48,11 @@ bug_class: bohrbug
     - promotion_without_gui_and_pty_proof: forbidden
 
 ## Evidence
+
+- timestamp: 2026-08-28
+  checked: Rebuilt-guest verification from committed fix `cc612a4`
+  found: Candidate `deadline-bade6e8baa9d` (ISO SHA-256 `22e05e4d383c1e2e4d68543178a2ba27c14c46ab15f085f5d479af3a6e67f50d`, 183,500,800 bytes, source `a084138`) emitted exactly one unique `300K_STAGE=ROOTFS_READY` in ordinary BIOS optical attempt `feb8490977c24c398cabb5162f07cc66`, followed by hostname-correct `300k` login output.
+  implication: The rebuilt guest crossed this session's exact failure boundary, confirming the BusyBox relock root cause and `cc612a4` fix end to end. The later absence of X/UI/TERM is a distinct tty1 helper-argv defect and does not reopen this resolved ROOTFS session.
 
 - timestamp: 2026-08-28T01:12:00+07:00
   checked: Debug knowledge base and authored startup chain
@@ -136,7 +141,8 @@ bug_class: bohrbug
     revert_and_reconfirm: { result: pass, bug_returned_on_revert: true, fixed_on_reapply: true }
     artifact_immutability: { result: pass, latest_sha256: "34cb52ca77d0a6e679aa10a65aa34ff7131eb5cedb0796660d049ffbc1f297a7", candidate_iso_sha256: "c7d40c23fd78d7d07f899ea89e680292cf662b7c5acc752fbe0b719402b71bae" }
     guardrail_verdict: accepted
-    end_to_end_guest: { result: pending, reason: "rebuild and QEMU explicitly forbidden in this offline-fix task" }
+    end_to_end_guest: { result: pass, candidate: "deadline-bade6e8baa9d", iso_sha256: "22e05e4d383c1e2e4d68543178a2ba27c14c46ab15f085f5d479af3a6e67f50d", iso_bytes: 183500800, source_commit: "a084138", attempt: "feb8490977c24c398cabb5162f07cc66", observed: "exactly one unique 300K_STAGE=ROOTFS_READY and hostname 300k" }
+    downstream_boundary: { result: separate_debug_required, slug: "tty1-autologin-argv", evidence: "same 900-second attempt emitted no X/UI/TERM after ROOTFS_READY" }
     commit: "cc612a4"
 - oracle_type: derived (exact pinned BusyBox/OpenRC runtime contract)
 - tdd_status: green

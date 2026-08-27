@@ -33,3 +33,13 @@ Resolved debug sessions. Used by `gsd-debugger` to surface known-pattern hypothe
 - **Why not caught:** Existing gates checked only apkovl presence and deterministic source, not tar member namespace, initramfs lifecycle completeness, device-manager exclusivity, hostname, or ancestor modes.
 - **Recurrence guard:** Regression test `tests/deadline/run.ps1` — `Apkovl member paths and lifecycle survive diskless package install`; focused dot-operand mutant killed, RuntimeStatic 8/8, Deadline AllStatic 14/14, and Phase 1 Unit 27/27.
 ---
+
+## rootfs-ready-not-emitted — Redundant BusyBox account relock aborted local startup
+- **Date:** 2026-08-28
+- **Error patterns:** hostname-correct `300k login:`, zero `ROOTFS_READY`, silent OpenRC local failure, `passwd -l`, already locked shadow entry
+- **Root cause(s):** BusyBox `adduser -D` created `chatgpt` with an already locked shadow password; the unconditional `passwd -l chatgpt` returned nonzero under `set -e`, aborting `300k.start` before its marker. OpenRC `local` redirected the child diagnostic and returned success, masking the abort.
+- **Fix:** Guard the one fallback relock with a BusyBox-awk shadow check that treats fields beginning with `!` (including `!` and `!!`) as already locked.
+- **Files changed:** `builder/apkovl/rootfs/etc/local.d/300k.start`, `tests/deadline/run.ps1`
+- **Why not caught:** RuntimeStatic treated the presence of `passwd -l` as a security proxy without modeling BusyBox's already-locked `adduser -D` state or redundant relock exit status; OpenRC suppressed the runtime diagnostic.
+- **Recurrence guard:** `BusyBox live-user locking is idempotent before ROOTFS readiness`; RED 8/9, GREEN 9/9, exact unconditional-relock mutant killed, Deadline AllStatic 15/15, Phase 1 Unit 27/27, then rebuilt guest emitted exactly one `ROOTFS_READY` marker.
+---
