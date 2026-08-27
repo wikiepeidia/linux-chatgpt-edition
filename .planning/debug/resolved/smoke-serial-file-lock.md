@@ -132,6 +132,10 @@ updated: 2026-08-27T23:17:22.9876487+07:00
   checked: final code/test/documentation commit
   found: Commit `b609302085e5cfe5789fda3963500d6da0b07366` contains only the verified reader, recovery, tests, and recovery documentation; the worktree otherwise contains only this debug session before archival.
   implication: The minimal fix is atomically recorded and ready for the separate planning-resolution commit.
+- timestamp: 2026-08-27T23:17:23+07:00
+  checked: archive, knowledge-base, and semantic-index disposition
+  found: Session archived under `resolved/`; knowledge-base entry committed. Project configuration has `mempalace.enabled=false`, so semantic indexing was skipped and `knowledge-base.md` remains the durable recall fallback.
+  implication: Future debug sessions can recall the verified pattern without requiring an unavailable semantic store.
 
 ## Eliminated
 
