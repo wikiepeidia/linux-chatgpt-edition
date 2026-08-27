@@ -221,7 +221,7 @@ Add-TestCase -Name 'BUILD-03 El Torito catalog bytes are bounded cross-checked a
     Assert-Match -Value $source -Pattern 'expect_catalog_preflight_failure[\s\S]*materializations[\s\S]*-eq 0' -Message 'Every hostile catalog metadata fixture must fail before any byte materialization.'
 }
 
-Add-TestCase -Name 'BUILD-03 UEFI tree recognizes exact Alpine lowercase namespace only' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
+Add-TestCase -Name 'BUILD-03 UEFI tree requires the exact Alpine lowercase regular loader' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
     $inspectorPath = Join-Path $script:RepositoryRoot 'scripts/linux/inspect-iso.sh'
     $source = (Get-Content -Raw -LiteralPath $inspectorPath).Replace("`r`n", "`n")
     $functionMatch = [regex]::Match($source, '(?ms)^manifest_has_uefi_tree\(\) \{.*?^\}')
@@ -247,12 +247,13 @@ manifest=$work/manifest
 
 write_member() {
     member_type=$1
-    member_path=$2
-    printf 'iso:00000001\t%s\t0\t%s\t\n' "$member_type" "$member_path" > "$manifest"
+    member_size=$2
+    member_path=$3
+    printf 'iso:00000001\t%s\t%s\t%s\t\n' "$member_type" "$member_size" "$member_path" > "$manifest"
 }
 
 expect_present() {
-    write_member "$1" "$2"
+    write_member "$1" "$2" "$3"
     manifest_has_uefi_tree "$manifest" || {
         printf '%s\n' "expected UEFI path was rejected" >&2
         exit 91
@@ -260,23 +261,23 @@ expect_present() {
 }
 
 expect_absent() {
-    write_member "$1" "$2"
+    write_member "$1" "$2" "$3"
     if manifest_has_uefi_tree "$manifest"; then
         printf '%s\n' "hostile UEFI near-miss was accepted" >&2
         exit 92
     fi
 }
 
-expect_present f efi/boot/bootx64.efi
-expect_present f EFI/BOOT/BOOTX64.EFI
-expect_present d efi/boot/grub
+expect_present f 847872 efi/boot/bootx64.efi
 
-expect_absent d efi/boot
-expect_absent f Efi/Boot/bootx64.efi
-expect_absent f xefi/boot/bootx64.efi
-expect_absent f efi/bootleg/bootx64.efi
-expect_absent f boot/grub/efi.img
-expect_absent l efi/boot/bootx64.efi
+expect_absent f 847872 EFI/BOOT/BOOTX64.EFI
+expect_absent d 0 efi/boot
+expect_absent d 0 efi/boot/bootx64.efi
+expect_absent l 0 efi/boot/bootx64.efi
+expect_absent f 0 efi/boot/bootx64.efi
+expect_absent f 847872 efi/boot/bootaa64.efi
+expect_absent f 847872 efi/boot/bootx64.efi.bak
+expect_absent f 847872 nested/efi/boot/bootx64.efi
 printf '%s\n' UEFI_TREE_PATH_PASS
 '@.Replace('__MANIFEST_HAS_UEFI_TREE__', $functionMatch.Value)
 
