@@ -319,6 +319,7 @@ assert_root_confined_path() {
 
 validate_graph_file() {
     manifest=$1
+    container_kind=${2:-generic}
     current_members=$(counter_get members)
     current_bytes=$(counter_get expanded_bytes)
     summary=$OWNED_ROOT/graph-summary
@@ -328,7 +329,8 @@ validate_graph_file() {
         -v max_file="$MAX_FILE_BYTES" \
         -v max_total="$MAX_TOTAL_EXPANDED_BYTES" \
         -v current_members="$current_members" \
-        -v current_bytes="$current_bytes" '
+        -v current_bytes="$current_bytes" \
+        -v container_kind="$container_kind" '
         function die(message) { print message > "/dev/stderr"; bad=1; exit 2 }
         function parent(path, at) { at=match(path, /\/[^\/]*$/); return at ? substr(path,1,at-1) : "." }
         function resolve(path, target, base,n,i,part,out,top) {
@@ -352,18 +354,23 @@ validate_graph_file() {
         {
             id=$1; type=$2; size=$3; path=$4; target=(NF >= 5 ? $5 : "")
             if (id !~ /^[A-Za-z0-9._:+-]+$/ || seen_id[id]++) die("duplicate or unsafe stable source identifier")
-            if (type !~ /^[dflh]$/) die("unsupported member type")
+            if (type !~ /^[deflh]$/) die("unsupported member type")
+            if (type == "e" && (container_kind != "iso9660" || id !~ /^iso:/)) die("El Torito catalog type is only valid in an ISO manifest")
             if (path == "" || path == "." || path ~ /^\// || path ~ /\/\// || path ~ /(^|\/)\.\.?($|\/)/ || path ~ /(^|\/)-/ || path ~ /[[:cntrl:]]/ || path ~ /\\/ || path ~ /[^A-Za-z0-9._+@%\/:,=-]/) die("unsafe member path")
             if (length(path) > max_path) die("member path exceeds configured bound")
             if (seen_path[path]++) die("duplicate canonical member path or type conflict")
             paths[path]=type
             member_path[id]=path
             member_type[id]=type
-            if (type == "f") {
-                if (size !~ /^[0-9]+$/) die("regular member size is not decimal")
-                if (size + 0 > max_file + 0) die("regular member exceeds single-file bound")
+            if (type == "f" || type == "e") {
+                if (size !~ /^[0-9]+$/) die("byte-bearing member size is not decimal")
+                if (size + 0 > max_file + 0) die("byte-bearing member exceeds single-file bound")
                 declared += size
-                regulars++
+                if (type == "f") regulars++
+                else {
+                    if (catalogs++) die("ISO manifest has multiple El Torito catalogs")
+                    if (target !~ /^[0-9]+:[0-9]+$/) die("El Torito catalog extent is malformed")
+                }
             } else if (size != "0") die("non-regular member declares bytes")
             if (type ~ /^[lh]$/) {
                 if (target == "" || length(target) > max_path) die("link target is empty or overlong")
@@ -371,7 +378,7 @@ validate_graph_file() {
                 else canonical=resolve(path,target)
                 if (canonical == "!") die("link target escapes or is malformed")
                 link_target[path]=canonical
-            } else if (target != "") die("non-link has a link target")
+            } else if (type != "e" && target != "") die("non-link has a link target")
             members++
         }
         END {
@@ -414,7 +421,180 @@ validate_graph_file() {
 }
 
 preflight_graph() {
-    validate_graph_file "$1"
+    validate_graph_file "$1" "${2:-generic}"
+}
+
+is_canonical_decimal() {
+    value=$1
+    case "$value" in
+        ''|*[!0-9]*|0[0-9]*) return 1 ;;
+    esac
+    [ "${#value}" -le 18 ]
+}
+
+parse_iso_catalog_report() {
+    iso=$1
+    metadata=$2
+    raw=$OWNED_ROOT/iso-catalog.raw
+    errors=$OWNED_ROOT/iso-catalog.errors
+    iso_command=$(tool_field iso command)
+    "$iso_command" -report_about WARNING -indev "$iso" -report_el_torito plain \
+        > "$raw" 2> "$errors" \
+        || fail INSPECTION_ISO_CATALOG_INVALID "xorriso could not report El Torito metadata"
+    assert_decoder_log_clean iso9660 "$errors"
+    awk '
+        function die(message) { print message > "/dev/stderr"; bad=1; exit 2 }
+        BEGIN {
+            catalog_prefix="El Torito catalog  : "
+            path_prefix="El Torito cat path : "
+        }
+        index($0, catalog_prefix) == 1 {
+            if (++catalog_count != 1) die("duplicate El Torito catalog extent")
+            value=substr($0, length(catalog_prefix) + 1)
+            if (value !~ /^[0-9]+[[:space:]]+[0-9]+$/) die("malformed El Torito catalog extent")
+            fields=split(value, part, /[[:space:]]+/)
+            if (fields != 2) die("ambiguous El Torito catalog extent")
+            lba=part[1]; blocks=part[2]
+            next
+        }
+        index($0, path_prefix) == 1 {
+            if (++path_count != 1) die("duplicate El Torito catalog path")
+            path=substr($0, length(path_prefix) + 1)
+            if (path !~ /^\/[A-Za-z0-9._+@%\/:,=-]+$/) die("unsafe El Torito catalog path")
+            sub(/^\//, "", path)
+            next
+        }
+        /^El Torito catalog/ { die("unrecognized El Torito catalog report line") }
+        /^El Torito cat path/ { die("unrecognized El Torito catalog path report line") }
+        END {
+            if (bad) exit 2
+            if (catalog_count != path_count) die("partial El Torito catalog report")
+            if (catalog_count == 1) printf "%s\t%s\t%s\n", path, lba, blocks
+        }
+    ' "$raw" > "$metadata" \
+        || fail INSPECTION_ISO_CATALOG_INVALID "xorriso El Torito metadata was ambiguous or malformed"
+}
+
+validate_iso_catalog_manifest() {
+    iso=$1
+    manifest=$2
+    metadata=$3
+    catalog_fail_code=INSPECTION_ISO_CATALOG_INVALID
+    iso_bytes=$(file_bytes "$iso")
+    is_canonical_decimal "$iso_bytes" \
+        || fail "$catalog_fail_code" "ISO byte size is not a bounded canonical decimal"
+
+    metadata_lines=$(wc -l < "$metadata" | tr -d ' ')
+    case "$metadata_lines" in 0|1) ;; *) fail "$catalog_fail_code" "El Torito report has duplicate metadata records" ;; esac
+    report_path=
+    report_lba=
+    report_blocks=
+    tab=$(printf '\t')
+    if [ "$metadata_lines" -eq 1 ]; then
+        IFS="$tab" read -r report_path report_lba report_blocks < "$metadata" \
+            || fail "$catalog_fail_code" "El Torito report record is incomplete"
+        [ -n "$report_path" ] && [ -n "$report_lba" ] && [ -n "$report_blocks" ] \
+            || fail "$catalog_fail_code" "El Torito report record is partial"
+    fi
+
+    catalog_record=$OWNED_ROOT/iso-catalog.manifest-record
+    awk -F '\t' '
+        $2 == "e" {
+            if (NF != 5 || ++catalogs != 1) exit 2
+            printf "%s\t%s\t%s\n", $4, $3, $5
+        }
+        END { if (catalogs > 1) exit 2 }
+    ' "$manifest" > "$catalog_record" \
+        || fail "$catalog_fail_code" "ISO manifest has duplicate or malformed catalog records"
+    catalog_records=$(wc -l < "$catalog_record" | tr -d ' ')
+    case "$catalog_records:$metadata_lines" in
+        0:0) return 0 ;;
+        1:1) ;;
+        *) fail "$catalog_fail_code" "ISO listing and El Torito report disagree about catalog presence" ;;
+    esac
+
+    IFS="$tab" read -r manifest_path manifest_size manifest_extent < "$catalog_record" \
+        || fail "$catalog_fail_code" "ISO catalog manifest record is incomplete"
+    case "$manifest_extent" in
+        *:*:*) fail "$catalog_fail_code" "ISO catalog manifest extent is ambiguous" ;;
+        *:*) manifest_lba=${manifest_extent%%:*}; manifest_blocks=${manifest_extent#*:} ;;
+        *) fail "$catalog_fail_code" "ISO catalog manifest extent is absent" ;;
+    esac
+    is_canonical_decimal "$report_lba" && is_canonical_decimal "$report_blocks" \
+        && is_canonical_decimal "$manifest_lba" && is_canonical_decimal "$manifest_blocks" \
+        && is_canonical_decimal "$manifest_size" \
+        || fail "$catalog_fail_code" "ISO catalog extent or size is not a bounded canonical decimal"
+    [ "$report_blocks" -gt 0 ] \
+        || fail "$catalog_fail_code" "ISO catalog block count is zero"
+    [ "$manifest_path" = "$report_path" ] \
+        || fail "$catalog_fail_code" "ISO catalog path differs from the El Torito report"
+    [ "$manifest_lba" = "$report_lba" ] && [ "$manifest_blocks" = "$report_blocks" ] \
+        || fail "$catalog_fail_code" "ISO catalog extent differs from the El Torito report"
+
+    iso_sectors=$((iso_bytes / 2048))
+    [ "$report_lba" -le "$iso_sectors" ] \
+        || fail "$catalog_fail_code" "ISO catalog starts outside the image"
+    [ "$report_blocks" -le $((iso_sectors - report_lba)) ] \
+        || fail "$catalog_fail_code" "ISO catalog interval extends outside the image"
+    expected_size=$((report_blocks * 2048))
+    [ "$manifest_size" -eq "$expected_size" ] \
+        || fail "$catalog_fail_code" "ISO catalog listing size differs from its exact sector interval"
+}
+
+stream_iso_boot_catalog() {
+    container=$1
+    expected_size=$2
+    extent=$3
+    dd_command=/bin/dd
+    # The /bin/dd reader runs under ulimit -f only after
+    # assert_root_confined_path approves its exclusive partial destination.
+    case "$extent" in
+        *:*:*) fail INSPECTION_ISO_CATALOG_INVALID "catalog extent is ambiguous at materialization" ;;
+        *:*) catalog_lba=${extent%%:*}; catalog_blocks=${extent#*:} ;;
+        *) fail INSPECTION_ISO_CATALOG_INVALID "catalog extent is absent at materialization" ;;
+    esac
+    is_canonical_decimal "$catalog_lba" && is_canonical_decimal "$catalog_blocks" \
+        && is_canonical_decimal "$expected_size" && [ "$catalog_blocks" -gt 0 ] \
+        || fail INSPECTION_ISO_CATALOG_INVALID "catalog extent is malformed at materialization"
+    [ "$expected_size" -eq $((catalog_blocks * 2048)) ] \
+        || fail INSPECTION_ISO_CATALOG_INVALID "catalog interval changed after preflight"
+
+    next=$(( $(counter_get materializations) + 1 ))
+    mkdir -p -m 0700 -- "$OWNED_ROOT/materialized"
+    [ -d "$OWNED_ROOT/materialized" ] && [ ! -L "$OWNED_ROOT/materialized" ] \
+        || fail INSPECTION_PARENT_INVALID "materialization root is not a real directory"
+    partial=$OWNED_ROOT/materialized/$next.partial
+    final=$OWNED_ROOT/materialized/$next
+    assert_root_confined_path "$partial"
+    remaining=$((MAX_TOTAL_EXPANDED_BYTES - $(counter_get expanded_bytes)))
+    [ "$expected_size" -le "$remaining" ] && [ "$expected_size" -le "$MAX_FILE_BYTES" ] \
+        || fail INSPECTION_STREAM_LIMIT "catalog bytes exceed the reserved bounded sink"
+    sink_blocks=$((expected_size / 512))
+    [ "$sink_blocks" -gt 0 ] \
+        || fail INSPECTION_STREAM_LIMIT "catalog bounded sink allowance is empty"
+    error_log=$OWNED_ROOT/catalog-decoder-error
+    : > "$error_log"
+    status=0
+    (ulimit -f "$sink_blocks"; "$dd_command" if="$container" bs=2048 skip="$catalog_lba" count="$catalog_blocks" status=none) \
+        > "$partial" 2> "$error_log" || status=$?
+    if [ "$status" -ne 0 ]; then
+        decoder_error_bytes=$(file_bytes "$error_log")
+        decoder_error_sha256=$(sha256_file "$error_log")
+        fail INSPECTION_DECODE_FAILED "ISO catalog interval reader failed exit=$status stderr_bytes=$decoder_error_bytes stderr_sha256=$decoder_error_sha256"
+    fi
+    assert_decoder_log_clean catalog "$error_log"
+    [ -f "$partial" ] && [ ! -L "$partial" ] \
+        || fail INSPECTION_OUTPUT_TYPE "catalog decoder output is not one regular file"
+    actual=$(file_bytes "$partial")
+    [ "$actual" -eq "$expected_size" ] \
+        || fail INSPECTION_SIZE_MISMATCH "catalog materialization differs from its preflight declaration"
+    expanded=$(( $(counter_get expanded_bytes) + actual ))
+    [ "$expanded" -le "$MAX_TOTAL_EXPANDED_BYTES" ] \
+        || fail INSPECTION_TOTAL_LIMIT "catalog bytes exceeded the expanded-byte allowance"
+    mv "$partial" "$final"
+    counter_set expanded_bytes "$expanded"
+    counter_set materializations "$next"
+    printf '%s\n' "$final"
 }
 
 stream_regular_member() {
@@ -565,19 +745,29 @@ role_for_path() {
 make_iso_manifest() {
     iso=$1
     manifest=$2
+    catalog_metadata=$OWNED_ROOT/catalog-${manifest##*/}
+    parse_iso_catalog_report "$iso" "$catalog_metadata"
+    catalog_lba=
+    catalog_blocks=
+    tab=$(printf '\t')
+    if [ -s "$catalog_metadata" ]; then
+        IFS="$tab" read -r catalog_path catalog_lba catalog_blocks < "$catalog_metadata" \
+            || fail INSPECTION_ISO_CATALOG_INVALID "El Torito metadata could not be loaded"
+    fi
     raw=$OWNED_ROOT/iso-list.raw
     errors=$OWNED_ROOT/iso-list.errors
     iso_command=$(tool_field iso command)
     "$iso_command" -report_about WARNING -indev "$iso" -find / -exec lsdl \
         > "$raw" 2> "$errors" || fail INSPECTION_ISO_LIST_FAILED "xorriso could not list the complete ISO graph"
     assert_decoder_log_clean iso9660 "$errors"
-    awk '
+    awk -v catalog_lba="$catalog_lba" -v catalog_blocks="$catalog_blocks" '
         function clean(value) { gsub(/^\047|\047$/, "", value); sub(/^\//, "", value); sub(/^\.\//, "", value); return value }
         # xorriso uses type e for the byte-bearing El Torito catalog and may
         # append one closed ACL/hidden-namespace indicator to the mode field.
         /^[bcdelps-][rwxStTs-]{9}[+IJAHijah]?[[:space:]]/ {
             type=substr($1,1,1); size=((type == "-" || type == "e") ? $5 : 0); target=""
-            if (type == "-" || type == "e") type="f"; else if (type == "d") type="d"; else if (type == "l") type="l"; else { print "unsupported ISO type" > "/dev/stderr"; exit 2 }
+            if (type == "-") type="f"; else if (type == "e") { type="e"; if (catalog_lba != "" && catalog_blocks != "") target=catalog_lba ":" catalog_blocks }
+            else if (type == "d") type="d"; else if (type == "l") type="l"; else { print "unsupported ISO type" > "/dev/stderr"; exit 2 }
             if (type == "l") { if ($(NF-1) != "->") { print "ambiguous ISO link" > "/dev/stderr"; exit 2 }; target=clean($NF); path=clean($(NF-2)) }
             else path=clean($NF)
             if (path == "") next
@@ -684,10 +874,22 @@ inspect_archive_members() {
         squashfs) make_squashfs_manifest "$archive" "$manifest" ;;
         *) fail INSPECTION_FORMAT_UNSUPPORTED "container manifest format is unsupported" ;;
     esac
-    preflight_graph "$manifest"
+    if [ "$kind" = iso9660 ]; then
+        validate_iso_catalog_manifest "$archive" "$manifest" "$OWNED_ROOT/catalog-${manifest##*/}"
+    fi
+    preflight_graph "$manifest" "$kind"
     counter_set containers $(( $(counter_get containers) + 1 ))
     tab=$(printf '\t')
     while IFS="$tab" read -r id type size member target; do
+        if [ "$type" = e ]; then
+            (
+                materialized=$(stream_iso_boot_catalog "$archive" "$size" "$target")
+                member_logical=$logical/$member
+                scan_regular_bytes "$materialized" "$member_logical"
+                inspect_file "$materialized" "$member_logical" $((depth + 1)) leaf
+            )
+            continue
+        fi
         [ "$type" = f ] || continue
         (
             materialized=$(stream_regular_member "$kind" "$archive" "$member" "$size")
@@ -710,7 +912,7 @@ inspect_file() {
     require_regular_member "$file"
     format=$(detect_format "$file")
     case "$role:$format" in
-        iso:iso9660|apk:gzip|apk:tar|apkovl:gzip|apkovl:tar|initramfs:gzip|initramfs:xz|initramfs:zstd|initramfs:lz4|initramfs:cpio|modloop:squashfs|modloop:gzip|modloop:xz|modloop:zstd|modloop:lz4|archive:tar|archive:gzip|cpio-chain:cpio|cpio-chain:gzip|cpio-chain:xz|cpio-chain:zstd|cpio-chain:lz4|compressed:gzip|compressed:xz|compressed:zstd|compressed:lz4|auto:*) ;;
+        iso:iso9660|apk:gzip|apk:tar|apkovl:gzip|apkovl:tar|initramfs:gzip|initramfs:xz|initramfs:zstd|initramfs:lz4|initramfs:cpio|modloop:squashfs|modloop:gzip|modloop:xz|modloop:zstd|modloop:lz4|archive:tar|archive:gzip|cpio-chain:cpio|cpio-chain:gzip|cpio-chain:xz|cpio-chain:zstd|cpio-chain:lz4|compressed:gzip|compressed:xz|compressed:zstd|compressed:lz4|leaf:leaf|auto:*) ;;
         *) fail INSPECTION_EXPECTED_ROLE_MISMATCH "$logical does not decode as its required Alpine role" ;;
     esac
     case "$format" in
@@ -727,7 +929,7 @@ inspect_file() {
             inspect_archive_members "$format" "$file" "$logical" "$depth"
             ;;
         leaf)
-            case "$role" in auto) : ;; *) fail INSPECTION_UNSUPPORTED_MAGIC "$logical ended before its required container role" ;; esac
+            case "$role" in auto|leaf) : ;; *) fail INSPECTION_UNSUPPORTED_MAGIC "$logical ended before its required container role" ;; esac
             ;;
         *) fail INSPECTION_FORMAT_UNSUPPORTED "magic detector returned an unsupported format" ;;
     esac
@@ -818,6 +1020,32 @@ expect_probe_failure() {
     fi
 }
 
+expect_catalog_preflight_failure() {
+    expected=$1
+    label=$2
+    iso=$3
+    manifest=$4
+    metadata=$5
+    kind=$6
+    fixture_reset_state
+    error=$OWNED_ROOT/$label.error
+    if (
+        if [ "$kind" = iso9660 ]; then
+            validate_iso_catalog_manifest "$iso" "$manifest" "$metadata"
+        fi
+        preflight_graph "$manifest" "$kind"
+    ) > /dev/null 2> "$error"; then
+        fail SELF_TEST_VACUOUS "$label hostile catalog metadata was accepted"
+    fi
+    if ! grep -F "$expected" "$error" >/dev/null; then
+        actual=$(sed -n 's/^\([A-Z][A-Z0-9_]*\):.*/\1/p' "$error" | head -n 1)
+        [ -n "$actual" ] || actual=NO_DIAGNOSTIC
+        fail SELF_TEST_WRONG_FAILURE "$label expected $expected but got $actual"
+    fi
+    [ "$(counter_get materializations)" -eq 0 ] \
+        || fail SELF_TEST_PREMATERIALIZED "$label catalog metadata materialized bytes before rejection"
+}
+
 expect_scan_failure() {
     expected=$1
     file=$2
@@ -852,6 +1080,21 @@ create_iso_fixture() {
     errors=$OWNED_ROOT/$label-create.errors
     "$iso_command" -as mkisofs -quiet -output "$output" "$source" 2> "$errors" \
         || fail SELF_TEST_FIXTURE_INVALID "$label ISO fixture creation failed"
+    assert_decoder_log_clean iso9660 "$errors"
+}
+
+create_bootable_iso_fixture() {
+    label=$1
+    output=$2
+    source=$3
+    catalog_id=$4
+    iso_command=$(tool_field iso command)
+    errors=$OWNED_ROOT/$label-create.errors
+    [ -f "$source/boot/boot.img" ] && [ ! -L "$source/boot/boot.img" ] \
+        || fail SELF_TEST_FIXTURE_INVALID "$label boot image fixture is absent"
+    "$iso_command" -as mkisofs -quiet -output "$output" -eltorito-id "$catalog_id" \
+        -c boot/boot.cat -b boot/boot.img -no-emul-boot "$source" 2> "$errors" \
+        || fail SELF_TEST_FIXTURE_INVALID "$label bootable ISO fixture creation failed"
     assert_decoder_log_clean iso9660 "$errors"
 }
 
@@ -992,6 +1235,26 @@ run_hostile_fixture_self_test() {
     if grep -aF "$marker" "$root/secret.iso" >/dev/null; then fail SELF_TEST_FIXTURE_INVALID "ISO secret fixture contains the raw marker"; fi
     expect_probe_failure INSPECTION_SECRET_FOUND "$root/secret.iso" iso iso9660
 
+    mkdir "$root/bootable-clean-root" "$root/bootable-clean-root/boot"
+    awk 'BEGIN { for (i = 0; i < 2048; i++) printf "B" }' > "$root/bootable-clean-root/boot/boot.img" \
+        || fail SELF_TEST_FIXTURE_INVALID "bootable-clean-catalog boot image generation failed"
+    printf '%s\n' '300K clean bootable catalog fixture' > "$root/bootable-clean-root/clean.txt"
+    create_bootable_iso_fixture bootable-clean-catalog "$root/bootable-clean.iso" "$root/bootable-clean-root" 300K-CLEAN
+    fixture_reset_state
+    bootable_clean_error=$root/bootable-clean-catalog.error
+    if ! inspect_file "$root/bootable-clean.iso" bootable-clean-catalog 0 iso > /dev/null 2> "$bootable_clean_error"; then
+        bootable_clean_actual=$(sed -n 's/^\([A-Z][A-Z0-9_]*\):.*/\1/p' "$bootable_clean_error" | head -n 1)
+        [ -n "$bootable_clean_actual" ] || bootable_clean_actual=NO_DIAGNOSTIC
+        fail SELF_TEST_WRONG_FAILURE "bootable-clean-catalog failed with $bootable_clean_actual"
+    fi
+
+    mkdir "$root/catalog-host-root" "$root/catalog-host-root/boot"
+    awk 'BEGIN { for (i = 0; i < 2048; i++) printf "H" }' > "$root/catalog-host-root/boot/boot.img" \
+        || fail SELF_TEST_FIXTURE_INVALID "catalog-host-marker boot image generation failed"
+    printf '%s\n' '300K clean catalog host fixture' > "$root/catalog-host-root/clean.txt"
+    create_bootable_iso_fixture catalog-host-marker "$root/catalog-host.iso" "$root/catalog-host-root" /run/300k-secrets
+    expect_probe_failure INSPECTION_SECRET_FOUND "$root/catalog-host.iso" iso catalog-host-marker
+
     cp "$root/content/clean.txt" "$root/iso-root/boot/vmlinuz-test"
     mkdir "$root/clean-cpio"
     cp "$root/content/clean.txt" "$root/clean-cpio/payload"
@@ -1026,6 +1289,60 @@ run_hostile_fixture_self_test() {
     sandbox=$root/hostile-sandbox
     probe=$sandbox/probe
     mkdir "$sandbox" "$probe"
+
+    catalog_fixture_iso=$probe/catalog-fixture.iso
+    awk 'BEGIN { for (i = 0; i < 8192; i++) printf "I" }' > "$catalog_fixture_iso" \
+        || fail SELF_TEST_FIXTURE_INVALID "catalog preflight ISO bytes could not be generated"
+    catalog_valid_manifest=$probe/catalog-valid.manifest
+    catalog_valid_metadata=$probe/catalog-valid.metadata
+    printf 'iso:00000001\td\t0\tboot\t\niso:00000002\te\t2048\tboot/boot.cat\t1:1\n' > "$catalog_valid_manifest"
+    printf 'boot/boot.cat\t1\t1\n' > "$catalog_valid_metadata"
+
+    catalog_duplicate_manifest=$probe/catalog-duplicate.manifest
+    printf 'iso:00000001\td\t0\tboot\t\niso:00000002\te\t2048\tboot/boot.cat\t1:1\niso:00000003\te\t2048\tboot/other.cat\t2:1\n' > "$catalog_duplicate_manifest"
+    expect_catalog_preflight_failure INSPECTION_ISO_CATALOG_INVALID catalog-duplicate "$catalog_fixture_iso" "$catalog_duplicate_manifest" "$catalog_valid_metadata" iso9660
+
+    catalog_duplicate_report=$probe/catalog-duplicate-report.metadata
+    printf 'boot/boot.cat\t1\t1\nboot/boot.cat\t1\t1\n' > "$catalog_duplicate_report"
+    expect_catalog_preflight_failure INSPECTION_ISO_CATALOG_INVALID catalog-duplicate-report "$catalog_fixture_iso" "$catalog_valid_manifest" "$catalog_duplicate_report" iso9660
+
+    catalog_missing_report=$probe/catalog-missing.metadata
+    : > "$catalog_missing_report"
+    expect_catalog_preflight_failure INSPECTION_ISO_CATALOG_INVALID catalog-missing "$catalog_fixture_iso" "$catalog_valid_manifest" "$catalog_missing_report" iso9660
+    expect_catalog_preflight_failure INSPECTION_ISO_CATALOG_INVALID catalog-e-without-report "$catalog_fixture_iso" "$catalog_valid_manifest" "$catalog_missing_report" iso9660
+
+    catalog_report_only_manifest=$probe/catalog-hidden-report-only.manifest
+    printf 'iso:00000001\td\t0\tboot\t\niso:00000002\tf\t1\tboot/ordinary\t\n' > "$catalog_report_only_manifest"
+    expect_catalog_preflight_failure INSPECTION_ISO_CATALOG_INVALID catalog-hidden-report-only "$catalog_fixture_iso" "$catalog_report_only_manifest" "$catalog_valid_metadata" iso9660
+
+    catalog_path_mismatch_manifest=$probe/catalog-path-mismatch.manifest
+    printf 'iso:00000001\td\t0\tboot\t\niso:00000002\te\t2048\tboot/other.cat\t1:1\n' > "$catalog_path_mismatch_manifest"
+    expect_catalog_preflight_failure INSPECTION_ISO_CATALOG_INVALID catalog-path-mismatch "$catalog_fixture_iso" "$catalog_path_mismatch_manifest" "$catalog_valid_metadata" iso9660
+
+    catalog_size_mismatch_manifest=$probe/catalog-size-mismatch.manifest
+    printf 'iso:00000001\td\t0\tboot\t\niso:00000002\te\t1024\tboot/boot.cat\t1:1\n' > "$catalog_size_mismatch_manifest"
+    expect_catalog_preflight_failure INSPECTION_ISO_CATALOG_INVALID catalog-size-mismatch "$catalog_fixture_iso" "$catalog_size_mismatch_manifest" "$catalog_valid_metadata" iso9660
+
+    catalog_malformed_metadata=$probe/catalog-malformed.metadata
+    printf 'boot/boot.cat\t01\t1\n' > "$catalog_malformed_metadata"
+    expect_catalog_preflight_failure INSPECTION_ISO_CATALOG_INVALID catalog-malformed "$catalog_fixture_iso" "$catalog_valid_manifest" "$catalog_malformed_metadata" iso9660
+
+    catalog_partial_metadata=$probe/catalog-partial.metadata
+    printf 'boot/boot.cat\t1\n' > "$catalog_partial_metadata"
+    expect_catalog_preflight_failure INSPECTION_ISO_CATALOG_INVALID catalog-partial "$catalog_fixture_iso" "$catalog_valid_manifest" "$catalog_partial_metadata" iso9660
+
+    catalog_overflow_metadata=$probe/catalog-overflow.metadata
+    printf 'boot/boot.cat\t9999999999999999999\t1\n' > "$catalog_overflow_metadata"
+    expect_catalog_preflight_failure INSPECTION_ISO_CATALOG_INVALID catalog-overflow "$catalog_fixture_iso" "$catalog_valid_manifest" "$catalog_overflow_metadata" iso9660
+
+    catalog_out_of_bounds_metadata=$probe/catalog-out-of-bounds.metadata
+    printf 'boot/boot.cat\t4\t1\n' > "$catalog_out_of_bounds_metadata"
+    catalog_out_of_bounds_manifest=$probe/catalog-out-of-bounds.manifest
+    printf 'iso:00000001\td\t0\tboot\t\niso:00000002\te\t2048\tboot/boot.cat\t4:1\n' > "$catalog_out_of_bounds_manifest"
+    expect_catalog_preflight_failure INSPECTION_ISO_CATALOG_INVALID catalog-out-of-bounds "$catalog_fixture_iso" "$catalog_out_of_bounds_manifest" "$catalog_out_of_bounds_metadata" iso9660
+
+    expect_catalog_preflight_failure INSPECTION_GRAPH_REJECTED catalog-non-iso "$catalog_fixture_iso" "$catalog_valid_manifest" "$catalog_valid_metadata" tar
+
     root_confined_external_symlinks=$probe/root-confined-external-symlinks.manifest
     printf 'a\td\t0\tvar\t\nb\tl\t0\tvar/lock\t../run/lock\nc\td\t0\tbin\t\nd\tl\t0\tbin/sh\t/bin/busybox\n' > "$root_confined_external_symlinks"
     fixture_reset_state
