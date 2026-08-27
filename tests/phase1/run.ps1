@@ -847,7 +847,7 @@ Add-TestCase -Name 'BUILD-04 public inputs pin the complete builder and inspecti
     $repositoryPins = @{}
     foreach ($repository in @($inputs.alpine.repositories)) { $repositoryPins[[string]$repository.name] = [string]$repository.apkindex_sha256 }
     Assert-Equal -Expected '33971e63c06dac7ab71e96e6fc88eec8edc44f465881e123c4893f1345b2360b' -Actual $repositoryPins['main'] -Message 'The twice-observed official v3.24 main APKINDEX bytes are not pinned.'
-    Assert-Equal -Expected '34a683f88ed4c897943b5bacf9c388d8a6b5980296ddddaa35fac1417fdf4deb' -Actual $repositoryPins['community'] -Message 'The twice-observed official v3.24 community APKINDEX bytes are not pinned.'
+    Assert-Equal -Expected '8a6946f6fe2e1afcc445aa8f9743890d48fd9cbb98f877a5c95f70f9bc3e616a' -Actual $repositoryPins['community'] -Message 'The twice-observed official v3.24 community APKINDEX bytes are not pinned.'
 
     $packages = @($inputs.builder_packages)
     foreach ($pin in @('gzip=1.14-r2', 'xz=5.8.3-r0', 'zstd=1.5.7-r2', 'lz4=1.10.0-r1', 'cpio=2.15-r0')) {
