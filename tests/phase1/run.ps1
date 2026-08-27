@@ -317,6 +317,99 @@ printf '%s\n' ARCHIVE_MEMBER_STATUS_PASS
     Assert-True -Condition ($output -ccontains 'ARCHIVE_MEMBER_STATUS_PASS') -Message 'Archive-member runtime regression returned no success marker.'
 }
 
+Add-TestCase -Name 'BUILD-03 archive audit accounting distinguishes ordinary catalog and compressed bytes' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
+    $inspectorPath = Join-Path $script:RepositoryRoot 'scripts/linux/inspect-iso.sh'
+    $source = (Get-Content -Raw -LiteralPath $inspectorPath).Replace("`r`n", "`n")
+    $functionNames = @(
+        'counter_get', 'counter_set', 'validate_graph_file',
+        'is_canonical_decimal', 'assert_root_confined_path', 'stream_iso_boot_catalog',
+        'stream_regular_member', 'decode_compressed'
+    )
+    $functions = foreach ($name in $functionNames) {
+        $match = [regex]::Match($source, "(?ms)^$([regex]::Escape($name))\(\) \{.*?^\}")
+        Assert-True -Condition $match.Success -Message "Production inspector function '$name' could not be isolated for the accounting fixture."
+        $match.Value
+    }
+
+    $bash = Get-Command bash -ErrorAction SilentlyContinue
+    if ($null -eq $bash) {
+        $git = Get-Command git -ErrorAction Stop
+        $gitRoot = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $git.Source) '..'))
+        $bashPath = Join-Path $gitRoot 'bin/bash.exe'
+        Assert-True -Condition (Test-Path -LiteralPath $bashPath -PathType Leaf) -Message 'Git Bash is required to execute the archive accounting regression.'
+    }
+    else { $bashPath = $bash.Source }
+
+    $harness = @'
+set -eu
+__INSPECTOR_FUNCTIONS__
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+OWNED_ROOT=$(cd "$work" && pwd -P)
+mkdir "$OWNED_ROOT/materialized"
+STATE_FILE=$work/counters
+MAX_FILE_BYTES=1048576
+MAX_TOTAL_EXPANDED_BYTES=4194304
+MAX_MEMBERS=200000
+MAX_PATH_BYTES=4096
+printf '%s\n' \
+    'members=0' 'regular_files=0' 'containers=0' 'expanded_bytes=0' \
+    'materializations=0' 'observed_depth=0' > "$STATE_FILE"
+
+fail() { printf '%s: %s\n' "$1" "$2" >&2; exit 1; }
+file_bytes() { stat -c '%s' "$1"; }
+sha256_file() { sha256sum "$1" | awk '{print $1}'; }
+ulimit() { :; }
+scan_text_value() { :; }
+scan_regular_bytes() { :; }
+assert_decoder_log_clean() { [ ! -s "$2" ]; }
+role_for_path() { printf '%s\n' auto; }
+inspect_file() { :; }
+validate_iso_catalog_manifest() { :; }
+tool_field() {
+    case "$1:$2" in
+        iso:command) printf '%s\n' "$work/fake-xorriso" ;;
+        gzip:command) command -v gzip ;;
+        *) return 1 ;;
+    esac
+}
+
+printf '%s\n' '#!/bin/sh' 'printf clean' > "$work/fake-xorriso"
+chmod +x "$work/fake-xorriso"
+awk 'BEGIN { for (i = 0; i < 8192; i++) printf "I" }' > "$work/input.iso"
+fixture_manifest=$work/input.manifest
+printf 'iso:00000001\td\t0\tboot\t\niso:00000002\te\t2048\tboot/boot.cat\t1:1\niso:00000003\tf\t5\tboot/ordinary\t\n' > "$fixture_manifest"
+
+validate_graph_file "$fixture_manifest" iso9660
+counter_set containers 1
+catalog=$(stream_iso_boot_catalog "$work/input.iso" 2048 1:1)
+[ -f "$catalog" ]
+ordinary=$(stream_regular_member iso9660 "$work/input.iso" boot/ordinary 5)
+[ -f "$ordinary" ]
+[ "$(counter_get members)" -eq 3 ]
+[ "$(counter_get regular_files)" -eq 1 ]
+[ "$(counter_get containers)" -eq 1 ]
+[ "$(counter_get expanded_bytes)" -eq 2053 ]
+[ "$(counter_get materializations)" -eq 2 ]
+
+printf clean | gzip -n -c > "$work/clean.gz"
+decoded=$(decode_compressed gzip "$work/clean.gz" image.iso/clean.gz.decoded)
+[ -f "$decoded" ]
+[ "$(counter_get members)" -eq 3 ]
+[ "$(counter_get regular_files)" -eq 2 ]
+[ "$(counter_get containers)" -eq 1 ]
+[ "$(counter_get expanded_bytes)" -eq 2058 ]
+[ "$(counter_get materializations)" -eq 3 ]
+printf '%s\n' ARCHIVE_ACCOUNTING_PASS
+'@.Replace('__INSPECTOR_FUNCTIONS__', ($functions -join "`n`n"))
+
+    $output = @($harness | & $bashPath -s 2>&1)
+    $exitCode = $LASTEXITCODE
+    Assert-Equal -Expected 0 -Actual $exitCode -Message ("Archive accounting regression failed. Output=<{0}>" -f ($output -join ' | '))
+    Assert-True -Condition ($output -ccontains 'ARCHIVE_ACCOUNTING_PASS') -Message 'Archive accounting regression returned no success marker.'
+}
+
 Add-TestCase -Name 'BUILD-03 offline build proves decoder identity before inspecting and publishing' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
     $linuxCore = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/linux/run-build.sh')
 
@@ -474,6 +567,57 @@ Add-TestCase -Name 'BUILD-03 closed staging rejects paths schemas hashes sizes l
         [System.IO.File]::WriteAllText($serialPath, 'FICT' + 'IONAL_300K_SECRET_TOKEN=' + ('Z' * 32))
         Assert-ThrowsCode -Code 'STAGING_SECRET_FOUND' -Body { Test-ClosedStagingBundle -StagingDirectory $fixture.Staging -ExpectedBuildRequestSha256 $fixture.RequestHash -Inputs $fixture.Inputs -BuildRequest $fixture.Request | Out-Null }
         [System.IO.File]::WriteAllBytes($serialPath, $serialBytes)
+    }
+    finally { Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Add-TestCase -Name 'BUILD-03 audit vacuity failures expose only deterministic allowlisted subcodes' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
+    $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('300k-audit-vacuity-' + [Guid]::NewGuid().ToString('N'))
+    [System.IO.Directory]::CreateDirectory($scratch) | Out-Null
+    try {
+        $fixture = New-ClosedSecurityFixture -Root $scratch
+        $validated = Test-ClosedStagingBundle -StagingDirectory $fixture.Staging -ExpectedBuildRequestSha256 $fixture.RequestHash -Inputs $fixture.Inputs -BuildRequest $fixture.Request
+        Assert-Equal -Expected $fixture.IsoHash -Actual $validated.IsoSha256 -Message 'Valid audit control did not pass before hostile mutations.'
+
+        $latestPath = Join-Path $scratch 'LATEST.json'
+        $priorPointer = [System.Text.UTF8Encoding]::new($false).GetBytes('{"schema_version":1,"build_id":"prior-build","directory":"prior-build"}' + "`n")
+        [System.IO.File]::WriteAllBytes($latestPath, $priorPointer)
+        $auditPath = Join-Path $fixture.Staging 'iso-audit.json'
+        $auditBytes = [System.IO.File]::ReadAllBytes($auditPath)
+        $cases = @(
+            [pscustomobject]@{ Name = 'members-zero'; Code = 'ISO_AUDIT_MEMBERS_ZERO'; Mutate = { param($audit) $audit.counts.members = 0 } },
+            [pscustomobject]@{ Name = 'regular-files-zero'; Code = 'ISO_AUDIT_REGULAR_FILES_ZERO'; Mutate = { param($audit) $audit.counts.regular_files = 0 } },
+            [pscustomobject]@{ Name = 'regular-files-exceed-members'; Code = 'ISO_AUDIT_REGULAR_FILES_EXCEED_MEMBERS'; Mutate = { param($audit) $audit.counts.regular_files = 11 } },
+            [pscustomobject]@{ Name = 'containers-zero'; Code = 'ISO_AUDIT_CONTAINERS_ZERO'; Mutate = { param($audit) $audit.counts.containers = 0 } },
+            [pscustomobject]@{ Name = 'expanded-bytes-zero'; Code = 'ISO_AUDIT_EXPANDED_BYTES_ZERO'; Mutate = { param($audit) $audit.counts.expanded_bytes = 0 } },
+            [pscustomobject]@{ Name = 'expanded-bytes-over-limit'; Code = 'ISO_AUDIT_EXPANDED_BYTES_EXCEED_LIMIT'; Mutate = { param($audit) $audit.counts.expanded_bytes = [long]4294967297 } },
+            [pscustomobject]@{ Name = 'depth-negative'; Code = 'ISO_AUDIT_DEPTH_OUT_OF_RANGE'; Mutate = { param($audit) $audit.counts.max_observed_depth = -1 } },
+            [pscustomobject]@{ Name = 'depth-over-limit'; Code = 'ISO_AUDIT_DEPTH_OUT_OF_RANGE'; Mutate = { param($audit) $audit.counts.max_observed_depth = 9 } },
+            [pscustomobject]@{ Name = 'closed-key-count'; Code = 'ISO_AUDIT_CLOSED_KEY_COUNT_INVALID'; Mutate = { param($audit) $audit.public_key_allowance.closed_key_count = 3 } },
+            [pscustomobject]@{ Name = 'key-manifest-shape'; Code = 'ISO_AUDIT_KEY_MANIFEST_HASH_INVALID'; Mutate = { param($audit) $audit.public_key_allowance.manifest_sha256 = 'not-a-hash' } },
+            [pscustomobject]@{ Name = 'classification'; Code = 'ISO_AUDIT_CLASSIFICATION_INVALID'; Mutate = { param($audit) $audit.structural_boot_findings.classification = 'content' } },
+            [pscustomobject]@{ Name = 'bios-tree'; Code = 'ISO_AUDIT_BIOS_TREE_MISSING'; Mutate = { param($audit) $audit.structural_boot_findings.bios_tree_present = $false } },
+            [pscustomobject]@{ Name = 'uefi-tree'; Code = 'ISO_AUDIT_UEFI_TREE_MISSING'; Mutate = { param($audit) $audit.structural_boot_findings.uefi_tree_present = $false } }
+        )
+
+        foreach ($case in $cases) {
+            [System.IO.File]::WriteAllBytes($auditPath, $auditBytes)
+            $audit = Get-Content -Raw -LiteralPath $auditPath | ConvertFrom-Json -Depth 64
+            & $case.Mutate $audit
+            Write-CanonicalJson -Value $audit -Path $auditPath
+            try {
+                Test-ClosedStagingBundle -StagingDirectory $fixture.Staging -ExpectedBuildRequestSha256 $fixture.RequestHash -Inputs $fixture.Inputs -BuildRequest $fixture.Request | Out-Null
+                throw "Hostile audit case '$($case.Name)' unexpectedly passed."
+            }
+            catch {
+                $actualCode = [string]$_.Exception.Data['Code']
+                Assert-Equal -Expected $case.Code -Actual $actualCode -Message "Hostile audit case '$($case.Name)' returned the wrong diagnostic."
+                Assert-Equal -Expected 'Decoded ISO audit invariant failed.' -Actual $_.Exception.Message -Message "Hostile audit case '$($case.Name)' exposed non-constant diagnostic content."
+                Assert-Match -Value $actualCode -Pattern '^ISO_AUDIT_[A-Z0-9_]+$' -Message "Hostile audit case '$($case.Name)' returned a non-allowlisted diagnostic shape."
+            }
+            Assert-Equal -Expected ([Convert]::ToHexString($priorPointer)) -Actual ([Convert]::ToHexString([System.IO.File]::ReadAllBytes($latestPath))) -Message "LATEST changed while validating hostile audit case '$($case.Name)'."
+        }
+        [System.IO.File]::WriteAllBytes($auditPath, $auditBytes)
     }
     finally { Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue }
 }
