@@ -13,3 +13,13 @@ Resolved debug sessions. Used by `gsd-debugger` to surface known-pattern hypothe
 - **Why not caught:** No pre-existing static or readiness gate covered preservation of the pinned Extlinux command line while adding a host-specific kernel workaround; later build, signing, inspection, and smoke gates run after the point of failure.
 - **Recurrence guard:** Regression test `tests/deadline/run.ps1` — `Builder direct boot preserves the pinned image contract and adds noapic once`; runtime extraction also fails closed on missing or duplicate APPEND lines.
 ---
+
+## smoke-serial-file-lock — Windows live serial reader consumed the only smoke attempt
+- **Date:** 2026-08-27
+- **Error patterns:** `ReadAllText`, `serial.log`, `being used by another process`, pre-observation host failure, consumed smoke attempt
+- **Root cause(s):** `Get-DeadlineSerialFacts` used read-only sharing while QEMU retained a live write handle; Windows required the reader to share that existing write access, and the intentional one-attempt policy made the harness failure final.
+- **Fix:** Use a bounded strict UTF-8 `FileStream` snapshot with `FileShare.ReadWrite | FileShare.Delete`; permit one `CreateNew` hash-linked successor only for the exact closed pre-observation host failure with zero owned QEMU processes.
+- **Files changed:** `build.ps1`, `scripts/host/Invoke-DeadlineSmoke.ps1`, `tests/deadline/run.ps1`, `docs/DEADLINE-MVP.md`
+- **Why not caught:** No existing host fixture held `serial.log` open for writing while `Get-DeadlineSerialFacts` read it; `SmokeUnit` covered only complete closed files.
+- **Recurrence guard:** Regression test `tests/deadline/run.ps1` — `Direct smoke contract is one-attempt BIOS optical and evidence driven` — covers live sharing, partial UTF-8, byte bounds, closed recovery rejection, predecessor immutability, and second-recovery refusal.
+---
