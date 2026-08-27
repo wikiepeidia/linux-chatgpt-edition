@@ -3,7 +3,7 @@ param(
     [ValidateSet('Auto', 'Docker', 'Qemu')]
     [string] $Backend = 'Auto',
 
-    [ValidateSet('Bootstrap')]
+    [ValidateSet('Bootstrap', 'DeadlineMvp')]
     [string] $Target = 'Bootstrap',
 
     [string] $StateRoot = (Join-Path $env:LOCALAPPDATA '300k-linux'),
@@ -178,7 +178,8 @@ function New-BuildRequest {
         [Parameter(Mandatory)] $Inputs,
         [Parameter(Mandatory)] $Source,
         [Parameter(Mandatory)] $InputHashes,
-        $SigningPublic
+        $SigningPublic,
+        [ValidateSet('Bootstrap', 'DeadlineMvp')] [string] $SelectedTarget = 'Bootstrap'
     )
     Assert-PublicInputs -Inputs $Inputs
     if ($null -eq $SigningPublic) {
@@ -188,34 +189,42 @@ function New-BuildRequest {
     if ($Source.git_commit -cnotmatch '^[0-9a-f]{40}$' -or $Source.archive_sha256 -cnotmatch '^[0-9a-f]{64}$' -or [long]$Source.source_date_epoch -le 0 -or [bool]$Source.dirty) {
         throw (New-BuildException -Code 'BUILD_SOURCE_INVALID' -Message 'BuildRequest source identity must be clean, exact, and positive-epoch.')
     }
-    foreach ($name in @('inputs_sha256', 'run_build_sha256', 'inspect_iso_sha256', 'profile_sha256')) {
+    $requiredHashNames = @('inputs_sha256', 'run_build_sha256', 'inspect_iso_sha256', 'profile_sha256')
+    if ($SelectedTarget -ceq 'DeadlineMvp') { $requiredHashNames += @('inspect_deadline_iso_sha256', 'apkovl_sha256') }
+    foreach ($name in $requiredHashNames) {
         if ([string](Get-ObjectProperty -Object $InputHashes -Name $name) -cnotmatch '^[0-9a-f]{64}$') {
             throw (New-BuildException -Code 'BUILD_INPUT_HASH_INVALID' -Message "Build input hash '$name' is malformed.")
         }
     }
 
+    $targetSpec = if ($SelectedTarget -ceq 'DeadlineMvp') {
+        [ordered]@{ name = 'DeadlineMvp'; os = 'linux'; arch = 'x86_64'; format = 'iso'; profile = '300k_deadline' }
+    }
+    else {
+        [ordered]@{ name = 'Bootstrap'; os = 'linux'; arch = 'x86_64'; format = 'iso'; profile = '300k_bootstrap' }
+    }
+    $publicInputs = [ordered]@{
+        inputs_sha256 = [string](Get-ObjectProperty -Object $InputHashes -Name 'inputs_sha256')
+        run_build_sha256 = [string](Get-ObjectProperty -Object $InputHashes -Name 'run_build_sha256')
+        inspect_iso_sha256 = [string](Get-ObjectProperty -Object $InputHashes -Name 'inspect_iso_sha256')
+        profile_sha256 = [string](Get-ObjectProperty -Object $InputHashes -Name 'profile_sha256')
+    }
+    if ($SelectedTarget -ceq 'DeadlineMvp') {
+        $publicInputs.inspect_deadline_iso_sha256 = [string](Get-ObjectProperty -Object $InputHashes -Name 'inspect_deadline_iso_sha256')
+        $publicInputs.apkovl_sha256 = [string](Get-ObjectProperty -Object $InputHashes -Name 'apkovl_sha256')
+    }
+
     return [ordered]@{
         schema = 'BuildRequest'
         schema_version = 1
-        target = [ordered]@{
-            name = 'Bootstrap'
-            os = 'linux'
-            arch = 'x86_64'
-            format = 'iso'
-            profile = '300k_bootstrap'
-        }
+        target = $targetSpec
         source = [ordered]@{
             git_commit = $Source.git_commit
             archive_sha256 = $Source.archive_sha256
             source_date_epoch = [long]$Source.source_date_epoch
             dirty = $false
         }
-        public_inputs = [ordered]@{
-            inputs_sha256 = [string](Get-ObjectProperty -Object $InputHashes -Name 'inputs_sha256')
-            run_build_sha256 = [string](Get-ObjectProperty -Object $InputHashes -Name 'run_build_sha256')
-            inspect_iso_sha256 = [string](Get-ObjectProperty -Object $InputHashes -Name 'inspect_iso_sha256')
-            profile_sha256 = [string](Get-ObjectProperty -Object $InputHashes -Name 'profile_sha256')
-        }
+        public_inputs = $publicInputs
         builder = [ordered]@{
             alpine_release = $Inputs.alpine.release
             image_index_digest = $Inputs.docker.image_index_digest
@@ -402,7 +411,13 @@ function Assert-SourceArchiveUnixText {
     param([Parameter(Mandatory)] [string] $Path)
 
     $requiredEntries = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-    foreach ($entryName in @('scripts/linux/run-build.sh', 'scripts/linux/inspect-iso.sh', 'builder/profiles/mkimg.300k.sh')) {
+    foreach ($entryName in @(
+        'scripts/linux/run-build.sh', 'scripts/linux/inspect-iso.sh', 'scripts/linux/inspect-deadline-iso.sh',
+        'builder/profiles/mkimg.300k.sh', 'builder/apkovl/genapkovl-300k.sh',
+        'builder/apkovl/rootfs/etc/local.d/300k.start', 'builder/apkovl/rootfs/etc/profile.d/300k-session.sh',
+        'builder/apkovl/rootfs/home/chatgpt/.xinitrc', 'builder/apkovl/rootfs/usr/local/bin/300k-runtime',
+        'builder/apkovl/rootfs/usr/local/sbin/300k-power'
+    )) {
         [void]$requiredEntries.Add($entryName)
     }
 
@@ -942,11 +957,430 @@ function Publish-BuildArtifacts {
     return Publish-ValidatedArtifactBundle -StagingDirectory $StagingDirectory -DistRoot $distRoot -BuildId $BuildId -ValidatedBundle $validated
 }
 
+function New-DeadlineQemuArguments {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $QemuExecutable,
+        [Parameter(Mandatory)] [string] $IsoPath,
+        [Parameter(Mandatory)] [string] $SerialPath,
+        [ValidateRange(1024,65535)] [int] $QmpPort
+    )
+    $expectedQemu = [System.IO.Path]::GetFullPath('D:\VM\qemu\qemu-system-x86_64.exe')
+    if ([System.IO.Path]::GetFullPath($QemuExecutable) -cne $expectedQemu) {
+        throw (New-BuildException -Code 'DEADLINE_QEMU_PATH_INVALID' -Message 'Deadline smoke must use the supplied D:\VM\qemu executable.')
+    }
+    return @(
+        '-machine','pc',
+        '-accel','tcg',
+        '-m','1024',
+        '-boot','order=d,strict=on',
+        '-cdrom',[System.IO.Path]::GetFullPath($IsoPath),
+        '-vga','std',
+        '-display','none',
+        '-serial',('file:' + [System.IO.Path]::GetFullPath($SerialPath)),
+        '-qmp',("tcp:127.0.0.1:$QmpPort,server=on,wait=off"),
+        '-monitor','none',
+        '-nic','none',
+        '-no-reboot'
+    )
+}
+
+function Test-DeadlineQemuArguments {
+    param(
+        [Parameter(Mandatory)] [string] $QemuExecutable,
+        [Parameter(Mandatory)] [string[]] $Arguments,
+        [Parameter(Mandatory)] [string] $IsoPath,
+        [Parameter(Mandatory)] [string] $SerialPath
+    )
+    $qmp = @($Arguments | Where-Object { $_ -cmatch '^tcp:127[.]0[.]0[.]1:([1-9][0-9]{3,4}),server=on,wait=off$' })
+    if ($qmp.Count -ne 1) { throw (New-BuildException -Code 'DEADLINE_QEMU_ARGV_INVALID' -Message 'QMP must use one dynamic loopback-only endpoint.') }
+    $port = [int]([regex]::Match($qmp[0], ':([0-9]+),').Groups[1].Value)
+    $expected = New-DeadlineQemuArguments -QemuExecutable $QemuExecutable -IsoPath $IsoPath -SerialPath $SerialPath -QmpPort $port
+    if ((ConvertTo-Json @($Arguments) -Compress) -cne (ConvertTo-Json @($expected) -Compress)) {
+        throw (New-BuildException -Code 'DEADLINE_QEMU_ARGV_INVALID' -Message 'QEMU argv differs from the exact BIOS optical no-NIC contract.')
+    }
+    foreach ($forbidden in @('-drive','-hda','-hdb','-hdc','-hdd','-netdev','-snapshot')) {
+        if (@($Arguments) -ccontains $forbidden) { throw (New-BuildException -Code 'DEADLINE_QEMU_ARGV_INVALID' -Message "QEMU argv contains forbidden token '$forbidden'.") }
+    }
+    return $true
+}
+
+function Get-DeadlineSerialFacts {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $Path)
+    if (-not [System.IO.File]::Exists($Path)) { throw (New-BuildException -Code 'DEADLINE_SERIAL_MISSING' -Message 'Deadline serial evidence is absent.') }
+    $text = [System.IO.File]::ReadAllText($Path)
+    if ([string]::IsNullOrEmpty($text) -or -not $text.EndsWith("`n", [System.StringComparison]::Ordinal)) {
+        throw (New-BuildException -Code 'DEADLINE_SERIAL_INCOMPLETE' -Message 'Deadline serial evidence has an incomplete final line.')
+    }
+    $lines = $text.Replace("`r`n", "`n").Split("`n")
+    $stageNames = [System.Collections.Generic.List[string]]::new()
+    $markers = [System.Collections.Generic.List[object]]::new()
+    $terminal = $null
+    for ($index = 0; $index -lt $lines.Count - 1; $index++) {
+        $line = $lines[$index]
+        if (-not $line.StartsWith('300K_STAGE=', [System.StringComparison]::Ordinal)) { continue }
+        if ($line -cmatch '^300K_STAGE=(ROOTFS_READY|X_READY|UI_READY)$') {
+            $stage = $Matches[1]
+        }
+        elseif ($line -cmatch '^300K_STAGE=TERM_EXEC_OK uid=([1-9][0-9]*) user=chatgpt tty=(/dev/pts/[0-9]+) command=ok file=ok exit=1$') {
+            $stage = 'TERM_EXEC_OK'
+            $terminal = [pscustomobject]@{ uid=[int]$Matches[1]; user='chatgpt'; tty=$Matches[2]; command='ok'; file='ok'; exit=1 }
+        }
+        else {
+            throw (New-BuildException -Code 'DEADLINE_SERIAL_MARKER_INVALID' -Message 'A deadline stage line has invalid grammar or root terminal facts.')
+        }
+        if ($stageNames.Contains($stage)) { throw (New-BuildException -Code 'DEADLINE_SERIAL_MARKER_DUPLICATE' -Message "Stage '$stage' was emitted more than once.") }
+        $stageNames.Add($stage)
+        $markers.Add([pscustomobject]@{ stage=$stage; line=$index + 1 })
+    }
+    $expected = @('ROOTFS_READY','X_READY','UI_READY','TERM_EXEC_OK')
+    if ((ConvertTo-Json @($stageNames) -Compress) -cne (ConvertTo-Json $expected -Compress) -or $null -eq $terminal) {
+        throw (New-BuildException -Code 'DEADLINE_SERIAL_MARKER_ORDER' -Message 'Required ROOTFS/X/UI/TERM markers are missing, duplicated, or out of order.')
+    }
+    return [pscustomobject]@{ Markers=@($markers); Terminal=$terminal }
+}
+
+function Read-DeadlinePpmToken {
+    param([Parameter(Mandatory)] [byte[]] $Bytes, [Parameter(Mandatory)] [ref] $Index)
+    while ($Index.Value -lt $Bytes.Length) {
+        $value = $Bytes[$Index.Value]
+        if ($value -eq 35) {
+            while ($Index.Value -lt $Bytes.Length -and $Bytes[$Index.Value] -ne 10) { $Index.Value++ }
+            continue
+        }
+        if ($value -in @(9,10,13,32)) { $Index.Value++; continue }
+        break
+    }
+    $start = $Index.Value
+    while ($Index.Value -lt $Bytes.Length -and $Bytes[$Index.Value] -notin @(9,10,13,32,35)) { $Index.Value++ }
+    if ($Index.Value -le $start) { throw (New-BuildException -Code 'DEADLINE_SCREENSHOT_INVALID' -Message 'PPM header token is missing.') }
+    return [System.Text.Encoding]::ASCII.GetString($Bytes, $start, $Index.Value - $start)
+}
+
+function Read-DeadlinePpm {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $Path)
+    if (-not [System.IO.File]::Exists($Path)) { throw (New-BuildException -Code 'DEADLINE_SCREENSHOT_MISSING' -Message 'Deadline screenshot is absent.') }
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $index = 0
+    $magic = Read-DeadlinePpmToken -Bytes $bytes -Index ([ref]$index)
+    $widthText = Read-DeadlinePpmToken -Bytes $bytes -Index ([ref]$index)
+    $heightText = Read-DeadlinePpmToken -Bytes $bytes -Index ([ref]$index)
+    $maxText = Read-DeadlinePpmToken -Bytes $bytes -Index ([ref]$index)
+    if ($magic -cne 'P6' -or $widthText -cnotmatch '^[1-9][0-9]*$' -or $heightText -cnotmatch '^[1-9][0-9]*$' -or $maxText -cne '255') {
+        throw (New-BuildException -Code 'DEADLINE_SCREENSHOT_INVALID' -Message 'Screenshot is not a positive binary P6/255 PPM.')
+    }
+    if ($index -ge $bytes.Length -or $bytes[$index] -notin @(9,10,13,32)) { throw (New-BuildException -Code 'DEADLINE_SCREENSHOT_INVALID' -Message 'PPM header is not separated from pixels.') }
+    if ($bytes[$index] -eq 13 -and $index + 1 -lt $bytes.Length -and $bytes[$index + 1] -eq 10) { $index += 2 } else { $index++ }
+    $width = [int]$widthText
+    $height = [int]$heightText
+    $expectedPixelBytes = [long]$width * [long]$height * 3L
+    if ($bytes.Length - $index -ne $expectedPixelBytes) { throw (New-BuildException -Code 'DEADLINE_SCREENSHOT_INVALID' -Message 'PPM pixel payload length differs from its dimensions.') }
+    $colors = [System.Collections.Generic.HashSet[int]]::new()
+    for ($offset = $index; $offset -lt $bytes.Length; $offset += 3) {
+        $color = ([int]$bytes[$offset] -shl 16) -bor ([int]$bytes[$offset + 1] -shl 8) -bor [int]$bytes[$offset + 2]
+        [void]$colors.Add($color)
+        if ($colors.Count -ge 4096) { break }
+    }
+    return [pscustomobject]@{ width=$width; height=$height; max_value=255; distinct_pixels=$colors.Count; nonblank=($colors.Count -ge 2); bytes=[long]$bytes.Length; sha256=Get-LowerFileSha256 -Path $Path }
+}
+
+function Get-DeadlineDeferredClaims {
+    return [ordered]@{
+        runtime_uefi = 'not-executed'
+        raw_usb = 'not-executed'
+        broad_hardware_support = 'not-executed'
+        docker_parity = 'not-executed'
+        second_build_reproducibility = 'not-executed'
+        size_optimization = 'not-executed'
+        exhaustive_security = 'not-executed'
+        general_release_certification = 'not-executed'
+    }
+}
+
+function Assert-DeadlineDeferredClaims {
+    param([Parameter(Mandatory)] $Deferred, [Parameter(Mandatory)] [string] $Code)
+    $expected = Get-DeadlineDeferredClaims
+    Assert-ClosedObjectKeys -Object $Deferred -ExpectedKeys @($expected.Keys) -Code $Code -Label 'Deadline deferred claims'
+    foreach ($key in $expected.Keys) {
+        if ([string](Get-ObjectProperty $Deferred $key) -cne 'not-executed') { throw (New-BuildException -Code $Code -Message "Deferred claim '$key' was overstated.") }
+    }
+}
+
+function Test-DeadlineStagingBundle {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $StagingDirectory,
+        [Parameter(Mandatory)] [string] $ExpectedBuildRequestSha256,
+        [Parameter(Mandatory)] $Inputs,
+        [Parameter(Mandatory)] $BuildRequest
+    )
+    $root = [System.IO.Path]::GetFullPath($StagingDirectory)
+    if (-not [System.IO.Directory]::Exists($root)) { throw (New-BuildException -Code 'DEADLINE_STAGING_MISSING' -Message 'Deadline backend staging is absent.') }
+    Assert-NoReparseAncestors -Path $root
+    $entries = @(Get-ChildItem -LiteralPath $root -Force)
+    if (@($entries | Where-Object { $_.PSIsContainer -or ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 }).Count -ne 0) { throw (New-BuildException -Code 'DEADLINE_STAGING_SET_INVALID' -Message 'Deadline staging contains a directory or link.') }
+    $isoEntries = @($entries | Where-Object { $_.Name -cmatch '^300k-deadline-x86_64-[0-9a-f]{12}[.]iso$' })
+    if ($isoEntries.Count -ne 1) { throw (New-BuildException -Code 'DEADLINE_ISO_MISSING' -Message 'Deadline staging must contain one hash-qualified ISO.') }
+    $isoName = $isoEntries[0].Name
+    $requiredNames = @(
+        'build-request.json','resolved-build-lock.json','builder-packages.lock','apk-files.sha256',$isoName,
+        'boot-layout.txt','deadline-inspection.json','SHA256SUMS','qemu-image-info.json','environment-report.json',
+        'serial-diagnostic.log','repository-evidence.json','resource-inventory.json'
+    )
+    $actualNames = @($entries.Name | Sort-Object -CaseSensitive)
+    if ((ConvertTo-Json $actualNames -Compress) -cne (ConvertTo-Json @($requiredNames | Sort-Object -CaseSensitive) -Compress)) { throw (New-BuildException -Code 'DEADLINE_STAGING_SET_INVALID' -Message 'Deadline staging file set is not closed.') }
+    $items = [ordered]@{}
+    foreach ($name in $requiredNames) { $items[$name] = Get-ClosedRegularArtifact -BaseDirectory $root -Name $name }
+    foreach ($name in @('boot-layout.txt','serial-diagnostic.log','builder-packages.lock','apk-files.sha256','SHA256SUMS')) { Assert-StagingTextSecretFree -Path $items[$name].FullName -Name $name }
+
+    $requestPath = $items['build-request.json'].FullName
+    if ((Get-LowerFileSha256 $requestPath) -cne $ExpectedBuildRequestSha256 -or [System.IO.File]::ReadAllText($requestPath) -cne (ConvertTo-CanonicalJsonText $BuildRequest) -or $BuildRequest.target.name -cne 'DeadlineMvp' -or $BuildRequest.target.profile -cne '300k_deadline') { throw (New-BuildException -Code 'DEADLINE_REQUEST_INVALID' -Message 'Staged deadline request differs from the immutable host request.') }
+    $lock = Read-ClosedJsonArtifact -Path $items['resolved-build-lock.json'].FullName -Code 'DEADLINE_LOCK_INVALID'
+    Assert-ClosedObjectKeys -Object $lock -ExpectedKeys @('schema','schema_version','build_request_sha256','repository_object_id','repository_indexes','aports','trusted_keys','trust_policy','builder_packages_record','apk_files_record','inspection_commands','inspection_toolchain_sha256','offline_install','artifacts') -Code 'DEADLINE_LOCK_INVALID' -Label 'Deadline ResolvedBuildLock'
+    [void](Test-ResolvedBuildLock -Lock $lock -ExpectedBuildRequestSha256 $ExpectedBuildRequestSha256)
+    if (-not [bool]$lock.trust_policy.mkimage_hostkeys -or -not [bool]$lock.trust_policy.closed_keyring_verified -or [bool]$lock.trust_policy.signature_bypass -or (ConvertTo-Json @($lock.offline_install.repositories) -Compress) -cne '["file:///repo"]' -or -not [bool]$lock.offline_install.apk_no_network -or -not [bool]$lock.offline_install.network_disabled -or -not [bool]$lock.offline_install.complete_manifest_verified) { throw (New-BuildException -Code 'DEADLINE_LOCK_INVALID' -Message 'Deadline lock weakened repository, keyring, or offline policy.') }
+    [void](Test-ResolvedTrustedKeys -TrustedKeys @($lock.trusted_keys) -RepositoryKeys $Inputs.alpine.repository_keys -SigningPublicSha256 $BuildRequest.signing.public_key_sha256)
+    foreach ($recordName in @('builder_packages_record','apk_files_record')) { [void](Test-GeneratedFileRecord -Record (Get-ObjectProperty $lock $recordName) -BaseDirectory $root -ExpectedProducer 'run-build.sh:prepare-repository') }
+
+    $iso = $items[$isoName]
+    $isoHash = Get-LowerFileSha256 $iso.FullName
+    if ($isoName -cne "300k-deadline-x86_64-$($isoHash.Substring(0,12)).iso") { throw (New-BuildException -Code 'DEADLINE_ISO_REFERENCE_MISMATCH' -Message 'Deadline ISO basename differs from its bytes.') }
+    $inspection = Read-ClosedJsonArtifact -Path $items['deadline-inspection.json'].FullName -Code 'DEADLINE_INSPECTION_INVALID'
+    Assert-ClosedObjectKeys -Object $inspection -ExpectedKeys @('schema','schema_version','scope','iso_sha256','iso_bytes','required_paths','bios','uefi','recursive_content_audit','runtime_uefi_boot','result') -Code 'DEADLINE_INSPECTION_INVALID' -Label 'DeadlineIsoInspection'
+    Assert-ClosedObjectKeys -Object $inspection.bios -ExpectedKeys @('catalog','loader','bootable') -Code 'DEADLINE_INSPECTION_INVALID' -Label 'DeadlineIsoInspection.bios'
+    Assert-ClosedObjectKeys -Object $inspection.uefi -ExpectedKeys @('image','loader','structural_bootable') -Code 'DEADLINE_INSPECTION_INVALID' -Label 'DeadlineIsoInspection.uefi'
+    $paths = @('/boot/vmlinuz-virt','/boot/initramfs-virt','/300k.apkovl.tar.gz','/apks/x86_64/APKINDEX.tar.gz','/boot/syslinux/isolinux.bin','/efi/boot/bootx64.efi')
+    if ($inspection.schema -cne 'DeadlineIsoInspection' -or [int]$inspection.schema_version -ne 1 -or $inspection.scope -cne 'deadline-fast-structural' -or $inspection.result -cne 'pass' -or $inspection.iso_sha256 -cne $isoHash -or [long]$inspection.iso_bytes -ne [long]$iso.Length -or (ConvertTo-Json @($inspection.required_paths) -Compress) -cne (ConvertTo-Json $paths -Compress) -or $inspection.bios.catalog -cne '/boot/syslinux/boot.cat' -or $inspection.bios.loader -cne '/boot/syslinux/isolinux.bin' -or -not [bool]$inspection.bios.bootable -or $inspection.uefi.image -cne '/boot/grub/efi.img' -or $inspection.uefi.loader -cne '/efi/boot/bootx64.efi' -or -not [bool]$inspection.uefi.structural_bootable -or $inspection.recursive_content_audit -cne 'not-executed' -or $inspection.runtime_uefi_boot -cne 'not-executed') { throw (New-BuildException -Code 'DEADLINE_INSPECTION_INVALID' -Message 'Deadline structural inspection is malformed or overstated.') }
+    if ([System.IO.File]::ReadAllText($items['SHA256SUMS'].FullName).Replace("`r`n","`n") -cne "$isoHash  $isoName`n") { throw (New-BuildException -Code 'DEADLINE_ISO_REFERENCE_MISMATCH' -Message 'Deadline SHA256SUMS differs from ISO bytes.') }
+    $artifactMap = [ordered]@{ deadline_mvp_iso=$isoName; deadline_fast_inspection='deadline-inspection.json'; iso_checksums='SHA256SUMS' }
+    if (@($lock.artifacts).Count -ne 3) { throw (New-BuildException -Code 'DEADLINE_LOCK_INVALID' -Message 'Deadline artifact role set is not closed.') }
+    foreach ($record in @($lock.artifacts)) {
+        Assert-ClosedObjectKeys -Object $record -ExpectedKeys @('role','file','sha256','bytes') -Code 'DEADLINE_LOCK_INVALID' -Label 'Deadline artifact record'
+        if (-not $artifactMap.Contains([string]$record.role) -or $artifactMap[[string]$record.role] -cne [string]$record.file) { throw (New-BuildException -Code 'DEADLINE_LOCK_INVALID' -Message 'Deadline artifact role is unexpected.') }
+        $recordItem = $items[[string]$record.file]
+        if ($record.sha256 -cne (Get-LowerFileSha256 $recordItem.FullName) -or [long]$record.bytes -ne [long]$recordItem.Length) { throw (New-BuildException -Code 'DEADLINE_LOCK_INVALID' -Message 'Deadline artifact record differs from staged bytes.') }
+    }
+    $inventory = Read-ClosedJsonArtifact -Path $items['resource-inventory.json'].FullName -Code 'DEADLINE_RESOURCE_INVALID'
+    if (-not [bool]$inventory.cleanup_complete -or @($inventory.resources.PSObject.Properties | Where-Object { [bool]$_.Value }).Count -ne 0) { throw (New-BuildException -Code 'DEADLINE_RESOURCE_INVALID' -Message 'Builder QEMU resources are not fully drained.') }
+    $repoEvidence = Read-ClosedJsonArtifact -Path $items['repository-evidence.json'].FullName -Code 'DEADLINE_REPOSITORY_INVALID'
+    if ($repoEvidence.build_request_sha256 -cne $ExpectedBuildRequestSha256 -or $repoEvidence.repository_object_id -cne $lock.repository_object_id -or [long]$repoEvidence.apk_count -le 0 -or -not [bool]$repoEvidence.official_indexes_verified -or -not [bool]$repoEvidence.official_signatures_verified -or -not [bool]$repoEvidence.content_addressed_snapshot_verified) { throw (New-BuildException -Code 'DEADLINE_REPOSITORY_INVALID' -Message 'Deadline repository evidence is invalid.') }
+    $qemuInfo = Read-ClosedJsonArtifact -Path $items['qemu-image-info.json'].FullName -Code 'DEADLINE_QEMU_INFO_INVALID'
+    if ($qemuInfo.format -cne 'raw' -or [long]$qemuInfo.actual_size -ne [long]$iso.Length) { throw (New-BuildException -Code 'DEADLINE_QEMU_INFO_INVALID' -Message 'QEMU image measurement differs from the deadline ISO.') }
+    $environment = Read-ClosedJsonArtifact -Path $items['environment-report.json'].FullName -Code 'DEADLINE_ENVIRONMENT_INVALID'
+    if ($environment.backend -cne 'qemu' -or $environment.backend_status -cne 'executed' -or -not [bool]$environment.cleanup_complete -or $environment.source_commit -cne $BuildRequest.source.git_commit) { throw (New-BuildException -Code 'DEADLINE_ENVIRONMENT_INVALID' -Message 'Deadline builder environment report is invalid.') }
+    return [pscustomobject]@{ IsoFile=$isoName; IsoSha256=$isoHash; IsoBytes=[long]$iso.Length; BuildRequestSha256=$ExpectedBuildRequestSha256; SourceCommit=$BuildRequest.source.git_commit; Files=@($requiredNames) }
+}
+
+function Test-DeadlineCandidateDirectory {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $CandidateManifestPath)
+    $manifestItem = Get-Item -LiteralPath $CandidateManifestPath -Force -ErrorAction Stop
+    if ($manifestItem.PSIsContainer -or ($manifestItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw (New-BuildException -Code 'DEADLINE_CANDIDATE_MANIFEST_INVALID' -Message 'Candidate manifest is not one regular file.') }
+    $directory = $manifestItem.Directory.FullName
+    Assert-NoReparseAncestors $directory
+    $manifest = Read-ClosedJsonArtifact -Path $manifestItem.FullName -Code 'DEADLINE_CANDIDATE_MANIFEST_INVALID'
+    Assert-ClosedObjectKeys $manifest @('schema','schema_version','build_id','build_request_sha256','source_commit','iso','inspection','deferred','files') 'DEADLINE_CANDIDATE_MANIFEST_INVALID' 'DeadlineCandidateManifest'
+    Assert-ClosedObjectKeys $manifest.iso @('file','sha256','bytes') 'DEADLINE_CANDIDATE_MANIFEST_INVALID' 'DeadlineCandidateManifest.iso'
+    Assert-ClosedObjectKeys $manifest.inspection @('file','scope') 'DEADLINE_CANDIDATE_MANIFEST_INVALID' 'DeadlineCandidateManifest.inspection'
+    Assert-DeadlineDeferredClaims $manifest.deferred 'DEADLINE_CANDIDATE_MANIFEST_INVALID'
+    if ($manifest.schema -cne 'DeadlineCandidateManifest' -or [int]$manifest.schema_version -ne 1 -or $manifest.build_id -cnotmatch '^deadline-[0-9a-f]{12}$' -or $manifest.build_request_sha256 -cnotmatch '^[0-9a-f]{64}$' -or $manifest.source_commit -cnotmatch '^[0-9a-f]{40}$' -or $manifest.inspection.file -cne 'deadline-inspection.json' -or $manifest.inspection.scope -cne 'deadline-fast-structural') { throw (New-BuildException -Code 'DEADLINE_CANDIDATE_MANIFEST_INVALID' -Message 'Candidate manifest identity is invalid.') }
+    $recordNames = [System.Collections.Generic.List[string]]::new()
+    foreach ($record in @($manifest.files)) {
+        Assert-ClosedObjectKeys $record @('file','sha256','bytes') 'DEADLINE_CANDIDATE_MANIFEST_INVALID' 'DeadlineCandidateManifest.files record'
+        $name = Assert-ClosedRelativeArtifactName ([string]$record.file)
+        if ($recordNames.Contains($name)) { throw (New-BuildException -Code 'DEADLINE_CANDIDATE_MANIFEST_INVALID' -Message 'Candidate manifest duplicates a file.') }
+        $recordNames.Add($name)
+        $item = Get-ClosedRegularArtifact $directory $name
+        if ($record.sha256 -cne (Get-LowerFileSha256 $item.FullName) -or [long]$record.bytes -ne [long]$item.Length) { throw (New-BuildException -Code 'DEADLINE_CANDIDATE_MANIFEST_INVALID' -Message "Candidate file '$name' differs from its manifest.") }
+    }
+    $actual = @(Get-ChildItem -LiteralPath $directory -Force | ForEach-Object { if ($_.PSIsContainer -or ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw (New-BuildException -Code 'DEADLINE_CANDIDATE_MANIFEST_INVALID' -Message 'Candidate contains a directory or link.') }; $_.Name } | Sort-Object -CaseSensitive)
+    $expected = @(@($recordNames) + $manifestItem.Name | Sort-Object -CaseSensitive)
+    if ((ConvertTo-Json $actual -Compress) -cne (ConvertTo-Json $expected -Compress)) { throw (New-BuildException -Code 'DEADLINE_CANDIDATE_MANIFEST_INVALID' -Message 'Candidate file set is not closed.') }
+    $iso = Get-ClosedRegularArtifact $directory ([string]$manifest.iso.file)
+    if ($manifest.iso.sha256 -cne (Get-LowerFileSha256 $iso.FullName) -or [long]$manifest.iso.bytes -ne [long]$iso.Length) { throw (New-BuildException -Code 'DEADLINE_CANDIDATE_MANIFEST_INVALID' -Message 'Candidate ISO identity differs from its manifest.') }
+    $inspection = Read-ClosedJsonArtifact (Join-Path $directory $manifest.inspection.file) 'DEADLINE_CANDIDATE_MANIFEST_INVALID'
+    if ($inspection.scope -cne 'deadline-fast-structural' -or $inspection.result -cne 'pass') { throw (New-BuildException -Code 'DEADLINE_CANDIDATE_MANIFEST_INVALID' -Message 'Candidate lacks passing fast inspection.') }
+    return [pscustomobject]@{ Manifest=$manifest; ManifestPath=$manifestItem.FullName; Directory=$directory; BuildId=$manifest.build_id; IsoFile=$manifest.iso.file; IsoPath=$iso.FullName; IsoSha256=$manifest.iso.sha256; IsoBytes=[long]$manifest.iso.bytes; SourceCommit=$manifest.source_commit }
+}
+
+function Stage-DeadlineCandidate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $StagingDirectory,
+        [Parameter(Mandatory)] [string] $DistRoot,
+        [Parameter(Mandatory)] [string] $BuildId,
+        [Parameter(Mandatory)] $ValidatedBundle
+    )
+    if ($BuildId -cnotmatch '^deadline-[0-9a-f]{12}$') { throw (New-BuildException -Code 'DEADLINE_BUILD_ID_INVALID' -Message 'Deadline build ID is unsafe.') }
+    $dist = [System.IO.Path]::GetFullPath($DistRoot)
+    [System.IO.Directory]::CreateDirectory($dist) | Out-Null
+    Assert-NoReparseAncestors $dist
+    $latest = Join-Path $dist 'LATEST.json'
+    $priorLatest = if ([System.IO.File]::Exists($latest)) { [System.IO.File]::ReadAllBytes($latest) } else { $null }
+    $priorPublished = @(Get-ChildItem -LiteralPath $dist -Force | Where-Object { $_.Name -ne '.deadline-candidates' } | ForEach-Object Name | Sort-Object -CaseSensitive)
+    $candidateRoot = Join-Path $dist '.deadline-candidates'
+    [System.IO.Directory]::CreateDirectory($candidateRoot) | Out-Null
+    $partial = Join-Path $candidateRoot ('.partial-' + $BuildId + '-' + [Guid]::NewGuid().ToString('N'))
+    $final = Join-Path $candidateRoot $BuildId
+    if ([System.IO.Directory]::Exists($final) -or [System.IO.File]::Exists($final)) { throw (New-BuildException -Code 'DEADLINE_CANDIDATE_EXISTS' -Message 'This deadline candidate already exists.') }
+    try {
+        [System.IO.Directory]::CreateDirectory($partial) | Out-Null
+        foreach ($name in @($ValidatedBundle.Files)) {
+            $source = (Get-ClosedRegularArtifact $StagingDirectory $name).FullName
+            $destination = Join-Path $partial $name
+            [System.IO.File]::Copy($source, $destination, $false)
+            if ((Get-LowerFileSha256 $source) -cne (Get-LowerFileSha256 $destination)) { throw (New-BuildException -Code 'DEADLINE_CANDIDATE_COPY_MISMATCH' -Message "Candidate copy '$name' changed bytes.") }
+        }
+        $records = @($ValidatedBundle.Files | Sort-Object -CaseSensitive | ForEach-Object { $item=Get-ClosedRegularArtifact $partial $_; [ordered]@{ file=$_; sha256=Get-LowerFileSha256 $item.FullName; bytes=[long]$item.Length } })
+        $manifestPath = Join-Path $partial 'deadline-candidate.json'
+        Write-CanonicalJson ([ordered]@{
+            schema='DeadlineCandidateManifest'; schema_version=1; build_id=$BuildId; build_request_sha256=$ValidatedBundle.BuildRequestSha256; source_commit=$ValidatedBundle.SourceCommit
+            iso=[ordered]@{ file=$ValidatedBundle.IsoFile; sha256=$ValidatedBundle.IsoSha256; bytes=[long]$ValidatedBundle.IsoBytes }
+            inspection=[ordered]@{ file='deadline-inspection.json'; scope='deadline-fast-structural' }; deferred=Get-DeadlineDeferredClaims; files=$records
+        }) $manifestPath
+        [void](Test-DeadlineCandidateDirectory $manifestPath)
+        [System.IO.Directory]::Move($partial, $final)
+        $finalManifest = Join-Path $final 'deadline-candidate.json'
+        [void](Test-DeadlineCandidateDirectory $finalManifest)
+        $afterPublished = @(Get-ChildItem -LiteralPath $dist -Force | Where-Object { $_.Name -ne '.deadline-candidates' } | ForEach-Object Name | Sort-Object -CaseSensitive)
+        if ((ConvertTo-Json $priorPublished -Compress) -cne (ConvertTo-Json $afterPublished -Compress)) { throw (New-BuildException -Code 'DEADLINE_CANDIDATE_PUBLICATION_LEAK' -Message 'Candidate staging changed the published namespace.') }
+        if ($null -eq $priorLatest) { if ([System.IO.File]::Exists($latest)) { throw (New-BuildException -Code 'DEADLINE_CANDIDATE_POINTER_CHANGED' -Message 'Candidate staging created LATEST.') } }
+        elseif (-not [System.IO.File]::Exists($latest) -or [Convert]::ToHexString([System.IO.File]::ReadAllBytes($latest)) -cne [Convert]::ToHexString($priorLatest)) { throw (New-BuildException -Code 'DEADLINE_CANDIDATE_POINTER_CHANGED' -Message 'Candidate staging changed LATEST bytes.') }
+        return [pscustomobject]@{ status='candidate-staged'; BuildId=$BuildId; Directory=$final; Manifest=$finalManifest; IsoFile=$ValidatedBundle.IsoFile; IsoSha256=$ValidatedBundle.IsoSha256; IsoBytes=[long]$ValidatedBundle.IsoBytes }
+    }
+    catch {
+        if ([System.IO.Directory]::Exists($partial)) { [System.IO.Directory]::Delete($partial, $true) }
+        if ([System.IO.Directory]::Exists($final)) { [System.IO.Directory]::Delete($final, $true) }
+        throw
+    }
+}
+
+function Test-DeadlineSmokeEvidence {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $EvidencePath, [Parameter(Mandatory)] [string] $CandidateManifestPath)
+    $candidate = Test-DeadlineCandidateDirectory $CandidateManifestPath
+    $evidenceItem = Get-Item -LiteralPath $EvidencePath -Force -ErrorAction Stop
+    $evidenceRoot = $evidenceItem.Directory.FullName
+    $evidence = Read-ClosedJsonArtifact $evidenceItem.FullName 'DEADLINE_SMOKE_EVIDENCE_INVALID'
+    Assert-ClosedObjectKeys $evidence @('schema','schema_version','result','build_id','attempt_id','iso','qemu','markers','terminal','serial','screenshot','deferred') 'DEADLINE_SMOKE_EVIDENCE_INVALID' 'DeadlineSmokeEvidence'
+    Assert-ClosedObjectKeys $evidence.iso @('file','sha256','bytes') 'DEADLINE_SMOKE_EVIDENCE_INVALID' 'DeadlineSmokeEvidence.iso'
+    Assert-ClosedObjectKeys $evidence.qemu @('executable','argv','machine','firmware','media','nic','memory_mib') 'DEADLINE_SMOKE_EVIDENCE_INVALID' 'DeadlineSmokeEvidence.qemu'
+    Assert-ClosedObjectKeys $evidence.terminal @('uid','user','tty','command','file','exit') 'DEADLINE_SMOKE_EVIDENCE_INVALID' 'DeadlineSmokeEvidence.terminal'
+    Assert-ClosedObjectKeys $evidence.serial @('file','sha256','bytes') 'DEADLINE_SMOKE_EVIDENCE_INVALID' 'DeadlineSmokeEvidence.serial'
+    Assert-ClosedObjectKeys $evidence.screenshot @('file','sha256','bytes','width','height','max_value','distinct_pixels','nonblank') 'DEADLINE_SMOKE_EVIDENCE_INVALID' 'DeadlineSmokeEvidence.screenshot'
+    Assert-DeadlineDeferredClaims $evidence.deferred 'DEADLINE_SMOKE_EVIDENCE_INVALID'
+    if ($evidence.schema -cne 'DeadlineSmokeEvidence' -or [int]$evidence.schema_version -ne 1 -or $evidence.result -cne 'pass' -or $evidence.build_id -cne $candidate.BuildId -or $evidence.attempt_id -cnotmatch '^[0-9a-f]{32}$' -or $evidence.iso.file -cne $candidate.IsoFile -or $evidence.iso.sha256 -cne $candidate.IsoSha256 -or [long]$evidence.iso.bytes -ne $candidate.IsoBytes) { throw (New-BuildException -Code 'DEADLINE_SMOKE_EVIDENCE_INVALID' -Message 'Smoke evidence identity differs from the candidate.') }
+    if ($evidence.qemu.executable -cne 'D:\VM\qemu\qemu-system-x86_64.exe' -or $evidence.qemu.machine -cne 'pc' -or $evidence.qemu.firmware -cne 'bios' -or $evidence.qemu.media -cne 'optical-read-only' -or $evidence.qemu.nic -cne 'none' -or [int]$evidence.qemu.memory_mib -ne 1024) { throw (New-BuildException -Code 'DEADLINE_SMOKE_EVIDENCE_INVALID' -Message 'Smoke evidence overstates or changes the executed QEMU lane.') }
+    $serialName = Assert-ClosedRelativeArtifactName ([string]$evidence.serial.file)
+    $screenName = Assert-ClosedRelativeArtifactName ([string]$evidence.screenshot.file)
+    $serial = Get-ClosedRegularArtifact $evidenceRoot $serialName
+    $screen = Get-ClosedRegularArtifact $evidenceRoot $screenName
+    if ($evidence.serial.sha256 -cne (Get-LowerFileSha256 $serial.FullName) -or [long]$evidence.serial.bytes -ne [long]$serial.Length -or $evidence.screenshot.sha256 -cne (Get-LowerFileSha256 $screen.FullName) -or [long]$evidence.screenshot.bytes -ne [long]$screen.Length) { throw (New-BuildException -Code 'DEADLINE_SMOKE_EVIDENCE_INVALID' -Message 'Serial or screenshot evidence bytes changed.') }
+    $facts = Get-DeadlineSerialFacts $serial.FullName
+    $expectedStages = @('ROOTFS_READY','X_READY','UI_READY','TERM_EXEC_OK')
+    if (@($evidence.markers).Count -ne 4) { throw (New-BuildException -Code 'DEADLINE_SMOKE_EVIDENCE_INVALID' -Message 'Evidence marker set is not closed.') }
+    for ($index=0;$index -lt 4;$index++) {
+        Assert-ClosedObjectKeys $evidence.markers[$index] @('stage','line') 'DEADLINE_SMOKE_EVIDENCE_INVALID' 'DeadlineSmokeEvidence.marker'
+        if ($evidence.markers[$index].stage -cne $expectedStages[$index] -or [int]$evidence.markers[$index].line -ne [int]$facts.Markers[$index].line) { throw (New-BuildException -Code 'DEADLINE_SMOKE_EVIDENCE_INVALID' -Message 'Evidence marker order or line number differs from serial bytes.') }
+    }
+    if ([int]$evidence.terminal.uid -le 0 -or $evidence.terminal.user -cne 'chatgpt' -or $evidence.terminal.tty -cnotmatch '^/dev/pts/[0-9]+$' -or $evidence.terminal.command -cne 'ok' -or $evidence.terminal.file -cne 'ok' -or [int]$evidence.terminal.exit -ne 1 -or [int]$evidence.terminal.uid -ne [int]$facts.Terminal.uid -or $evidence.terminal.tty -cne $facts.Terminal.tty) { throw (New-BuildException -Code 'DEADLINE_SMOKE_EVIDENCE_INVALID' -Message 'PTY proof fields are missing, root, fake, or inconsistent.') }
+    $ppm = Read-DeadlinePpm $screen.FullName
+    if (-not [bool]$evidence.screenshot.nonblank -or -not $ppm.nonblank -or [int]$evidence.screenshot.width -ne $ppm.width -or [int]$evidence.screenshot.height -ne $ppm.height -or [int]$evidence.screenshot.max_value -ne 255 -or [int]$evidence.screenshot.distinct_pixels -ne $ppm.distinct_pixels) { throw (New-BuildException -Code 'DEADLINE_SMOKE_EVIDENCE_INVALID' -Message 'Screenshot is blank or its measured geometry/variance differs.') }
+    $candidateParent = [System.IO.Directory]::GetParent($candidate.Directory)
+    if ($null -eq $candidateParent -or [System.IO.Path]::GetFileName($candidate.Directory) -cne $candidate.BuildId) {
+        throw (New-BuildException -Code 'DEADLINE_CANDIDATE_LOCATION_INVALID' -Message 'Candidate directory does not match its build identity.')
+    }
+    $distRoot = if ($candidateParent.Name -ceq '.deadline-candidates') { $candidateParent.Parent.FullName } else { $candidateParent.FullName }
+    $executedIsoPath = [System.IO.Path]::GetFullPath((Join-Path $distRoot ('.deadline-candidates\' + $candidate.BuildId + '\' + $candidate.IsoFile)))
+    [void](Test-DeadlineQemuArguments -QemuExecutable $evidence.qemu.executable -Arguments @($evidence.qemu.argv) -IsoPath $executedIsoPath -SerialPath $serial.FullName)
+    return [pscustomobject]@{ Candidate=$candidate; Evidence=$evidence; EvidencePath=$evidenceItem.FullName; EvidenceSha256=Get-LowerFileSha256 $evidenceItem.FullName; SerialPath=$serial.FullName; ScreenshotPath=$screen.FullName; Screenshot=$ppm; ExecutedIsoPath=$executedIsoPath }
+}
+
+function Complete-DeadlineCandidate {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $CandidateManifestPath, [Parameter(Mandatory)] [string] $EvidencePath, [Parameter(Mandatory)] [string] $DistRoot, [string] $FailureStage)
+    $validated = Test-DeadlineSmokeEvidence $EvidencePath $CandidateManifestPath
+    $candidate = $validated.Candidate
+    $dist = [System.IO.Path]::GetFullPath($DistRoot)
+    $expectedCandidateRoot = [System.IO.Path]::GetFullPath((Join-Path $dist '.deadline-candidates')).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    if (-not $candidate.Directory.StartsWith($expectedCandidateRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { throw (New-BuildException -Code 'DEADLINE_CANDIDATE_LOCATION_INVALID' -Message 'Candidate is outside the quarantine namespace.') }
+    $final = Join-Path $dist $candidate.BuildId
+    $latest = Join-Path $dist 'LATEST.json'
+    if ([System.IO.Directory]::Exists($final) -or [System.IO.File]::Exists($final)) { throw (New-BuildException -Code 'DEADLINE_ALREADY_PUBLISHED' -Message 'Deadline build already exists in the published namespace.') }
+    $priorLatest = if ([System.IO.File]::Exists($latest)) { [System.IO.File]::ReadAllBytes($latest) } else { $null }
+    $latestPartial = Join-Path $dist ('LATEST.json.' + [Guid]::NewGuid().ToString('N') + '.partial')
+    $renamed = $false
+    $pointerChanged = $false
+    try {
+        [System.IO.Directory]::Move($candidate.Directory, $final)
+        $renamed = $true
+        Invoke-PublicationFailureStage $FailureStage 'after-final-rename'
+        $relativeEvidence = [System.IO.Path]::GetRelativePath($dist, $validated.EvidencePath).Replace('\','/')
+        if ($relativeEvidence.StartsWith('../', [System.StringComparison]::Ordinal) -or $relativeEvidence -ceq '..') { throw (New-BuildException -Code 'DEADLINE_EVIDENCE_LOCATION_INVALID' -Message 'Smoke evidence must remain under dist.') }
+        Write-CanonicalJson ([ordered]@{
+            schema_version=1; build_id=$candidate.BuildId; directory=$candidate.BuildId; iso_file=$candidate.IsoFile; iso_sha256=$candidate.IsoSha256; iso_bytes=[long]$candidate.IsoBytes
+            verification='deadline-bios-optical'; smoke_evidence=$relativeEvidence; smoke_evidence_sha256=$validated.EvidenceSha256; screenshot_sha256=$validated.Evidence.screenshot.sha256; serial_sha256=$validated.Evidence.serial.sha256; source_commit=$candidate.SourceCommit
+        }) $latestPartial
+        Invoke-PublicationFailureStage $FailureStage 'before-pointer-replace'
+        if ([System.IO.File]::Exists($latest)) {
+            $backup = Join-Path $dist ('LATEST.json.backup-' + [Guid]::NewGuid().ToString('N'))
+            [System.IO.File]::Replace($latestPartial, $latest, $backup, $true)
+            $pointerChanged = $true
+            [System.IO.File]::Delete($backup)
+        }
+        else {
+            [System.IO.File]::Move($latestPartial, $latest)
+            $pointerChanged = $true
+        }
+        Invoke-PublicationFailureStage $FailureStage 'after-pointer-replace'
+        [void](Test-DeadlineCandidateDirectory (Join-Path $final 'deadline-candidate.json'))
+        return [pscustomobject]@{ status='promoted'; BuildId=$candidate.BuildId; Directory=$final; IsoFile=$candidate.IsoFile; IsoSha256=$candidate.IsoSha256; IsoBytes=[long]$candidate.IsoBytes; Evidence=$validated.EvidencePath; Screenshot=$validated.ScreenshotPath; Serial=$validated.SerialPath }
+    }
+    catch {
+        if ($pointerChanged) {
+            if ($null -eq $priorLatest) { [System.IO.File]::Delete($latest) }
+            else { $rollback=Join-Path $dist ('LATEST.json.rollback-' + [Guid]::NewGuid().ToString('N') + '.partial'); [System.IO.File]::WriteAllBytes($rollback,$priorLatest); [System.IO.File]::Move($rollback,$latest,$true) }
+        }
+        if ([System.IO.File]::Exists($latestPartial)) { [System.IO.File]::Delete($latestPartial) }
+        if ($renamed -and [System.IO.Directory]::Exists($final) -and -not [System.IO.Directory]::Exists($candidate.Directory)) { [System.IO.Directory]::Move($final,$candidate.Directory) }
+        throw
+    }
+}
+
+function Stage-DeadlineBuildArtifacts {
+    param(
+        [Parameter(Mandatory)] [string] $StagingDirectory,
+        [Parameter(Mandatory)] [string] $BuildId,
+        [Parameter(Mandatory)] [string] $BuildRequestHash,
+        [Parameter(Mandatory)] $BackendResult,
+        [Parameter(Mandatory)] [string] $QemuImgPath,
+        [Parameter(Mandatory)] [string] $SourceCommit,
+        [Parameter(Mandatory)] $DockerProbe,
+        [Parameter(Mandatory)] $Inputs,
+        [Parameter(Mandatory)] $BuildRequest
+    )
+    if (-not [bool]$BackendResult.CleanupComplete) { throw (New-BuildException -Code 'QEMU_CLEANUP_INCOMPLETE' -Message 'Builder QEMU cleanup is incomplete, so deadline staging is forbidden.') }
+    $isoCandidates = @(Get-ChildItem -LiteralPath $StagingDirectory -Force | Where-Object { -not $_.PSIsContainer -and $_.Name -cmatch '^300k-deadline-x86_64-[0-9a-f]{12}[.]iso$' })
+    if ($isoCandidates.Count -ne 1) { throw (New-BuildException -Code 'DEADLINE_ISO_MISSING' -Message 'Backend did not return one deadline ISO.') }
+    $iso=$isoCandidates[0]
+    $qemuInfoResult=Invoke-CheckedProcess -FilePath $QemuImgPath -ArgumentList @('info','--output=json',$iso.FullName) -TimeoutSeconds 60
+    $qemuInfo=$qemuInfoResult.StandardOutput | ConvertFrom-Json -Depth 10
+    Write-CanonicalJson ([ordered]@{ format=$qemuInfo.format; virtual_size=[long]$qemuInfo.'virtual-size'; actual_size=[long]$iso.Length }) (Join-Path $StagingDirectory 'qemu-image-info.json')
+    Write-CanonicalJson ([ordered]@{
+        schema_version=1; backend='qemu'; backend_status='executed'; guest_os='linux'; guest_arch='x86_64'; alpine_release='3.24.1'; qemu_cloud_image_sha512=$BackendResult.CloudImageSha512
+        docker_status=$DockerProbe.status; docker_reason=$DockerProbe.reason; serial_host_fingerprint=$BackendResult.SerialFingerprint; live_management_stages=@($BackendResult.ManagementStages); cleanup_complete=[bool]$BackendResult.CleanupComplete; source_commit=$SourceCommit
+    }) (Join-Path $StagingDirectory 'environment-report.json')
+    $validated=Test-DeadlineStagingBundle $StagingDirectory $BuildRequestHash $Inputs $BuildRequest
+    return Stage-DeadlineCandidate $StagingDirectory (Join-Path $script:BuildRepositoryRoot 'dist') $BuildId $validated
+}
+
 function Invoke-300kBuild {
     [CmdletBinding()]
     param(
         [ValidateSet('Auto', 'Docker', 'Qemu')] [string] $SelectedBackend,
-        [ValidateSet('Bootstrap')] [string] $SelectedTarget,
+        [ValidateSet('Bootstrap', 'DeadlineMvp')] [string] $SelectedTarget,
         [Parameter(Mandatory)] [string] $SelectedStateRoot,
         [Parameter(Mandatory)] [string] $SelectedQemuRoot,
         [Nullable[long]] $RequestedSourceDateEpoch,
@@ -996,7 +1430,9 @@ function Invoke-300kBuild {
         inputs_sha256 = Get-LowerFileSha256 -Path $inputsPath
         run_build_sha256 = Get-LowerFileSha256 -Path (Join-Path $script:BuildRepositoryRoot 'scripts/linux/run-build.sh')
         inspect_iso_sha256 = Get-LowerFileSha256 -Path (Join-Path $script:BuildRepositoryRoot 'scripts/linux/inspect-iso.sh')
+        inspect_deadline_iso_sha256 = Get-LowerFileSha256 -Path (Join-Path $script:BuildRepositoryRoot 'scripts/linux/inspect-deadline-iso.sh')
         profile_sha256 = Get-LowerFileSha256 -Path (Join-Path $script:BuildRepositoryRoot 'builder/profiles/mkimg.300k.sh')
+        apkovl_sha256 = Get-LowerFileSha256 -Path (Join-Path $script:BuildRepositoryRoot 'builder/apkovl/genapkovl-300k.sh')
     }
     $cacheIdentity = $hashes.inputs_sha256
     $backendExport = Join-Path $runRoot 'export'
@@ -1043,11 +1479,11 @@ function Invoke-300kBuild {
     if (-not [System.IO.File]::Exists($signingPublicJson)) { throw (New-BuildException -Code 'SIGNING_PUBLIC_REQUIRED' -Message 'Run -InitializeSigningKey before an ordinary build.') }
     $signing = Get-Content -Raw -LiteralPath $signingPublicJson | ConvertFrom-Json
     [void](Test-SigningPublicIdentity -SigningPublic $signing -BaseDirectory $secretRoot)
-    $request = New-BuildRequest -Inputs $inputs -Source $source -InputHashes $hashes -SigningPublic $signing
+    $request = New-BuildRequest -Inputs $inputs -Source $source -InputHashes $hashes -SigningPublic $signing -SelectedTarget $SelectedTarget
     $requestPath = Join-Path $runRoot 'build-request.json'
     Write-CanonicalJson -Value $request -Path $requestPath
     $requestHash = Get-LowerFileSha256 -Path $requestPath
-    $buildId = 'p01-' + $requestHash.Substring(0,12)
+    $buildId = if ($SelectedTarget -ceq 'DeadlineMvp') { 'deadline-' + $requestHash.Substring(0,12) } else { 'p01-' + $requestHash.Substring(0,12) }
 
     if ($CleanExactNamespace) {
         Clear-IncompleteBuildNamespace -DistRoot (Join-Path $script:BuildRepositoryRoot 'dist') -BuildId $buildId
@@ -1059,6 +1495,9 @@ function Invoke-300kBuild {
         -BuildTimeoutSeconds 14400 `
         -SigningPrivateFile (Join-Path $secretRoot '300k.rsa') -SigningPublicFile (Join-Path $secretRoot '300k.rsa.pub')
     [System.IO.File]::Copy($requestPath, (Join-Path $backendExport 'build-request.json'), $true)
+    if ($SelectedTarget -ceq 'DeadlineMvp') {
+        return Stage-DeadlineBuildArtifacts -StagingDirectory $backendExport -BuildId $buildId -BuildRequestHash $requestHash -BackendResult $backendResult -QemuImgPath $qemuImg -SourceCommit $sourceIdentity.git_commit -DockerProbe $dockerProbe -Inputs $inputs -BuildRequest $request
+    }
     return Publish-BuildArtifacts -StagingDirectory $backendExport -BuildId $buildId -BuildRequestHash $requestHash -BackendResult $backendResult -QemuImgPath $qemuImg -SourceCommit $sourceIdentity.git_commit -DockerProbe $dockerProbe -Inputs $inputs -BuildRequest $request
     }
     finally {

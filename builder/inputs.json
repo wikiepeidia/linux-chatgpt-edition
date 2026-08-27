@@ -62,7 +62,8 @@
     "zstd=1.5.7-r2",
     "lz4=1.10.0-r1",
     "cpio=2.15-r0",
-    "tar=1.35-r5"
+    "tar=1.35-r5",
+    "tcl=8.6.17-r1"
   ],
   "requested_image_packages": [
     "alpine-base",
@@ -72,21 +73,31 @@
     "dhcpcd",
     "doas",
     "e2fsprogs",
+    "eudev",
+    "font-terminus",
     "grub-efi",
     "iw",
     "kbd-bkeymaps",
     "linux-firmware",
     "linux-virt",
+    "mesa-dri-gallium",
     "network-extras",
     "openntpd",
+    "openbox",
     "openssl",
     "openssh",
     "syslinux",
+    "tcl",
+    "tk",
     "tiny-cloud-alpine",
     "tzdata",
     "wget",
     "wireless-regdb",
-    "wpa_supplicant"
+    "wpa_supplicant",
+    "xf86-input-libinput",
+    "xinit",
+    "xorg-server",
+    "xterm"
   ],
   "inspection_toolchain": {
     "gzip": {

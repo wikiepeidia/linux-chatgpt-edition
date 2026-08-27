@@ -760,6 +760,55 @@ inspect_iso_artifact() {
         || fail ISO_DECODE_AUDIT_FAILED "settled ISO failed recursive decoded-content inspection"
 }
 
+run_content_self_test() {
+    root=$1
+    user=$2
+    test_script=$root/work/content-self-test.tcl
+    sentinel=$root/work/content-self-test.sentinel
+    printf '%s\n' untouched > "$sentinel"
+    cat > "$test_script" <<'TCL'
+set ::env(300K_SEED) 424242
+source /home/builder/.mkimage/rootfs/usr/local/lib/300k/content.tcl
+set prompts [list {; poweroff} {$(id)} {[exec id]} {../../etc/shadow} {| reboot} {`uname`}]
+set turn 0
+foreach prompt $prompts {
+    set reply [reply_for $prompt $turn]
+    foreach field {id text effect actions} {
+        if {![dict exists $reply $field]} { error "reply schema missing" }
+    }
+    incr turn
+}
+set ::threehundredk_initialized 0
+set first [dict get [reply_for {deadline} 7] id]
+set ::threehundredk_initialized 0
+set second [dict get [reply_for {deadline} 7] id]
+if {$first ne $second} { error "seed seam is not deterministic" }
+puts CONTENT_SELF_TEST_PASS
+TCL
+    chown "$builder_uid:$builder_gid" "$test_script" "$sentinel"
+    chmod 0444 "$test_script" "$sentinel"
+    output=$root/work/content-self-test.stdout
+    if ! chroot "$root" /bin/su -s /bin/sh -c '/usr/bin/tclsh /work/content-self-test.tcl' "$user" > "$output" 2>&1; then
+        tail -n 20 "$output" >&2 || true
+        fail CONTENT_SELF_TEST_FAILED "display-free local content test failed"
+    fi
+    grep -Fx CONTENT_SELF_TEST_PASS "$output" >/dev/null \
+        || fail CONTENT_SELF_TEST_FAILED "content test did not emit its fixed result"
+    [ "$(cat "$sentinel")" = untouched ] \
+        || fail CONTENT_SELF_TEST_FAILED "hostile content input changed the sentinel"
+}
+
+inspect_deadline_iso_artifact() {
+    root=$1
+    iso=$2
+    iso_hash=$3
+    iso_bytes=$4
+    chroot "$root" /bin/sh /workspace/scripts/linux/inspect-deadline-iso.sh \
+        "$iso" "$iso_hash" "$iso_bytes" /work/inspection-commands.json.items \
+        /export/deadline-inspection.json /export/boot-layout.txt deadline-fast-structural \
+        || fail DEADLINE_ISO_INSPECTION_FAILED "settled ISO failed fast structural inspection"
+}
+
 append_iso_report() {
     root=$1
     iso=$2
@@ -795,6 +844,11 @@ build_from_local() {
     [ "$request_hash" = "$(cat "$WORK_ROOT/build-request.sha256")" ] || fail BUILD_REQUEST_HASH_CHANGED "BuildRequest changed between stages"
     object_root=$CACHE_ROOT/repositories/$repository_object_id
     verify_repository_snapshot "$object_root"
+    request_profile=$(json_scalar profile "$REQUEST_FILE")
+    case "$request_profile" in
+        300k_bootstrap|300k_deadline) ;;
+        *) fail BUILD_PROFILE_INVALID "BuildRequest profile is outside the closed allowlist" ;;
+    esac
 
     if [ "$(printenv 300K_INJECT_REPOSITORY_DRIFT 2>/dev/null || true)" = 1 ]; then
         injected=$(find "$object_root" -maxdepth 1 -type f -name '*.apk' | LC_ALL=C sort | head -n 1)
@@ -821,10 +875,17 @@ build_from_local() {
     chmod 0600 "$build_root/run/300k-secrets/300k.rsa"
     cp -a /workspace/. "$build_root/workspace/"
     require_file "$build_root/workspace/scripts/linux/inspect-iso.sh"
+    require_file "$build_root/workspace/scripts/linux/inspect-deadline-iso.sh"
+    require_file "$build_root/workspace/builder/apkovl/genapkovl-300k.sh"
     mkdir -p "$build_root/work/aports"
     tar -xf "$object_root/aports.tar" -C "$build_root/work/aports"
     [ -f "$build_root/work/aports/scripts/mkimage.sh" ] || fail APORTS_ARCHIVE_INVALID "retained aports archive is incomplete"
     cp "$build_root/workspace/builder/profiles/mkimg.300k.sh" "$build_root/home/$builder_user/.mkimage/mkimg.300k.sh"
+    cp "$build_root/workspace/builder/apkovl/genapkovl-300k.sh" "$build_root/home/$builder_user/.mkimage/genapkovl-300k.sh"
+    cp -a "$build_root/workspace/builder/apkovl/rootfs" "$build_root/home/$builder_user/.mkimage/rootfs"
+    chmod 0555 "$build_root/home/$builder_user/.mkimage/genapkovl-300k.sh"
+    find "$build_root/home/$builder_user/.mkimage/rootfs" -type d -exec chmod 0555 {} \;
+    find "$build_root/home/$builder_user/.mkimage/rootfs" -type f -exec chmod 0444 {} \;
 
     repositories_file=$build_root/etc/apk/repositories
     printf '%s\n' 'file:///repo' > "$repositories_file"
@@ -863,6 +924,7 @@ build_from_local() {
     chmod -R a-w,a+rX "$build_root/repo" "$build_root/work/aports" "$build_root/workspace"
     chown -R "$builder_uid:$builder_gid" \
         "$build_root/home/$builder_user" "$build_root/work/mkimage" "$build_root/export"
+    chmod 0444 "$build_root/home/$builder_user/.mkimage/mkimg.300k.sh"
     chown -R "$builder_uid:$builder_gid" "$build_root/run/300k-secrets"
     chmod 0700 "$build_root/run/300k-secrets"
     chmod 0600 "$build_root/run/300k-secrets/300k.rsa" "$build_root/run/300k-secrets/300k.rsa.pub"
@@ -887,15 +949,21 @@ build_from_local() {
     verify_repository_snapshot "$build_root/repo/x86_64"
     verify_repository_snapshot "$object_root"
     verify_closed_keyring "$build_root/etc/apk/keys" "$trusted_key_manifest"
-    run_inspector_self_test "$build_root"
+    case "$request_profile" in
+        300k_bootstrap) run_inspector_self_test "$build_root" ;;
+        300k_deadline) run_content_self_test "$build_root" "$builder_user" ;;
+    esac
     source_date_epoch=$(json_scalar source_date_epoch "$REQUEST_FILE")
     case "$source_date_epoch" in ''|0|*[!0-9]*) fail SOURCE_DATE_EPOCH_INVALID "BuildRequest epoch is invalid" ;; esac
-    release_tag=p01-${request_hash%${request_hash#????????????}}
+    case "$request_profile" in
+        300k_bootstrap) release_tag=p01-${request_hash%${request_hash#????????????}} ;;
+        300k_deadline) release_tag=deadline-${request_hash%${request_hash#????????????}} ;;
+    esac
     mkimage_workdir=/work/mkimage/$request_hash
     # Pinned aports commit 52643b7 copies /etc/apk/keys into its inner APKROOT
     # only with --hostkeys. The buildroot key directory above is an exact,
     # hash-verified four-key allowlist, so no ambient guest key crosses here.
-    mkimage_command="exec /usr/bin/env -i HOME=/home/$builder_user PATH=/usr/sbin:/usr/bin:/sbin:/bin CBUILD=x86_64 SOURCE_DATE_EPOCH=$source_date_epoch PACKAGER_PRIVKEY=/run/300k-secrets/300k.rsa PACKAGER_PUBKEY=/run/300k-secrets/300k.rsa.pub /bin/sh /work/aports/scripts/mkimage.sh --tag $release_tag --outdir /export/raw --workdir $mkimage_workdir --arch x86_64 --hostkeys --repository file:///repo --profile 300k_bootstrap --checksum"
+    mkimage_command="exec /usr/bin/env -i HOME=/home/$builder_user PATH=/usr/sbin:/usr/bin:/sbin:/bin CBUILD=x86_64 SOURCE_DATE_EPOCH=$source_date_epoch PACKAGER_PRIVKEY=/run/300k-secrets/300k.rsa PACKAGER_PUBKEY=/run/300k-secrets/300k.rsa.pub /bin/sh /work/aports/scripts/mkimage.sh --tag $release_tag --outdir /export/raw --workdir $mkimage_workdir --arch x86_64 --hostkeys --repository file:///repo --profile $request_profile --checksum"
     # Pinned aports uses apk add --no-chown for its APKROOT. apk-tools 3 maps
     # that option to usermode and rejects uid 0, so run mkimage as its sole
     # dedicated owner rather than weakening package verification.
@@ -932,35 +1000,68 @@ build_from_local() {
     iso_in_root=$(find "$build_root/export/raw" -maxdepth 1 -type f -name '*.iso' | LC_ALL=C sort | head -n 1)
     require_file "$iso_in_root"
     iso_hash=$(sha256_file "$iso_in_root")
-    iso_name=300k-bootstrap-x86_64-$(printf '%s' "$iso_hash" | cut -c1-12).iso
-    inspect_iso_artifact "$build_root" "${iso_in_root#$build_root}"
-    require_file "$build_root/export/iso-audit.json"
-    grep -F "\"iso_sha256\": \"$iso_hash\"" "$build_root/export/iso-audit.json" >/dev/null \
-        || fail ISO_AUDIT_HASH_MISMATCH "decoded audit does not identify the settled ISO bytes"
-    grep -F '"result": "pass"' "$build_root/export/iso-audit.json" >/dev/null \
-        || fail ISO_AUDIT_RESULT_INVALID "decoded audit is not a successful result"
+    iso_bytes=$(file_bytes "$iso_in_root")
+    case "$request_profile" in
+        300k_bootstrap)
+            iso_name=300k-bootstrap-x86_64-$(printf '%s' "$iso_hash" | cut -c1-12).iso
+            inspect_iso_artifact "$build_root" "${iso_in_root#$build_root}"
+            require_file "$build_root/export/iso-audit.json"
+            grep -F "\"iso_sha256\": \"$iso_hash\"" "$build_root/export/iso-audit.json" >/dev/null \
+                || fail ISO_AUDIT_HASH_MISMATCH "decoded audit does not identify the settled ISO bytes"
+            grep -F '"result": "pass"' "$build_root/export/iso-audit.json" >/dev/null \
+                || fail ISO_AUDIT_RESULT_INVALID "decoded audit is not a successful result"
+            cp "$build_root/export/iso-audit.json" "$EXPORT_ROOT/iso-audit.json"
+            ;;
+        300k_deadline)
+            iso_name=300k-deadline-x86_64-$(printf '%s' "$iso_hash" | cut -c1-12).iso
+            inspect_deadline_iso_artifact "$build_root" "${iso_in_root#$build_root}" "$iso_hash" "$iso_bytes"
+            require_file "$build_root/export/deadline-inspection.json"
+            cp "$build_root/export/deadline-inspection.json" "$EXPORT_ROOT/deadline-inspection.json"
+            cp "$build_root/export/boot-layout.txt" "$EXPORT_ROOT/boot-layout.txt"
+            ;;
+    esac
     cp "$iso_in_root" "$EXPORT_ROOT/$iso_name"
-    cp "$build_root/export/iso-audit.json" "$EXPORT_ROOT/iso-audit.json"
     printf '%s  %s\n' "$iso_hash" "$iso_name" > "$EXPORT_ROOT/SHA256SUMS"
-    boot_layout=$EXPORT_ROOT/boot-layout.txt
-    : > "$boot_layout.partial"
-    append_iso_report "$build_root" "${iso_in_root#$build_root}" "$inspection_file" "$boot_layout.partial" pvd-info -pvd_info
-    append_iso_report "$build_root" "${iso_in_root#$build_root}" "$inspection_file" "$boot_layout.partial" el-torito-plain -report_el_torito plain
-    append_iso_report "$build_root" "${iso_in_root#$build_root}" "$inspection_file" "$boot_layout.partial" el-torito-mkisofs -report_el_torito as_mkisofs
-    append_iso_report "$build_root" "${iso_in_root#$build_root}" "$inspection_file" "$boot_layout.partial" system-area -report_system_area plain
-    mv "$boot_layout.partial" "$boot_layout"
+    if [ "$request_profile" = 300k_bootstrap ]; then
+        boot_layout=$EXPORT_ROOT/boot-layout.txt
+        : > "$boot_layout.partial"
+        append_iso_report "$build_root" "${iso_in_root#$build_root}" "$inspection_file" "$boot_layout.partial" pvd-info -pvd_info
+        append_iso_report "$build_root" "${iso_in_root#$build_root}" "$inspection_file" "$boot_layout.partial" el-torito-plain -report_el_torito plain
+        append_iso_report "$build_root" "${iso_in_root#$build_root}" "$inspection_file" "$boot_layout.partial" el-torito-mkisofs -report_el_torito as_mkisofs
+        append_iso_report "$build_root" "${iso_in_root#$build_root}" "$inspection_file" "$boot_layout.partial" system-area -report_system_area plain
+        mv "$boot_layout.partial" "$boot_layout"
+    fi
     require_file "$EXPORT_ROOT/boot-layout.txt"
 
     builder_hash=$(sha256_file "$EXPORT_ROOT/builder-packages.lock")
     builder_bytes=$(file_bytes "$EXPORT_ROOT/builder-packages.lock")
     apk_hashes_hash=$(sha256_file "$EXPORT_ROOT/apk-files.sha256")
     apk_hashes_bytes=$(file_bytes "$EXPORT_ROOT/apk-files.sha256")
-    audit_hash=$(sha256_file "$EXPORT_ROOT/iso-audit.json")
-    audit_bytes=$(file_bytes "$EXPORT_ROOT/iso-audit.json")
     checksums_hash=$(sha256_file "$EXPORT_ROOT/SHA256SUMS")
     checksums_bytes=$(file_bytes "$EXPORT_ROOT/SHA256SUMS")
     inspection_hash=$(sha256_file "$inspection_file")
     iso_bytes=$(file_bytes "$EXPORT_ROOT/$iso_name")
+    artifact_items=$WORK_ROOT/resolved-artifacts.json.items
+    case "$request_profile" in
+        300k_bootstrap)
+            audit_hash=$(sha256_file "$EXPORT_ROOT/iso-audit.json")
+            audit_bytes=$(file_bytes "$EXPORT_ROOT/iso-audit.json")
+            cat > "$artifact_items" <<EOF
+    {"role": "bootstrap_iso", "file": "$iso_name", "sha256": "$iso_hash", "bytes": $iso_bytes},
+    {"role": "decoded_iso_audit", "file": "iso-audit.json", "sha256": "$audit_hash", "bytes": $audit_bytes},
+    {"role": "iso_checksums", "file": "SHA256SUMS", "sha256": "$checksums_hash", "bytes": $checksums_bytes}
+EOF
+            ;;
+        300k_deadline)
+            deadline_hash=$(sha256_file "$EXPORT_ROOT/deadline-inspection.json")
+            deadline_bytes=$(file_bytes "$EXPORT_ROOT/deadline-inspection.json")
+            cat > "$artifact_items" <<EOF
+    {"role": "deadline_mvp_iso", "file": "$iso_name", "sha256": "$iso_hash", "bytes": $iso_bytes},
+    {"role": "deadline_fast_inspection", "file": "deadline-inspection.json", "sha256": "$deadline_hash", "bytes": $deadline_bytes},
+    {"role": "iso_checksums", "file": "SHA256SUMS", "sha256": "$checksums_hash", "bytes": $checksums_bytes}
+EOF
+            ;;
+    esac
     main_hash=$(repository_value main apkindex_sha256)
     community_hash=$(repository_value community apkindex_sha256)
     cat > "$EXPORT_ROOT/resolved-build-lock.json.partial" <<EOF
@@ -998,9 +1099,7 @@ $(cat "$inspection_file")
   "inspection_toolchain_sha256": "$inspection_hash",
   "offline_install": {"repositories": ["file:///repo"], "apk_no_network": true, "network_disabled": true, "complete_manifest_verified": true},
   "artifacts": [
-    {"role": "bootstrap_iso", "file": "$iso_name", "sha256": "$iso_hash", "bytes": $iso_bytes},
-    {"role": "decoded_iso_audit", "file": "iso-audit.json", "sha256": "$audit_hash", "bytes": $audit_bytes},
-    {"role": "iso_checksums", "file": "SHA256SUMS", "sha256": "$checksums_hash", "bytes": $checksums_bytes}
+$(cat "$artifact_items")
   ]
 }
 EOF

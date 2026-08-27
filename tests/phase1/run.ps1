@@ -1143,7 +1143,13 @@ Add-TestCase -Name 'BUILD-04 source archive preserves LF-only guest shell script
             $stream = [System.IO.File]::Create($path)
             $writer = [System.Formats.Tar.TarWriter]::new($stream, $false)
             try {
-                foreach ($entryName in @('scripts/linux/run-build.sh', 'scripts/linux/inspect-iso.sh', 'builder/profiles/mkimg.300k.sh')) {
+                foreach ($entryName in @(
+                    'scripts/linux/run-build.sh', 'scripts/linux/inspect-iso.sh', 'scripts/linux/inspect-deadline-iso.sh',
+                    'builder/profiles/mkimg.300k.sh', 'builder/apkovl/genapkovl-300k.sh',
+                    'builder/apkovl/rootfs/etc/local.d/300k.start', 'builder/apkovl/rootfs/etc/profile.d/300k-session.sh',
+                    'builder/apkovl/rootfs/home/chatgpt/.xinitrc', 'builder/apkovl/rootfs/usr/local/bin/300k-runtime',
+                    'builder/apkovl/rootfs/usr/local/sbin/300k-power'
+                )) {
                     $entry = [System.Formats.Tar.PaxTarEntry]::new([System.Formats.Tar.TarEntryType]::RegularFile, $entryName)
                     $entry.DataStream = [System.IO.MemoryStream]::new($fixture.Bytes, $false)
                     try { $writer.WriteEntry($entry) }
@@ -1237,13 +1243,16 @@ Add-TestCase -Name 'BUILD-04 Linux core owns package/profile decisions and the Q
     $profile = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'builder/profiles/mkimg.300k.sh')
     Assert-Match -Value $profile -Pattern 'profile_300k_bootstrap'
     Assert-Match -Value $profile -Pattern 'profile_virt'
-    Assert-Match -Value $profile -Pattern 'for _300k_package in \$apks; do[\s\S]{0,300}\[ "\$_300k_package" = alpine-base \][\s\S]{0,300}done' -Message 'The ISO package set must remove the alpine-base meta-package that pulls the broad alpine-keys payload.'
+    $bootstrapMatch = [regex]::Match($profile, '(?ms)^profile_300k_bootstrap\(\) \{.*?^\}')
+    Assert-True -Condition $bootstrapMatch.Success -Message 'The bootstrap profile function is not a closed thin profile.'
+    $bootstrapProfile = $bootstrapMatch.Value
+    Assert-Match -Value $bootstrapProfile -Pattern 'for _300k_package in \$apks; do[\s\S]{0,300}\[ "\$_300k_package" = alpine-base \][\s\S]{0,300}done' -Message 'The ISO package set must remove the alpine-base meta-package that pulls the broad alpine-keys payload.'
     foreach ($basePackage in @('alpine-baselayout', 'alpine-conf', 'apk-tools', 'busybox', 'busybox-mdev-openrc', 'busybox-openrc', 'busybox-suid', 'musl-utils', 'openrc')) {
-        Assert-Match -Value $profile -Pattern ([regex]::Escape($basePackage)) -Message "Explicit bootstrap constituent '$basePackage' is missing after alpine-base removal."
+        Assert-Match -Value $bootstrapProfile -Pattern ([regex]::Escape($basePackage)) -Message "Explicit bootstrap constituent '$basePackage' is missing after alpine-base removal."
     }
-    Assert-False -Condition ([bool]($profile -match '(?m)^\s*apks=.*\balpine-(release|keys)\b')) -Message 'The published ISO profile must not directly restore broad Alpine release-key packages.'
-    Assert-False -Condition ([bool]($profile -match '(?i)apk add|xorriso|mkimage\.sh|linux-virt')) -Message 'The thin profile duplicated upstream assembly decisions.'
-    Assert-True -Condition (($profile -split "`n").Count -le 12) -Message 'The bootstrap profile is no longer a thin profile_virt extension.'
+    Assert-False -Condition ([bool]($bootstrapProfile -match '(?m)^\s*apks=.*\balpine-(release|keys)\b')) -Message 'The published bootstrap profile must not directly restore broad Alpine release-key packages.'
+    Assert-False -Condition ([bool]($bootstrapProfile -match '(?i)apk add|xorriso|mkimage\.sh|linux-virt')) -Message 'The thin bootstrap profile duplicated upstream assembly decisions.'
+    Assert-True -Condition (($bootstrapProfile -split "`n").Count -le 12) -Message 'The bootstrap profile is no longer a thin profile_virt extension.'
 
     $qemu = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/host/Invoke-QemuBackend.ps1')
     Assert-Match -Value $qemu -Pattern '@\(''resize'', ''-f'', ''qcow2'', \$overlayPath, ''16G''\)' -Message 'The disposable cloud overlay is not expanded before boot.'

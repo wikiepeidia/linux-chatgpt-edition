@@ -49,6 +49,13 @@ function Assert-Match {
     if ($Value -notmatch $Pattern) { throw "$Message Pattern=<$Pattern>" }
 }
 
+function Assert-Throws {
+    param([Parameter(Mandatory)] [scriptblock] $Body, [string] $Message = 'Expected an exception.')
+    try { & $Body }
+    catch { return }
+    throw $Message
+}
+
 function Get-RepoText {
     param([Parameter(Mandatory)] [string] $Path)
     $full = Join-Path $script:RepositoryRoot $Path
@@ -137,11 +144,13 @@ Add-Test -Name 'Locked live-user boot path is bounded and retains rescue access'
 
 Add-Test -Name 'Stable boot and PTY markers have one authored producer each' -Scopes @('RuntimeStatic') -Body {
     $all = ($runtimeFiles | ForEach-Object { Get-RepoText $_ }) -join "`n"
+    $runtime = Get-RepoText 'builder/apkovl/rootfs/usr/local/bin/300k-runtime'
     foreach ($stage in @('ROOTFS_READY','X_READY','UI_READY')) {
         $count = [regex]::Matches($all, 'serial-stage\s+' + $stage).Count
         Assert-Equal 1 $count "Stage $stage must have exactly one authored producer."
     }
     Assert-Equal 1 ([regex]::Matches($all, 'TERM_EXEC_OK uid=').Count) 'TERM_EXEC_OK must be emitted only by the PTY proof.'
+    Assert-Match $runtime 'printf ''\\n%s\\n'' "\$line" > /dev/ttyS0' 'Serial stages must start on a fresh line even when the rescue getty prompt is active.'
 }
 
 Add-Test -Name 'Content records are closed, seedable, varied, and non-executable' -Scopes @('RuntimeStatic') -Body {
@@ -206,6 +215,227 @@ Add-Test -Name 'Full-screen original UI keeps identity and fixed controls visibl
     foreach ($label in @('Terminal','Help','About','System Info','Reboot','Shutdown')) { Assert-Match $ui ([regex]::Escape($label)) "UI control is missing: $label" }
     Assert-Match $ui 'winfo ismapped' 'UI readiness must depend on a mapped top-level window.'
     Assert-Match $ui 'after[^\r\n]*terminal-proof' 'UI must schedule one bounded terminal proof after mapping.'
+}
+
+Add-Test -Name 'Deadline target and profile extend rather than weaken Bootstrap' -Scopes @('BuildStatic') -Body {
+    $build = Get-RepoText 'build.ps1'
+    $profile = Get-RepoText 'builder/profiles/mkimg.300k.sh'
+    $runner = Get-RepoText 'scripts/linux/run-build.sh'
+    $inputs = Get-RepoText 'builder/inputs.json' | ConvertFrom-Json -Depth 64
+
+    Assert-Match $build "ValidateSet\('Bootstrap', 'DeadlineMvp'\)" 'Public target enum must include the isolated deadline target.'
+    Assert-Match $build "300k_deadline" 'BuildRequest must map DeadlineMvp to the deadline profile.'
+    Assert-Match $build "deadline_mvp_iso" 'Deadline artifact role is missing.'
+    Assert-Match $build ([regex]::Escape("'deadline-' + `$requestHash.Substring(0,12)")) 'Deadline build identity must be request-qualified.'
+    Assert-Match $profile 'profile_300k_bootstrap\(\)' 'Bootstrap profile must remain present.'
+    Assert-Match $profile 'profile_300k_deadline\(\)[\s\S]*profile_virt' 'Deadline profile must inherit profile_virt.'
+    Assert-Match $profile 'profile_300k_deadline\(\)[\s\S]*arch="x86_64"[\s\S]*hostname="300k"[\s\S]*apkovl="genapkovl-300k[.]sh"' 'Deadline profile identity/apkovl contract is incomplete.'
+    foreach ($package in @('eudev','font-terminus','mesa-dri-gallium','openbox','tcl','tk','xf86-input-libinput','xinit','xorg-server','xterm')) {
+        Assert-True (@($inputs.requested_image_packages) -ccontains $package) "Retained image closure is missing $package."
+        Assert-Match $profile ([regex]::Escape($package)) "Deadline profile is missing $package."
+    }
+    Assert-True (@($inputs.builder_packages) -ccontains 'tcl=8.6.17-r1') 'Display-free guest content tests require exact tcl=8.6.17-r1.'
+    Assert-Match $runner 'request_profile=\$\(json_scalar profile "\$REQUEST_FILE"\)' 'Linux build must derive the profile from immutable BuildRequest.'
+    Assert-Match $runner '300k_bootstrap\|300k_deadline' 'Only the two known profiles may cross into mkimage argv.'
+    Assert-Match $runner '300k_bootstrap\)[\s\S]*run_inspector_self_test[\s\S]*inspect_iso_artifact' 'Bootstrap must retain both recursive verification stages.'
+    Assert-Match $runner '300k_deadline\)[\s\S]*run_content_self_test[\s\S]*inspect_deadline_iso_artifact' 'Deadline must use content self-test and fast inspection.'
+    Assert-Match $runner '--profile \$request_profile' 'mkimage must use only the allowlisted request profile.'
+}
+
+Add-Test -Name 'Deadline inspector requires exact BIOS, EFI, ISO, and deferral evidence' -Scopes @('BuildStatic') -Body {
+    $inspector = Get-RepoText 'scripts/linux/inspect-deadline-iso.sh'
+    foreach ($path in @('/boot/vmlinuz-virt','/boot/initramfs-virt','/300k.apkovl.tar.gz','/apks/x86_64/APKINDEX.tar.gz','/boot/syslinux/isolinux.bin','/efi/boot/bootx64.efi','/boot/syslinux/boot.cat','/boot/grub/efi.img')) {
+        Assert-Match $inspector ([regex]::Escape($path)) "Fast inspector is missing $path."
+    }
+    foreach ($fact in @('deadline-fast-structural','recursive_content_audit','runtime_uefi_boot','not-executed','iso_sha256','iso_bytes','result')) {
+        Assert-Match $inspector ([regex]::Escape($fact)) "Fast inspection evidence is missing $fact."
+    }
+    Assert-Match $inspector '-report_el_torito plain' 'Fast inspector must prove plain El Torito records.'
+    Assert-Match $inspector '-report_el_torito as_mkisofs' 'Fast inspector must prove BIOS and EFI image argv.'
+    Assert-Match $inspector 'deadline-inspection[.]json[.]partial' 'Inspection JSON must be committed atomically.'
+}
+
+Add-Test -Name 'Deadline candidate and promotion path are isolated and fail closed' -Scopes @('Publication') -Body {
+    $buildSource = Get-RepoText 'build.ps1'
+    Assert-Match $buildSource '::Replace\(\$latestPartial, \$latest, \$backup, \$true\)[\s\S]{0,180}\$pointerChanged = \$true[\s\S]{0,180}::Delete\(\$backup\)' 'Pointer replacement must be marked before fallible backup cleanup so rollback remains armed.'
+    . (Join-Path $script:RepositoryRoot 'build.ps1')
+    foreach ($functionName in @('Test-DeadlineStagingBundle','Stage-DeadlineCandidate','Test-DeadlineCandidateDirectory','Test-DeadlineSmokeEvidence','Complete-DeadlineCandidate')) {
+        Assert-True ($null -ne (Get-Command $functionName -CommandType Function -ErrorAction SilentlyContinue)) "Deadline publication function is missing: $functionName"
+    }
+
+    $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('300k-deadline-publication-' + [Guid]::NewGuid().ToString('N'))
+    $dist = Join-Path $scratch 'dist'
+    $candidateRoot = Join-Path $dist '.deadline-candidates'
+    $evidenceRoot = Join-Path $dist '.deadline-evidence'
+    [System.IO.Directory]::CreateDirectory($candidateRoot) | Out-Null
+    [System.IO.Directory]::CreateDirectory($evidenceRoot) | Out-Null
+    try {
+        $buildId = 'deadline-' + ('a' * 12)
+        $candidate = Join-Path $candidateRoot $buildId
+        [System.IO.Directory]::CreateDirectory($candidate) | Out-Null
+        $isoName = '300k-deadline-x86_64-' + ('b' * 12) + '.iso'
+        $isoPath = Join-Path $candidate $isoName
+        [System.IO.File]::WriteAllBytes($isoPath, [byte[]](1..64))
+        $inspectionPath = Join-Path $candidate 'deadline-inspection.json'
+        Write-CanonicalJson ([ordered]@{ schema='DeadlineIsoInspection'; schema_version=1; scope='deadline-fast-structural'; result='pass' }) $inspectionPath
+        $records = @($isoName, 'deadline-inspection.json' | Sort-Object -CaseSensitive | ForEach-Object {
+            $item = Get-Item -LiteralPath (Join-Path $candidate $_)
+            [ordered]@{ file=$_; sha256=Get-LowerFileSha256 $item.FullName; bytes=[long]$item.Length }
+        })
+        $deferred = [ordered]@{ runtime_uefi='not-executed'; raw_usb='not-executed'; broad_hardware_support='not-executed'; docker_parity='not-executed'; second_build_reproducibility='not-executed'; size_optimization='not-executed'; exhaustive_security='not-executed'; general_release_certification='not-executed' }
+        $manifestPath = Join-Path $candidate 'deadline-candidate.json'
+        Write-CanonicalJson ([ordered]@{
+            schema='DeadlineCandidateManifest'; schema_version=1; build_id=$buildId; build_request_sha256=('c' * 64); source_commit=('d' * 40)
+            iso=[ordered]@{ file=$isoName; sha256=Get-LowerFileSha256 $isoPath; bytes=[long](Get-Item $isoPath).Length }
+            inspection=[ordered]@{ file='deadline-inspection.json'; scope='deadline-fast-structural' }; deferred=$deferred; files=$records
+        }) $manifestPath
+
+        $evidence = Join-Path $evidenceRoot $buildId
+        [System.IO.Directory]::CreateDirectory($evidence) | Out-Null
+        $serialPath = Join-Path $evidence 'serial.log'
+        [System.IO.File]::WriteAllText($serialPath, (@(
+            '300K_STAGE=ROOTFS_READY','300K_STAGE=X_READY','300K_STAGE=UI_READY',
+            '300K_STAGE=TERM_EXEC_OK uid=1000 user=chatgpt tty=/dev/pts/0 command=ok file=ok exit=1'
+        ) -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
+        $screenPath = Join-Path $evidence 'screen.ppm'
+        $ppm = [System.Collections.Generic.List[byte]]::new()
+        $ppm.AddRange([System.Text.Encoding]::ASCII.GetBytes("P6`n2 2`n255`n"))
+        $ppm.AddRange([byte[]](0,0,0,255,255,255,10,20,30,200,30,40))
+        [System.IO.File]::WriteAllBytes($screenPath, $ppm.ToArray())
+        $argv = New-DeadlineQemuArguments -QemuExecutable 'D:\VM\qemu\qemu-system-x86_64.exe' -IsoPath $isoPath -SerialPath $serialPath -QmpPort 49152
+        $evidencePath = Join-Path $evidence 'deadline-smoke-evidence.json'
+        $evidenceObject = [ordered]@{
+            schema='DeadlineSmokeEvidence'; schema_version=1; result='pass'; build_id=$buildId; attempt_id=('e' * 32)
+            iso=[ordered]@{ file=$isoName; sha256=Get-LowerFileSha256 $isoPath; bytes=[long](Get-Item $isoPath).Length }
+            qemu=[ordered]@{ executable='D:\VM\qemu\qemu-system-x86_64.exe'; argv=@($argv); machine='pc'; firmware='bios'; media='optical-read-only'; nic='none'; memory_mib=1024 }
+            markers=@(
+                [ordered]@{ stage='ROOTFS_READY'; line=1 }, [ordered]@{ stage='X_READY'; line=2 },
+                [ordered]@{ stage='UI_READY'; line=3 }, [ordered]@{ stage='TERM_EXEC_OK'; line=4 }
+            )
+            terminal=[ordered]@{ uid=1000; user='chatgpt'; tty='/dev/pts/0'; command='ok'; file='ok'; exit=1 }
+            serial=[ordered]@{ file='serial.log'; sha256=Get-LowerFileSha256 $serialPath; bytes=[long](Get-Item $serialPath).Length }
+            screenshot=[ordered]@{ file='screen.ppm'; sha256=Get-LowerFileSha256 $screenPath; bytes=[long](Get-Item $screenPath).Length; width=2; height=2; max_value=255; distinct_pixels=4; nonblank=$true }
+            deferred=$deferred
+        }
+        Write-CanonicalJson $evidenceObject $evidencePath
+
+        $priorDirectory = Join-Path $dist 'prior-build'
+        [System.IO.Directory]::CreateDirectory($priorDirectory) | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $priorDirectory 'sentinel.bin'), 'immutable')
+        $latestPath = Join-Path $dist 'LATEST.json'
+        $priorLatest = [System.Text.UTF8Encoding]::new($false).GetBytes('{"schema_version":1,"build_id":"prior-build","directory":"prior-build"}' + "`n")
+        [System.IO.File]::WriteAllBytes($latestPath, $priorLatest)
+
+        $mutations = @(
+            { param($x) $x.iso.sha256 = ('0' * 64) },
+            { param($x) $x.screenshot.nonblank = $false },
+            { param($x) $x.markers[1].line = 1 },
+            { param($x) $x.terminal.uid = 0 },
+            { param($x) $x.terminal.tty = '/dev/tty1' },
+            { param($x) $x.terminal.command = 'missing' },
+            { param($x) $x.terminal.file = 'missing' },
+            { param($x) $x.terminal.exit = 0 }
+        )
+        foreach ($mutation in $mutations) {
+            $copy = ($evidenceObject | ConvertTo-Json -Depth 64 | ConvertFrom-Json -Depth 64)
+            & $mutation $copy
+            $invalidPath = Join-Path $evidence ('invalid-' + [Guid]::NewGuid().ToString('N') + '.json')
+            Write-CanonicalJson $copy $invalidPath
+            Assert-Throws { Test-DeadlineSmokeEvidence -EvidencePath $invalidPath -CandidateManifestPath $manifestPath } 'Malformed evidence was accepted.'
+            Assert-Equal ([Convert]::ToHexString($priorLatest)) ([Convert]::ToHexString([System.IO.File]::ReadAllBytes($latestPath))) 'Rejected evidence changed LATEST.'
+        }
+
+        $completed = Complete-DeadlineCandidate -CandidateManifestPath $manifestPath -EvidencePath $evidencePath -DistRoot $dist
+        Assert-True (Test-Path -LiteralPath $completed.Directory -PathType Container) 'Passing evidence did not promote the candidate.'
+        $publishedManifest = Join-Path $completed.Directory 'deadline-candidate.json'
+        $revalidated = Test-DeadlineSmokeEvidence -EvidencePath $evidencePath -CandidateManifestPath $publishedManifest
+        Assert-Equal $isoPath $revalidated.ExecutedIsoPath 'Post-promotion validation forgot the exact quarantined ISO path that QEMU executed.'
+        $latest = Get-Content -Raw -LiteralPath $latestPath | ConvertFrom-Json
+        Assert-Equal $buildId $latest.build_id 'LATEST does not name the promoted build.'
+        Assert-Equal (Get-LowerFileSha256 (Join-Path $completed.Directory $isoName)) $latest.iso_sha256 'LATEST hash differs from promoted bytes.'
+        Assert-Equal 'immutable' ([System.IO.File]::ReadAllText((Join-Path $priorDirectory 'sentinel.bin'))) 'Prior published bytes changed.'
+    }
+    finally {
+        if ([System.IO.Directory]::Exists($scratch)) { [System.IO.Directory]::Delete($scratch, $true) }
+    }
+}
+
+Add-Test -Name 'Direct smoke contract is one-attempt BIOS optical and evidence driven' -Scopes @('SmokeUnit') -Body {
+    $smokePath = Join-Path $script:RepositoryRoot 'scripts/host/Invoke-DeadlineSmoke.ps1'
+    Assert-True (Test-Path -LiteralPath $smokePath -PathType Leaf) 'Direct deadline smoke runner is missing.'
+    . $smokePath
+    foreach ($functionName in @('New-DeadlineQemuArguments','Get-DeadlineSerialFacts','Read-DeadlinePpm','New-DeadlineAttemptRecord','Invoke-DeadlineQmpCommand')) {
+        Assert-True ($null -ne (Get-Command $functionName -CommandType Function -ErrorAction SilentlyContinue)) "Smoke function is missing: $functionName"
+    }
+
+    $args = New-DeadlineQemuArguments -QemuExecutable 'D:\VM\qemu\qemu-system-x86_64.exe' -IsoPath 'D:\candidate.iso' -SerialPath 'D:\serial.log' -QmpPort 49153
+    Assert-Equal @('-machine','pc','-accel','tcg','-m','1024','-boot','order=d,strict=on','-cdrom','D:\candidate.iso','-vga','std','-display','none','-serial','file:D:\serial.log','-qmp','tcp:127.0.0.1:49153,server=on,wait=off','-monitor','none','-nic','none','-no-reboot') @($args) 'QEMU argv differs from the direct BIOS optical contract.'
+    foreach ($forbidden in @('-drive','-hda','-netdev','hostfwd','-snapshot')) { Assert-False (@($args) -ccontains $forbidden) "QEMU argv contains forbidden token $forbidden." }
+
+    $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('300k-deadline-smoke-unit-' + [Guid]::NewGuid().ToString('N'))
+    [System.IO.Directory]::CreateDirectory($scratch) | Out-Null
+    try {
+        $serial = Join-Path $scratch 'serial.log'
+        [System.IO.File]::WriteAllText($serial, "300K_STAGE=ROOTFS_READY`n300K_STAGE=X_READY`n300K_STAGE=UI_READY`n300K_STAGE=TERM_EXEC_OK uid=1000 user=chatgpt tty=/dev/pts/2 command=ok file=ok exit=1`n", [System.Text.UTF8Encoding]::new($false))
+        $facts = Get-DeadlineSerialFacts -Path $serial
+        Assert-Equal 1000 $facts.Terminal.uid 'PTY proof uid was not parsed.'
+        Assert-Equal '/dev/pts/2' $facts.Terminal.tty 'PTY proof tty was not parsed.'
+        [System.IO.File]::AppendAllText($serial, "300K_STAGE=UI_READY`n")
+        Assert-Throws { Get-DeadlineSerialFacts -Path $serial } 'Duplicate stage was accepted.'
+
+        $ppmPath = Join-Path $scratch 'screen.ppm'
+        $bytes = [System.Collections.Generic.List[byte]]::new()
+        $bytes.AddRange([System.Text.Encoding]::ASCII.GetBytes("P6`n2 1`n255`n"))
+        $bytes.AddRange([byte[]](0,0,0,255,255,255))
+        [System.IO.File]::WriteAllBytes($ppmPath, $bytes.ToArray())
+        $ppm = Read-DeadlinePpm -Path $ppmPath
+        Assert-True $ppm.nonblank 'Two-color PPM was classified blank.'
+        $attemptRoot = Join-Path $scratch 'attempts'
+        $attempt = New-DeadlineAttemptRecord -AttemptRoot $attemptRoot -BuildId 'deadline-aaaaaaaaaaaa' -CandidateSha256 ('a' * 64) -EvidenceDirectory $scratch
+        Assert-True (Test-Path -LiteralPath $attempt.Path -PathType Leaf) 'Attempt record was not durable.'
+        Assert-Throws { New-DeadlineAttemptRecord -AttemptRoot $attemptRoot -BuildId 'deadline-aaaaaaaaaaaa' -CandidateSha256 ('a' * 64) -EvidenceDirectory $scratch } 'A second candidate attempt was accepted.'
+    }
+    finally {
+        if ([System.IO.Directory]::Exists($scratch)) { [System.IO.Directory]::Delete($scratch, $true) }
+    }
+}
+
+Add-Test -Name 'Deadline documentation states exact commands and honest deferrals' -Scopes @('BuildStatic') -Body {
+    $doc = Get-RepoText 'docs/DEADLINE-MVP.md'
+    Assert-Match $doc 'build[.]ps1 -Backend Qemu -Target DeadlineMvp' 'Documentation lacks the exact deadline build command.'
+    Assert-Match $doc 'Invoke-DeadlineSmoke[.]ps1' 'Documentation lacks the direct smoke command.'
+    foreach ($claim in @('unofficial','offline','BIOS optical','UEFI runtime','raw USB','Docker parity','second build','size optimization','exhaustive security','release certification')) {
+        Assert-Match $doc ([regex]::Escape($claim)) "Documentation does not classify $claim."
+    }
+}
+
+Add-Test -Name 'Published deadline pointer revalidates immutable boot evidence' -Scopes @('Evidence') -Body {
+    . (Join-Path $script:RepositoryRoot 'build.ps1')
+    $latest = if ([System.IO.Path]::IsPathRooted($LatestPath)) { [System.IO.Path]::GetFullPath($LatestPath) } else { [System.IO.Path]::GetFullPath((Join-Path $script:RepositoryRoot $LatestPath)) }
+    Assert-True (Test-Path -LiteralPath $latest -PathType Leaf) 'Published LATEST pointer is absent.'
+    $dist = [System.IO.Directory]::GetParent($latest).FullName
+    $pointer = Read-ClosedJsonArtifact -Path $latest -Code 'DEADLINE_LATEST_INVALID'
+    Assert-ClosedObjectKeys $pointer @('schema_version','build_id','directory','iso_file','iso_sha256','iso_bytes','verification','smoke_evidence','smoke_evidence_sha256','screenshot_sha256','serial_sha256','source_commit') 'DEADLINE_LATEST_INVALID' 'Deadline LATEST'
+    Assert-True ([int]$pointer.schema_version -eq 1 -and $pointer.build_id -cmatch '^deadline-[0-9a-f]{12}$' -and $pointer.directory -ceq $pointer.build_id -and $pointer.verification -ceq 'deadline-bios-optical') 'LATEST does not identify one promoted deadline BIOS proof.'
+    Assert-True ($pointer.iso_file -cmatch '^300k-deadline-x86_64-[0-9a-f]{12}[.]iso$' -and $pointer.iso_sha256 -cmatch '^[0-9a-f]{64}$' -and [long]$pointer.iso_bytes -gt 0 -and $pointer.source_commit -cmatch '^[0-9a-f]{40}$') 'LATEST ISO or source identity is malformed.'
+    $expectedEvidenceName = '.deadline-evidence/' + $pointer.build_id + '/deadline-smoke-evidence.json'
+    Assert-Equal $expectedEvidenceName ([string]$pointer.smoke_evidence) 'LATEST smoke evidence path is outside the retained candidate-keyed namespace.'
+
+    $manifestPath = Join-Path (Join-Path $dist $pointer.directory) 'deadline-candidate.json'
+    $candidate = Test-DeadlineCandidateDirectory -CandidateManifestPath $manifestPath
+    $evidencePath = Join-Path $dist ([string]$pointer.smoke_evidence)
+    $validated = Test-DeadlineSmokeEvidence -EvidencePath $evidencePath -CandidateManifestPath $manifestPath
+    $expectedExecutedIso = [System.IO.Path]::GetFullPath((Join-Path $dist ('.deadline-candidates\' + $candidate.BuildId + '\' + $candidate.IsoFile)))
+    Assert-Equal $expectedExecutedIso $validated.ExecutedIsoPath 'Evidence no longer retains the exact quarantined ISO path QEMU executed.'
+    Assert-Equal $candidate.IsoSha256 ([string]$pointer.iso_sha256) 'LATEST ISO hash differs from promoted bytes.'
+    Assert-Equal $candidate.IsoBytes ([long]$pointer.iso_bytes) 'LATEST ISO byte count differs from promoted bytes.'
+    Assert-Equal $candidate.SourceCommit ([string]$pointer.source_commit) 'LATEST source commit differs from the candidate.'
+    Assert-Equal $validated.EvidenceSha256 ([string]$pointer.smoke_evidence_sha256) 'LATEST evidence hash differs from retained bytes.'
+    Assert-Equal $validated.Evidence.screenshot.sha256 ([string]$pointer.screenshot_sha256) 'LATEST screenshot hash differs from retained bytes.'
+    Assert-Equal $validated.Evidence.serial.sha256 ([string]$pointer.serial_sha256) 'LATEST serial hash differs from retained bytes.'
+    $expectedQemu = [System.IO.Path]::GetFullPath((Join-Path $QemuRoot 'qemu-system-x86_64.exe'))
+    Assert-True (Test-Path -LiteralPath $expectedQemu -PathType Leaf) 'Supplied QEMU executable is absent during evidence verification.'
+    Assert-Equal $expectedQemu ([string]$validated.Evidence.qemu.executable) 'Evidence names a different QEMU executable.'
 }
 
 $selected = @($script:Tests | Where-Object {
