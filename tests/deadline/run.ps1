@@ -172,6 +172,7 @@ Add-Test -Name 'Locked live-user boot path is bounded and retains rescue access'
     $profile = Get-RepoText 'builder/apkovl/rootfs/etc/profile.d/300k-session.sh'
     $runtime = Get-RepoText 'builder/apkovl/rootfs/usr/local/bin/300k-runtime'
     $inittab = Get-RepoText 'builder/apkovl/rootfs/etc/inittab'
+    $generator = Get-RepoText 'builder/apkovl/genapkovl-300k.sh'
 
     Assert-Match $local 'addgroup -g 1000' 'The live group must have gid 1000.'
     Assert-Match $local 'adduser[^\r\n]*-u 1000[^\r\n]*chatgpt' 'The live user must have uid 1000.'
@@ -182,13 +183,28 @@ Add-Test -Name 'Locked live-user boot path is bounded and retains rescue access'
     foreach ($program in @('Xorg','startx','openbox','wish','tclsh','xterm','doas')) { Assert-Match $local ([regex]::Escape($program)) "Boot prerequisite check is missing $program." }
     Assert-Match $local '/dev/pts' 'Boot must verify the PTY filesystem.'
 
-    Assert-Match $inittab '(?m)^tty1::respawn:/sbin/getty[^\r\n]*300k-autologin' 'tty1 must use the fixed autologin helper through getty.'
+    Assert-Match $inittab '(?m)^tty1::respawn:/sbin/getty -n -l /usr/local/bin/300k-autologin 38400 tty1$' 'tty1 must use BusyBox getty no-prompt/login-helper argv exactly.'
+    Assert-Match $inittab '(?m)^::wait:/sbin/openrc default$' 'BusyBox init must wait for the OpenRC default runlevel before respawning login consoles.'
+    Assert-True ($inittab.IndexOf('::wait:/sbin/openrc default', [System.StringComparison]::Ordinal) -lt $inittab.IndexOf('tty1::respawn:', [System.StringComparison]::Ordinal)) 'The default runlevel must complete before tty1 autologin is authored.'
     Assert-Match $inittab '(?m)^tty2::respawn:/sbin/getty' 'tty2 must remain a normal rescue console.'
+    Assert-Match $generator '(?m)^ln -s 300k-runtime "\$stage/usr/local/bin/300k-autologin"$' 'The autologin helper must be a same-directory relative symlink to the runtime dispatcher.'
+    Assert-Match $runtime '(?ms)300k-autologin\)\s+\[ "\$#" -eq 0 \] \|\| usage\s+action=autologin' 'Symlink basename dispatch must accept only zero-argument getty invocation.'
+    Assert-Match $runtime '(?ms)autologin\)\s+\[ "\$#" -eq 0 \] \|\| usage\s+exec /bin/login -f chatgpt' 'Autologin must use BusyBox login forced-user mode without exposing a password prompt.'
     Assert-Match $profile 'tty[^\r\n]*=\s*/dev/tty1' 'The graphical session must be limited to tty1.'
     Assert-Match $profile '-z "\$\{DISPLAY:-\}"' 'The profile must not nest X inside an existing display.'
     Assert-Match $profile '_300K_SESSION_ATTEMPTED' 'The rescue login shell must not re-enter the X launcher.'
+    Assert-Match $profile '(?m)^\s*exec /usr/local/bin/300k-runtime session$' 'The tty1 login profile must replace the shell with the bounded session dispatcher.'
     Assert-Match $runtime 'while \[ "\$attempt" -le 2 \]' 'X startup must have exactly two bounded attempts.'
     Assert-Match $runtime 'exec /bin/ash -l' 'Failed X startup must return to an interactive rescue shell.'
+}
+
+Add-Test -Name 'BusyBox live-user locking is idempotent before ROOTFS readiness' -Scopes @('RuntimeStatic') -Body {
+    $local = Get-RepoText 'builder/apkovl/rootfs/etc/local.d/300k.start'
+
+    Assert-Match $local '(?m)^\s*adduser[^\r\n]*\s-D(?:\s|$)[^\r\n]*chatgpt\s*$' 'BusyBox adduser must create the fresh live account with its locked-password default.'
+    Assert-Match $local 'substr\(\$2,\s*1,\s*1\)\s*==\s*"!"' 'The existing-account guard must recognize both ! and !! locked shadow fields.'
+    Assert-Match $local '(?ms)^\s*if ! awk -F: [^\r\n]+ /etc/shadow; then\s+passwd -l chatgpt >/dev/null\s+fi\s*$' 'passwd -l must be only a conditional fallback for an unlocked shadow entry; BusyBox returns nonzero when redundantly relocking an already locked account.'
+    Assert-Equal 1 ([regex]::Matches($local, '(?m)^\s*passwd -l chatgpt >/dev/null\s*$').Count) 'The lock fallback must be authored exactly once.'
 }
 
 Add-Test -Name 'Stable boot and PTY markers have one authored producer each' -Scopes @('RuntimeStatic') -Body {

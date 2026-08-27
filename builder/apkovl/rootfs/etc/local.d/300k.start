@@ -9,7 +9,9 @@ if ! id chatgpt >/dev/null 2>&1; then
 fi
 [ "$(id -u chatgpt)" = 1000 ] || { printf '%s\n' '300K: uid 1000 is unavailable' >&2; exit 1; }
 [ "$(id -g chatgpt)" = 1000 ] || { printf '%s\n' '300K: gid 1000 is unavailable' >&2; exit 1; }
-passwd -l chatgpt >/dev/null
+if ! awk -F: '$1 == "chatgpt" && substr($2, 1, 1) == "!" { found=1 } END { exit(found ? 0 : 1) }' /etc/shadow; then
+    passwd -l chatgpt >/dev/null
+fi
 
 for supplemental_group in input video tty dialout; do
     if getent group "$supplemental_group" >/dev/null 2>&1; then
