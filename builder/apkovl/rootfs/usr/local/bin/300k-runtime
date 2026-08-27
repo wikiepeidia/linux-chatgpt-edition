@@ -1,0 +1,108 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    printf '%s\n' 'usage: 300k-runtime {autologin|session|terminal|terminal-proof|serial-stage|system-info}' >&2
+    exit 64
+}
+
+serial_stage() {
+    [ "$#" -eq 1 ] || exit 65
+    event=$1
+    case "$event" in
+        ROOTFS_READY|X_READY|UI_READY) ;;
+        TERM_EXEC_OK\ uid=[1-9][0-9]*\ user=chatgpt\ tty=/dev/pts/[0-9]*\ command=ok\ file=ok\ exit=1) ;;
+        *) exit 65 ;;
+    esac
+    line="300K_STAGE=$event"
+    install -d -m 0755 /var/log/300k
+    printf '%s\n' "$line" >> /var/log/300k/stages.log
+    if [ -w /dev/ttyS0 ]; then
+        printf '%s\n' "$line" > /dev/ttyS0
+    fi
+}
+
+run_session() {
+    attempt=1
+    while [ "$attempt" -le 2 ]; do
+        if startx -- -nolisten tcp vt1; then
+            exit 0
+        fi
+        printf '300K: X attempt %s failed; see ~/.xsession-errors\n' "$attempt" >&2
+        attempt=$((attempt + 1))
+    done
+    export _300K_SESSION_ATTEMPTED=1
+    printf '%s\n' '300K: graphical mode unavailable; entering rescue shell.' >&2
+    exec /bin/ash -l
+}
+
+run_terminal_proof() {
+    proof=/run/300k/terminal-proof.sh
+    install -d -m 0755 /run/300k
+    cat > "$proof" <<'PROOF'
+#!/bin/ash
+set -eu
+uid=$(id -u)
+user=$(id -un)
+tty_path=$(tty)
+[ "$uid" -ne 0 ]
+[ "$user" = chatgpt ]
+case "$tty_path" in /dev/pts/[0-9]*) ;; *) exit 70 ;; esac
+command_result=$(printf '300k-proof' | wc -c | tr -d ' ')
+[ "$command_result" = 10 ]
+proof_file=/run/300k/terminal-proof.$$
+printf '%s\n' 'file-round-trip' > "$proof_file"
+[ "$(cat "$proof_file")" = 'file-round-trip' ]
+rm -f "$proof_file"
+set +e
+false
+exit_code=$?
+set -e
+[ "$exit_code" -eq 1 ]
+/usr/local/bin/300k-runtime serial-stage "TERM_EXEC_OK uid=$uid user=$user tty=$tty_path command=ok file=ok exit=1"
+sleep 1
+PROOF
+    chmod 0700 "$proof"
+    exec xterm -T "300K Terminal Proof" -e /bin/ash /run/300k/terminal-proof.sh
+}
+
+action=
+case ${0##*/} in
+    300k-autologin)
+        [ "$#" -eq 0 ] || usage
+        action=autologin
+        ;;
+    *)
+        [ "$#" -ge 1 ] || usage
+        action=$1
+        shift
+        ;;
+esac
+
+case "$action" in
+    autologin)
+        [ "$#" -eq 0 ] || usage
+        exec /bin/login -f chatgpt
+        ;;
+    session)
+        [ "$#" -eq 0 ] || usage
+        run_session
+        ;;
+    terminal)
+        [ "$#" -eq 0 ] || usage
+        exec xterm -T "300K Terminal" -e /bin/ash -l
+        ;;
+    terminal-proof)
+        [ "$#" -eq 0 ] || usage
+        run_terminal_proof
+        ;;
+    serial-stage)
+        serial_stage "$@"
+        ;;
+    system-info)
+        [ "$#" -eq 0 ] || usage
+        printf '300K Linux deadline MVP\nKernel: %s\nArchitecture: %s\nUser: %s (uid %s)\nTerminal: %s\nNetwork service: none required\n' \
+            "$(uname -sr)" "$(uname -m)" "$(id -un)" "$(id -u)" "$(tty 2>/dev/null || printf none)"
+        ;;
+    *) usage ;;
+esac

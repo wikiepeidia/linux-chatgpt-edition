@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <theme>
+    <name>Clearlooks</name>
+    <keepBorder>no</keepBorder>
+  </theme>
+  <desktops>
+    <number>1</number>
+  </desktops>
+  <applications>
+    <application name="300K Linux">
+      <decor>no</decor>
+      <maximized>true</maximized>
+      <focus>yes</focus>
+    </application>
+  </applications>
+  <keyboard>
+    <keybind key="C-A-t">
+      <action name="Execute">
+        <command>/usr/local/bin/300k-runtime terminal</command>
+      </action>
+    </keybind>
+  </keyboard>
+</openbox_config>

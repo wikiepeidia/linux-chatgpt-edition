@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+if ! getent group chatgpt >/dev/null 2>&1; then
+    addgroup -g 1000 -S chatgpt
+fi
+if ! id chatgpt >/dev/null 2>&1; then
+    adduser -S -D -H -u 1000 -G chatgpt -s /bin/ash chatgpt
+fi
+[ "$(id -u chatgpt)" = 1000 ] || { printf '%s\n' '300K: uid 1000 is unavailable' >&2; exit 1; }
+[ "$(id -g chatgpt)" = 1000 ] || { printf '%s\n' '300K: gid 1000 is unavailable' >&2; exit 1; }
+passwd -l chatgpt >/dev/null
+
+for supplemental_group in input video tty dialout; do
+    if getent group "$supplemental_group" >/dev/null 2>&1; then
+        addgroup chatgpt "$supplemental_group" >/dev/null 2>&1 || true
+    fi
+done
+
+install -d -o chatgpt -g chatgpt -m 0755 /home/chatgpt /run/300k /var/log/300k
+chown -R chatgpt:chatgpt /home/chatgpt
+chmod 0750 /home/chatgpt
+: > /var/log/300k/stages.log
+chown chatgpt:chatgpt /var/log/300k/stages.log
+chmod 0644 /var/log/300k/stages.log
+
+for required_program in Xorg startx openbox wish tclsh xterm doas; do
+    command -v "$required_program" >/dev/null 2>&1 || {
+        printf '300K: required runtime program is missing: %s\n' "$required_program" >&2
+        exit 1
+    }
+done
+[ -d /dev/pts ] && awk '$2 == "/dev/pts" { found=1 } END { exit(found ? 0 : 1) }' /proc/mounts || {
+    printf '%s\n' '300K: /dev/pts is not mounted' >&2
+    exit 1
+}
+
+/usr/local/bin/300k-runtime serial-stage ROOTFS_READY

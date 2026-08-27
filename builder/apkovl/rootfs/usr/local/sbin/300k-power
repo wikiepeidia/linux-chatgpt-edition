@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+[ "$#" -eq 1 ] || exit 64
+case "$1" in
+    reboot) exec /sbin/reboot ;;
+    poweroff) exec /sbin/poweroff ;;
+    *) exit 64 ;;
+esac
