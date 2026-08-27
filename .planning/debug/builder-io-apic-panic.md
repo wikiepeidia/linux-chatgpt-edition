@@ -1,8 +1,8 @@
 ---
-status: verifying
+status: awaiting_human_verify
 trigger: "Deadline MVP builder VM panics before SSH_READY under both q35/TCG and pc/i440fx/TCG"
 created: 2026-08-27
-updated: 2026-08-27T22:21:48+07:00
+updated: 2026-08-27T22:26:00+07:00
 ---
 
 # Debug Session: Builder IO-APIC Panic
@@ -20,10 +20,10 @@ updated: 2026-08-27T22:21:48+07:00
 
 ## Current Focus
 
-- hypothesis: The readiness failure requires two conditions: QEMU 11.1.0 TCG cannot deliver the Alpine 6.18.35 early IRQ0 IO-APIC timer path on this host, and the pinned image's Extlinux command line lacks the kernel-recommended `noapic` escape. Direct-kernel boot preserving the image command line plus `noapic` should bypass only the failing interrupt path.
-- test: Add a regression test requiring hash-verified, fail-closed extraction of the pinned image kernel/initramfs/Extlinux command line and QEMU `-kernel/-initrd/-append ... noapic` arguments; prove it red before implementing.
-- expecting: The new regression fails against commit 5559ef2 because no direct-kernel transport exists, then passes after a minimal extraction/argument change. The single bounded readiness probe must subsequently reach ordered serial trust and strict SSH.
-- next_action: Run exactly one `build.ps1 -Backend Qemu -Target DeadlineMvp -BuilderReadinessProbe` from clean commit d43a00e; require ordered serial trust, strict SSH, shutdown, and cleanup before any package build.
+- hypothesis: The confirmed QEMU TCG IO-APIC timer failure is bypassed by verified direct-kernel boot with the pinned image command line plus one `noapic`; automated readiness and cleanup now pass.
+- test: Human confirms the original DeadlineMvp workflow should proceed from the now-proven builder transport, or reports any remaining environment-specific failure.
+- expecting: Confirmation that the readiness blocker is resolved; package build and ISO smoke remain deliberately unstarted.
+- next_action: Await human response `confirmed fixed` or a description of what still fails.
 - bug_class: bohrbug
 - reasoning_checkpoint:
     hypothesis: QEMU 11.1.0 TCG on this host fails Alpine 6.18.35 early IRQ0 delivery through the IO-APIC, and the builder's Extlinux-only boot path provides no `noapic` override, causing a deterministic pre-readiness panic.
@@ -102,6 +102,16 @@ updated: 2026-08-27T22:21:48+07:00
   found: Commit d43a00e contains only `scripts/host/Invoke-QemuBackend.ps1` and `tests/deadline/run.ps1` with 115 added lines; no signing material, publication pointer, or prior ISO changed.
   implication: The readiness probe can causally evaluate one immutable code revision.
 
+- timestamp: 2026-08-27T22:25:25+07:00
+  checked: Single bounded public builder-readiness probe from clean commit d43a00e
+  found: The probe returned `builder-readiness-passed` on machine `pc` and accelerator `tcg,thread=multi`, observed `300K_SSH_READY`, verified the serial Ed25519 host fingerprint, passed strict SSH, shut down, and reported `cleanup_complete=true`.
+  implication: The exact original pre-readiness IO-APIC panic no longer occurs with direct-kernel `noapic`; readiness is proven without source, signing-key, package, candidate, or ISO-smoke activity.
+
+- timestamp: 2026-08-27T22:26:00+07:00
+  checked: Post-probe cleanup and immutable publication integrity
+  found: Zero QEMU processes, zero run/host-run entries, and zero overlays remain. LATEST is still 260 bytes with SHA-256 `34cb52ca77d0a6e679aa10a65aa34ff7131eb5cedb0796660d049ffbc1f297a7`; the prior 69,206,016-byte ISO remains SHA-256 `2c968ee3a0c687bd0d779247b7b595494a6a9870308387a07572796fd46d0678`.
+  implication: The readiness verification cleaned all owned resources and did not alter the published artifact or pointer.
+
 ## Eliminated
 
 - hypothesis: The q35 machine type alone causes the Alpine IO-APIC timer panic.
@@ -119,7 +129,8 @@ updated: 2026-08-27T22:21:48+07:00
     adjacent_tests: { result: pass, suites_run: [tests/deadline/run.ps1 -Scope AllStatic], passed: 13, failed: 0 }
     revert_and_reconfirm: { result: pass, bug_returned_on_revert: true, fixed_on_reapply: true }
     real_image_extraction: { result: pass, kernel_bytes: 12575744, initrd_bytes: 10847826, noapic_count: 1 }
-    readiness_probe: { result: pending }
+    readiness_probe: { result: pass, status: builder-readiness-passed, machine: pc, accelerator: tcg-thread-multi, serial_marker: 300K_SSH_READY, ssh_probe: passed, cleanup_complete: true }
+    publication_integrity: { result: pass, latest_sha256: 34cb52ca77d0a6e679aa10a65aa34ff7131eb5cedb0796660d049ffbc1f297a7, prior_iso_sha256: 2c968ee3a0c687bd0d779247b7b595494a6a9870308387a07572796fd46d0678, live_qemu_count: 0, overlay_count: 0 }
     guardrail_verdict: accepted
 - files_changed:
   - scripts/host/Invoke-QemuBackend.ps1
