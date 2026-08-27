@@ -221,6 +221,71 @@ Add-TestCase -Name 'BUILD-03 El Torito catalog bytes are bounded cross-checked a
     Assert-Match -Value $source -Pattern 'expect_catalog_preflight_failure[\s\S]*materializations[\s\S]*-eq 0' -Message 'Every hostile catalog metadata fixture must fail before any byte materialization.'
 }
 
+Add-TestCase -Name 'BUILD-03 UEFI tree recognizes exact Alpine lowercase namespace only' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
+    $inspectorPath = Join-Path $script:RepositoryRoot 'scripts/linux/inspect-iso.sh'
+    $source = (Get-Content -Raw -LiteralPath $inspectorPath).Replace("`r`n", "`n")
+    $functionMatch = [regex]::Match($source, '(?ms)^manifest_has_uefi_tree\(\) \{.*?^\}')
+    Assert-True -Condition $functionMatch.Success -Message 'The production UEFI-tree predicate could not be isolated for its runtime regression fixture.'
+    Assert-Match -Value $source -Pattern 'write_iso_audit\(\)[\s\S]{0,900}manifest_has_uefi_tree "\$manifest"[\s\S]{0,120}uefi=true' -Message 'Audit generation must derive the UEFI finding from the exact shared manifest predicate.'
+
+    $bash = Get-Command bash -ErrorAction SilentlyContinue
+    if ($null -eq $bash) {
+        $git = Get-Command git -ErrorAction Stop
+        $gitRoot = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $git.Source) '..'))
+        $bashPath = Join-Path $gitRoot 'bin/bash.exe'
+        Assert-True -Condition (Test-Path -LiteralPath $bashPath -PathType Leaf) -Message 'Git Bash is required to execute the UEFI-tree manifest regression.'
+    }
+    else { $bashPath = $bash.Source }
+
+    $harness = @'
+set -eu
+__MANIFEST_HAS_UEFI_TREE__
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+manifest=$work/manifest
+
+write_member() {
+    member_type=$1
+    member_path=$2
+    printf 'iso:00000001\t%s\t0\t%s\t\n' "$member_type" "$member_path" > "$manifest"
+}
+
+expect_present() {
+    write_member "$1" "$2"
+    manifest_has_uefi_tree "$manifest" || {
+        printf '%s\n' "expected UEFI path was rejected" >&2
+        exit 91
+    }
+}
+
+expect_absent() {
+    write_member "$1" "$2"
+    if manifest_has_uefi_tree "$manifest"; then
+        printf '%s\n' "hostile UEFI near-miss was accepted" >&2
+        exit 92
+    fi
+}
+
+expect_present f efi/boot/bootx64.efi
+expect_present f EFI/BOOT/BOOTX64.EFI
+expect_present d efi/boot/grub
+
+expect_absent d efi/boot
+expect_absent f Efi/Boot/bootx64.efi
+expect_absent f xefi/boot/bootx64.efi
+expect_absent f efi/bootleg/bootx64.efi
+expect_absent f boot/grub/efi.img
+expect_absent l efi/boot/bootx64.efi
+printf '%s\n' UEFI_TREE_PATH_PASS
+'@.Replace('__MANIFEST_HAS_UEFI_TREE__', $functionMatch.Value)
+
+    $output = @($harness | & $bashPath -s 2>&1)
+    $exitCode = $LASTEXITCODE
+    Assert-Equal -Expected 0 -Actual $exitCode -Message ("UEFI-tree manifest regression failed. Output=<{0}>" -f ($output -join ' | '))
+    Assert-True -Condition ($output -ccontains 'UEFI_TREE_PATH_PASS') -Message 'UEFI-tree manifest regression returned no success marker.'
+}
+
 Add-TestCase -Name 'BUILD-03 archive member failures cannot be overwritten by later clean members' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
     $inspectorPath = Join-Path $script:RepositoryRoot 'scripts/linux/inspect-iso.sh'
     $source = (Get-Content -Raw -LiteralPath $inspectorPath).Replace("`r`n", "`n")
