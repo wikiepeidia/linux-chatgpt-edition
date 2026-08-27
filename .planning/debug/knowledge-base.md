@@ -43,3 +43,13 @@ Resolved debug sessions. Used by `gsd-debugger` to surface known-pattern hypothe
 - **Why not caught:** RuntimeStatic treated the presence of `passwd -l` as a security proxy without modeling BusyBox's already-locked `adduser -D` state or redundant relock exit status; OpenRC suppressed the runtime diagnostic.
 - **Recurrence guard:** `BusyBox live-user locking is idempotent before ROOTFS readiness`; RED 8/9, GREEN 9/9, exact unconditional-relock mutant killed, Deadline AllStatic 15/15, Phase 1 Unit 27/27, then rebuilt guest emitted exactly one `ROOTFS_READY` marker.
 ---
+
+## tty1-autologin-argv — BusyBox getty sentinel was rejected before forced login
+- **Date:** 2026-08-28
+- **Error patterns:** `ROOTFS_READY` only, missing `X_READY`, tty1 autologin, custom-login argv, literal `--`, usage exit 64
+- **Root cause(s):** The `300k-autologin` basename branch required argc 0, while exact pinned BusyBox 1.37.0-r31 `getty -n -l LOGIN` invokes the helper as `LOGIN --` when `logname` is null; the helper therefore exited before `/bin/login -f chatgpt`.
+- **Fix:** Require exactly one literal `--`, shift it, then retain the action-level argc-0 guard before fixed forced login.
+- **Files changed:** `builder/apkovl/rootfs/usr/local/bin/300k-runtime`, `tests/deadline/run.ps1`
+- **Why not caught:** RuntimeStatic encoded an inferred zero-argument `getty -n -l` contract and lacked a dependency-ABI assertion with closed boundary neighbors.
+- **Recurrence guard:** Regression test `tests/deadline/run.ps1` — `Locked live-user boot path is bounded and retains rescue access` requires argc 1, literal `--`, immediate shift, and the unchanged action-level argc-0 guard; original-guard mutant fails 8/9 and fixed code passes 9/9.
+---
