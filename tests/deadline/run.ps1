@@ -133,6 +133,40 @@ Add-Test -Name 'Runtime source is deterministic text with an explicit apkovl man
     }
 }
 
+Add-Test -Name 'Apkovl member paths and lifecycle survive diskless package install' -Scopes @('RuntimeStatic') -Body {
+    $generator = Get-RepoText 'builder/apkovl/genapkovl-300k.sh'
+
+    $explicitServices = @(
+        @('devfs','sysinit'), @('dmesg','sysinit'), @('udev','sysinit'), @('udev-trigger','sysinit'),
+        @('udev-settle','sysinit'), @('modloop','sysinit'),
+        @('modules','boot'), @('sysctl','boot'), @('hostname','boot'), @('bootmisc','boot'), @('syslog','boot'),
+        @('udev-postmount','default'), @('local','default'),
+        @('mount-ro','shutdown'), @('killprocs','shutdown'), @('savecache','shutdown')
+    )
+    $hasExplicitServices = $true
+    foreach ($pair in $explicitServices) {
+        $service = [regex]::Escape($pair[0])
+        $runlevel = [regex]::Escape($pair[1])
+        $pattern = '(?m)^\s*(?:rc_add ' + $service + ' ' + $runlevel + '|ln -s /etc/init[.]d/' + $service + ' "\$stage/etc/runlevels/' + $runlevel + '/' + $service + '")\s*$'
+        if ($generator -notmatch $pattern) { $hasExplicitServices = $false }
+    }
+    $usesDefaultServices = [bool]($generator -match '(?m)^\s*(?:: >|touch --) "\$stage/etc/[.]default_boot_services"\s*$')
+    Assert-True ($usesDefaultServices -xor $hasExplicitServices) 'Overlay must choose exactly one coherent lifecycle: Alpine default services or the complete explicit eudev runlevel set.'
+    if ($usesDefaultServices) {
+        Assert-False ([bool]($generator -match '(?m)^\s*rc_add (?:mdev|hwdrivers|udev|udev-trigger|udev-settle)\b')) 'Default mdev services must not be combined with explicit device-manager links.'
+    }
+    else {
+        Assert-False ([bool]($generator -match '(?m)^\s*rc_add (?:mdev|hwdrivers)\b')) 'The explicit eudev lifecycle must not also enable mdev or its hwdrivers helper.'
+    }
+
+    Assert-Match $generator '(?m)^\s*-C "\$stage" -cf - etc home usr \| gzip -9n > "\$output_tmp"$' 'Apkovl tar operands must be exactly the safe package-relative roots etc, home, and usr; absolute, dot, and dot-dot operands are forbidden.'
+    Assert-False ([bool]($generator -match '-C "\$stage" -cf - [.]')) 'Archiving dot would feed ./-prefixed names to apk --overlay-from-stdin.'
+    Assert-Match $generator 'printf ''%s\\n'' "\$hostname" > "\$stage/etc/hostname"' 'Diskless boot identity must write the validated profile hostname exactly.'
+    foreach ($ancestor in @('etc','home','home/chatgpt','usr','usr/local','usr/local/bin','usr/local/lib','usr/local/lib/300k','usr/local/sbin')) {
+        Assert-Match $generator ('install -d -m 0755[^\r\n]*"\$stage/' + [regex]::Escape($ancestor) + '"') "Overlay ancestor must be explicitly traversable: $ancestor"
+    }
+}
+
 Add-Test -Name 'Locked live-user boot path is bounded and retains rescue access' -Scopes @('RuntimeStatic') -Body {
     $local = Get-RepoText 'builder/apkovl/rootfs/etc/local.d/300k.start'
     $profile = Get-RepoText 'builder/apkovl/rootfs/etc/profile.d/300k-session.sh'

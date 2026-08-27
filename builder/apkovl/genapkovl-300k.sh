@@ -33,6 +33,10 @@ trap 'exit 130' INT TERM HUP
 
 stage=$temporary_root/root
 install -d -m 0755 "$stage"
+install -d -m 0755 "$stage/etc" "$stage/etc/apk" "$stage/etc/doas.d" "$stage/etc/local.d" "$stage/etc/profile.d" "$stage/etc/runlevels"
+install -d -m 0755 "$stage/etc/runlevels/sysinit" "$stage/etc/runlevels/boot" "$stage/etc/runlevels/default" "$stage/etc/runlevels/shutdown"
+install -d -m 0755 "$stage/home" "$stage/home/chatgpt" "$stage/home/chatgpt/.config" "$stage/home/chatgpt/.config/openbox"
+install -d -m 0755 "$stage/usr" "$stage/usr/local" "$stage/usr/local/bin" "$stage/usr/local/lib" "$stage/usr/local/lib/300k" "$stage/usr/local/sbin"
 
 install_file() {
     mode=$1
@@ -41,6 +45,12 @@ install_file() {
     destination=$stage/$relative
     [ -f "$source" ] || { printf 'missing overlay source: %s\n' "$relative" >&2; exit 68; }
     install -D -m "$mode" "$source" "$destination"
+}
+
+rc_add() {
+    service=$1
+    runlevel=$2
+    ln -s "/etc/init.d/$service" "$stage/etc/runlevels/$runlevel/$service"
 }
 
 install_file 0644 etc/inittab
@@ -54,7 +64,8 @@ install_file 0755 usr/local/sbin/300k-power
 install_file 0644 usr/local/lib/300k/content.tcl
 install_file 0644 usr/local/lib/300k/ui.tcl
 
-install -d -m 0755 "$stage/etc/apk" "$stage/etc/runlevels/default" "$stage/etc/runlevels/sysinit" "$stage/usr/local/bin"
+printf '%s\n' "$hostname" > "$stage/etc/hostname"
+chmod 0644 "$stage/etc/hostname"
 cat > "$temporary_root/world.unsorted" <<'PACKAGES'
 alpine-base
 doas
@@ -72,10 +83,22 @@ PACKAGES
 LC_ALL=C sort -u "$temporary_root/world.unsorted" > "$stage/etc/apk/world"
 chmod 0644 "$stage/etc/apk/world"
 
-ln -s /etc/init.d/local "$stage/etc/runlevels/default/local"
-ln -s /etc/init.d/udev "$stage/etc/runlevels/sysinit/udev"
-ln -s /etc/init.d/udev-trigger "$stage/etc/runlevels/sysinit/udev-trigger"
-ln -s /etc/init.d/udev-settle "$stage/etc/runlevels/sysinit/udev-settle"
+rc_add devfs sysinit
+rc_add dmesg sysinit
+rc_add udev sysinit
+rc_add udev-trigger sysinit
+rc_add udev-settle sysinit
+rc_add modloop sysinit
+rc_add modules boot
+rc_add sysctl boot
+rc_add hostname boot
+rc_add bootmisc boot
+rc_add syslog boot
+rc_add udev-postmount default
+rc_add local default
+rc_add mount-ro shutdown
+rc_add killprocs shutdown
+rc_add savecache shutdown
 ln -s 300k-runtime "$stage/usr/local/bin/300k-autologin"
 
 output=$PWD/$hostname.apkovl.tar.gz
@@ -87,7 +110,7 @@ LC_ALL=C tar \
     --group=0 \
     --numeric-owner \
     --mtime=@$SOURCE_DATE_EPOCH \
-    -C "$stage" -cf - . | gzip -9n > "$output_tmp"
+    -C "$stage" -cf - etc home usr | gzip -9n > "$output_tmp"
 chmod 0644 "$output_tmp"
 mv -f -- "$output_tmp" "$output"
 printf '%s\n' "$output"
