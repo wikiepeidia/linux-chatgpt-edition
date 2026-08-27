@@ -519,6 +519,68 @@ function Write-SanitizedSerialEvidence {
     [System.IO.File]::WriteAllText($EvidencePath, (($allowed -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
 }
 
+function Get-QemuDirectBootSpec {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $KernelPath,
+        [Parameter(Mandatory)] [string] $InitrdPath,
+        [Parameter(Mandatory)] [string] $ExtlinuxConfigPath
+    )
+
+    $resolved = @(@($KernelPath, $InitrdPath, $ExtlinuxConfigPath) | ForEach-Object { [System.IO.Path]::GetFullPath($_) })
+    foreach ($path in $resolved) {
+        if (-not [System.IO.File]::Exists($path)) {
+            throw (New-QemuException -Code 'QEMU_DIRECT_BOOT_MATERIAL_INVALID' -Message 'Pinned builder direct-boot material is incomplete.')
+        }
+        $item = Get-Item -LiteralPath $path -Force
+        if ($item.PSIsContainer -or $item.Length -le 0 -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw (New-QemuException -Code 'QEMU_DIRECT_BOOT_MATERIAL_INVALID' -Message 'Pinned builder direct-boot material is not a non-empty regular file.')
+        }
+    }
+
+    $extlinuxText = [System.IO.File]::ReadAllText($resolved[2], [System.Text.UTF8Encoding]::new($false, $true))
+    $appendLines = @($extlinuxText -split "`r?`n" | Where-Object { $_ -cmatch '^  APPEND ' })
+    if ($appendLines.Count -ne 1) {
+        throw (New-QemuException -Code 'QEMU_DIRECT_BOOT_CONFIG_INVALID' -Message 'Pinned builder Extlinux config must contain exactly one APPEND line.')
+    }
+    $match = [regex]::Match($appendLines[0], '^  APPEND (?<value>[^\r\n]+)$', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    $expectedAppend = 'root=LABEL=/ modules=sd-mod,usb-storage,ext4,ena,gve,mana console=ttyS0,115200n8 console=ttyAMA0,115200n8 console=tty0'
+    if (-not $match.Success -or $match.Groups['value'].Value -cne $expectedAppend) {
+        throw (New-QemuException -Code 'QEMU_DIRECT_BOOT_CONFIG_INVALID' -Message 'Pinned builder Extlinux APPEND contract changed unexpectedly.')
+    }
+
+    return [pscustomobject]@{
+        KernelPath        = $resolved[0]
+        InitrdPath        = $resolved[1]
+        KernelCommandLine = "$expectedAppend noapic"
+    }
+}
+
+function Expand-QemuDirectBootMaterial {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $BaseImagePath,
+        [Parameter(Mandatory)] [string] $RunRoot
+    )
+
+    $sevenZipCommand = Get-Command 7z.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $sevenZipCommand) {
+        throw (New-QemuException -Code 'QEMU_DIRECT_BOOT_EXTRACTOR_MISSING' -Message 'The installed 7-Zip reader is required for verified builder direct boot.')
+    }
+    $sevenZip = [System.IO.Path]::GetFullPath($sevenZipCommand.Source)
+    $directBootRoot = [System.IO.Path]::GetFullPath((Join-Path $RunRoot 'direct-boot'))
+    [System.IO.Directory]::CreateDirectory($directBootRoot) | Out-Null
+    [void](Invoke-CheckedProcess -FilePath $sevenZip -ArgumentList @(
+        'x', '-y', '-aoa', '-bd', '-bb0', "-o$directBootRoot", [System.IO.Path]::GetFullPath($BaseImagePath),
+        'boot\vmlinuz-virt', 'boot\initramfs-virt', 'boot\extlinux.conf'
+    ) -TimeoutSeconds 120)
+
+    return Get-QemuDirectBootSpec `
+        -KernelPath (Join-Path $directBootRoot 'boot\vmlinuz-virt') `
+        -InitrdPath (Join-Path $directBootRoot 'boot\initramfs-virt') `
+        -ExtlinuxConfigPath (Join-Path $directBootRoot 'boot\extlinux.conf')
+}
+
 function Invoke-QemuBackend {
     [CmdletBinding()]
     param(
@@ -591,6 +653,7 @@ function Invoke-QemuBackend {
         [System.IO.Directory]::CreateDirectory($cacheDirectory) | Out-Null
         $basePath = Join-Path $baseDirectory ([System.IO.Path]::GetFileName($CloudImageUri.AbsolutePath))
         $basePath = Get-VerifiedQemuBaseImage -Uri $CloudImageUri -ExpectedSha512 $CloudImageSha512 -Destination $basePath
+        $directBoot = Expand-QemuDirectBootMaterial -BaseImagePath $basePath -RunRoot $runRoot
 
         $overlayPath = Join-Path $runRoot 'overlay.qcow2'
         [void](Invoke-CheckedProcess -FilePath $qemuImgExe -ArgumentList @('create', '-f', 'qcow2', '-F', 'qcow2', '-b', $basePath, $overlayPath) -TimeoutSeconds 60)
@@ -642,6 +705,9 @@ function Invoke-QemuBackend {
             '-accel', 'tcg,thread=multi',
             '-m', '4096',
             '-smp', '4',
+            '-kernel', $directBoot.KernelPath,
+            '-initrd', $directBoot.InitrdPath,
+            '-append', $directBoot.KernelCommandLine,
             '-drive', "if=none,id=os,format=qcow2,file=$overlayPath",
             '-device', 'virtio-blk-pci,drive=os,bootindex=1,serial=300k-builder',
             '-drive', "if=none,id=cache,format=qcow2,file=$cachePath",
@@ -765,6 +831,8 @@ function Invoke-QemuBackend {
             AlpineRelease      = '3.24.1'
             Machine             = 'pc'
             Accelerator         = 'tcg,thread=multi'
+            DirectKernelBoot    = $true
+            KernelWorkaround    = 'noapic'
             ReadinessMarker     = '300K_SSH_READY'
             CloudImageSha512   = $CloudImageSha512
             SerialFingerprint  = $serialTrust.Fingerprint

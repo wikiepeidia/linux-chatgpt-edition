@@ -264,6 +264,53 @@ Add-Test -Name 'Deadline target and profile extend rather than weaken Bootstrap'
     Assert-Equal 'SIGNING_PUBLIC_REQUIRED' $failureCode 'Deadline preflight accepted a state root without the external signing identity.'
 }
 
+Add-Test -Name 'Builder direct boot preserves the pinned image contract and adds noapic once' -Scopes @('BuildStatic') -Body {
+    $qemuBackendPath = Join-Path $script:RepositoryRoot 'scripts/host/Invoke-QemuBackend.ps1'
+    $qemuBackend = Get-RepoText 'scripts/host/Invoke-QemuBackend.ps1'
+    foreach ($pattern in @(
+        'function Get-QemuDirectBootSpec',
+        'function Expand-QemuDirectBootMaterial',
+        "Get-Command 7z[.]exe -CommandType Application",
+        "'boot\\vmlinuz-virt'",
+        "'boot\\initramfs-virt'",
+        "'boot\\extlinux[.]conf'",
+        '''-kernel'', \$directBoot[.]KernelPath',
+        '''-initrd'', \$directBoot[.]InitrdPath',
+        '''-append'', \$directBoot[.]KernelCommandLine'
+    )) { Assert-Match $qemuBackend $pattern "Direct-kernel transport contract is absent: $pattern" }
+
+    . $qemuBackendPath
+    foreach ($functionName in @('Get-QemuDirectBootSpec','Expand-QemuDirectBootMaterial')) {
+        Assert-True ($null -ne (Get-Command $functionName -CommandType Function -ErrorAction SilentlyContinue)) "Direct-kernel function is missing: $functionName"
+    }
+
+    $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('300k-direct-kernel-unit-' + [Guid]::NewGuid().ToString('N'))
+    [System.IO.Directory]::CreateDirectory($scratch) | Out-Null
+    try {
+        $kernel = Join-Path $scratch 'vmlinuz-virt'
+        $initramfs = Join-Path $scratch 'initramfs-virt'
+        $extlinux = Join-Path $scratch 'extlinux.conf'
+        [System.IO.File]::WriteAllBytes($kernel, [byte[]](1,2,3))
+        [System.IO.File]::WriteAllBytes($initramfs, [byte[]](4,5,6))
+        $append = 'root=LABEL=/ modules=sd-mod,usb-storage,ext4,ena,gve,mana console=ttyS0,115200n8 console=ttyAMA0,115200n8 console=tty0'
+        [System.IO.File]::WriteAllText($extlinux, "LABEL virt`n  APPEND $append`n", [System.Text.UTF8Encoding]::new($false))
+
+        $spec = Get-QemuDirectBootSpec -KernelPath $kernel -InitrdPath $initramfs -ExtlinuxConfigPath $extlinux
+        Assert-Equal ([System.IO.Path]::GetFullPath($kernel)) $spec.KernelPath 'Direct boot changed the verified kernel path.'
+        Assert-Equal ([System.IO.Path]::GetFullPath($initramfs)) $spec.InitrdPath 'Direct boot changed the verified initramfs path.'
+        Assert-Equal "$append noapic" $spec.KernelCommandLine 'Direct boot did not preserve APPEND and add exactly one noapic token.'
+        Assert-Equal 1 @($spec.KernelCommandLine -split '\s+' | Where-Object { $_ -ceq 'noapic' }).Count 'Direct boot duplicated or omitted noapic.'
+
+        [System.IO.File]::WriteAllText($extlinux, "LABEL virt`n", [System.Text.UTF8Encoding]::new($false))
+        Assert-Throws { Get-QemuDirectBootSpec -KernelPath $kernel -InitrdPath $initramfs -ExtlinuxConfigPath $extlinux } 'A missing APPEND line was accepted.'
+        [System.IO.File]::WriteAllText($extlinux, "LABEL virt`n  APPEND $append`nLABEL second`n  APPEND $append`n", [System.Text.UTF8Encoding]::new($false))
+        Assert-Throws { Get-QemuDirectBootSpec -KernelPath $kernel -InitrdPath $initramfs -ExtlinuxConfigPath $extlinux } 'Duplicate APPEND lines were accepted.'
+    }
+    finally {
+        if ([System.IO.Directory]::Exists($scratch)) { [System.IO.Directory]::Delete($scratch, $true) }
+    }
+}
+
 Add-Test -Name 'Deadline inspector requires exact BIOS, EFI, ISO, and deferral evidence' -Scopes @('BuildStatic') -Body {
     $inspector = Get-RepoText 'scripts/linux/inspect-deadline-iso.sh'
     foreach ($path in @('/boot/vmlinuz-virt','/boot/initramfs-virt','/300k.apkovl.tar.gz','/apks/x86_64/APKINDEX.tar.gz','/boot/syslinux/isolinux.bin','/efi/boot/bootx64.efi','/boot/syslinux/boot.cat','/boot/grub/efi.img')) {
