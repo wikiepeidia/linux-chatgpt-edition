@@ -207,6 +207,37 @@ Add-Test -Name 'BusyBox live-user locking is idempotent before ROOTFS readiness'
     Assert-Equal 1 ([regex]::Matches($local, '(?m)^\s*passwd -l chatgpt >/dev/null\s*$').Count) 'The lock fallback must be authored exactly once.'
 }
 
+Add-Test -Name 'Non-root serial stages retain a dialout-writable tty without a competing getty' -Scopes @('RuntimeStatic') -Body {
+    $local = Get-RepoText 'builder/apkovl/rootfs/etc/local.d/300k.start'
+    $inittab = Get-RepoText 'builder/apkovl/rootfs/etc/inittab'
+    $runtime = Get-RepoText 'builder/apkovl/rootfs/usr/local/bin/300k-runtime'
+
+    $directSerialWrite = [bool]($runtime -match '(?m)^\s*printf ''\\n%s\\n'' "\$line" > /dev/ttyS0\s*$')
+    Assert-True $directSerialWrite 'The unprivileged stage helper must retain its direct, validated ttyS0 proof channel.'
+    Assert-False ([bool]($inittab -match '(?m)^ttyS0::[^\r\n]*\bgetty\b')) 'BusyBox getty must not compete for ttyS0 because it resets the direct non-root proof channel to root:root 0620.'
+    Assert-Match $inittab '(?m)^tty2::respawn:/sbin/getty 38400 tty2$' 'tty2 must remain the normal root rescue console after removing serial getty.'
+
+    $groupLoop = [regex]::Match($local, '(?ms)^for supplemental_group in input video tty dialout; do\r?\n.*?^done\s*$')
+    Assert-True $groupLoop.Success 'The chatgpt supplemental-group assignment loop is missing.'
+    $permissionBlock = [regex]::Match($local, '(?ms)^if \[ -c /dev/ttyS0 \]; then\r?\n(?<body>.*?)^fi\s*$')
+    Assert-True $permissionBlock.Success 'Serial ownership must be guarded by an exact character-device test.'
+    Assert-True ($permissionBlock.Index -ge ($groupLoop.Index + $groupLoop.Length)) 'Serial ownership must be established only after chatgpt supplemental-group assignment.'
+
+    $body = $permissionBlock.Groups['body'].Value
+    $membership = [regex]::Match($body, '(?m)^\s*id -Gn chatgpt \| tr '' '' ''\\n'' \| grep -qx dialout \|\| \{\s*$')
+    $ownership = [regex]::Match($body, '(?m)^\s*chown root:dialout /dev/ttyS0\s*$')
+    $mode = [regex]::Match($body, '(?m)^\s*chmod 0660 /dev/ttyS0\s*$')
+    Assert-True $membership.Success 'Serial setup must fail closed unless chatgpt belongs to dialout.'
+    Assert-True $ownership.Success 'Serial ownership must be exactly root:dialout.'
+    Assert-True $mode.Success 'Serial mode must be exactly 0660.'
+    Assert-True ($membership.Index -lt $ownership.Index -and $ownership.Index -lt $mode.Index) 'Dialout membership, ownership, and mode must be established in that order.'
+    Assert-Equal 1 ([regex]::Matches($local, '(?m)^\s*chown root:dialout /dev/ttyS0\s*$').Count) 'Serial ownership must be authored exactly once inside the character-device guard.'
+    Assert-Equal 1 ([regex]::Matches($local, '(?m)^\s*chmod 0660 /dev/ttyS0\s*$').Count) 'Serial mode must be authored exactly once inside the character-device guard.'
+
+    $rootfsMarker = $local.IndexOf('/usr/local/bin/300k-runtime serial-stage ROOTFS_READY', [System.StringComparison]::Ordinal)
+    Assert-True ($rootfsMarker -gt ($permissionBlock.Index + $permissionBlock.Length)) 'The serial permission contract must complete before ROOTFS_READY is emitted.'
+}
+
 Add-Test -Name 'Stable boot and PTY markers have one authored producer each' -Scopes @('RuntimeStatic') -Body {
     $all = ($runtimeFiles | ForEach-Object { Get-RepoText $_ }) -join "`n"
     $runtime = Get-RepoText 'builder/apkovl/rootfs/usr/local/bin/300k-runtime'
