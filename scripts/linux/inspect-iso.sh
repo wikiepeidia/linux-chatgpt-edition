@@ -882,22 +882,53 @@ inspect_archive_members() {
     tab=$(printf '\t')
     while IFS="$tab" read -r id type size member target; do
         if [ "$type" = e ]; then
-            (
-                materialized=$(stream_iso_boot_catalog "$archive" "$size" "$target")
+            if (
+                materialized=$(stream_iso_boot_catalog "$archive" "$size" "$target") || {
+                    member_status=$?
+                    exit "$member_status"
+                }
                 member_logical=$logical/$member
-                scan_regular_bytes "$materialized" "$member_logical"
-                inspect_file "$materialized" "$member_logical" $((depth + 1)) leaf
-            )
+                scan_regular_bytes "$materialized" "$member_logical" || {
+                    member_status=$?
+                    exit "$member_status"
+                }
+                inspect_file "$materialized" "$member_logical" $((depth + 1)) leaf || {
+                    member_status=$?
+                    exit "$member_status"
+                }
+            ); then
+                :
+            else
+                member_status=$?
+                return "$member_status"
+            fi
             continue
         fi
         [ "$type" = f ] || continue
-        (
-            materialized=$(stream_regular_member "$kind" "$archive" "$member" "$size")
+        if (
+            materialized=$(stream_regular_member "$kind" "$archive" "$member" "$size") || {
+                member_status=$?
+                exit "$member_status"
+            }
             member_logical=$logical/$member
-            scan_regular_bytes "$materialized" "$member_logical"
-            role=$(role_for_path "$member" "$member_logical")
-            inspect_file "$materialized" "$member_logical" $((depth + 1)) "$role"
-        )
+            scan_regular_bytes "$materialized" "$member_logical" || {
+                member_status=$?
+                exit "$member_status"
+            }
+            role=$(role_for_path "$member" "$member_logical") || {
+                member_status=$?
+                exit "$member_status"
+            }
+            inspect_file "$materialized" "$member_logical" $((depth + 1)) "$role" || {
+                member_status=$?
+                exit "$member_status"
+            }
+        ); then
+            :
+        else
+            member_status=$?
+            return "$member_status"
+        fi
     done < "$manifest"
 }
 
