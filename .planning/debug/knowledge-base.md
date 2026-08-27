@@ -63,3 +63,13 @@ Resolved debug sessions. Used by `gsd-debugger` to surface known-pattern hypothe
 - **Why not caught:** RuntimeStatic checked supplemental groups, marker producers, and rescue consoles separately but did not model BusyBox getty's ownership side effect against the uid-1000 direct writer; the helper's silent writability guard disguised a channel failure as missing graphical stages.
 - **Recurrence guard:** Regression test `tests/deadline/run.ps1` — `Non-root serial stages retain a dialout-writable tty without a competing getty`; RED 9/10, GREEN 10/10, exact ttyS0-getty and 0620-mode mutants killed, Deadline AllStatic 16/16, and Phase 1 Unit 27/27. Guest proof remains required on the next rebuilt candidate.
 ---
+
+## initramfs-serial-getty-synthesis — Alpine recreated a deleted ttyS0 getty after overlay
+- **Date:** 2026-08-28
+- **Error patterns:** `ROOTFS_READY` only, `300k login:`, `setup_inittab_console`, missing `^ttyS0:`, synthesized getty, post-overlay inittab mutation
+- **Root cause(s):** QEMU/kernel intentionally exposed ttyS0 as an active diagnostic console; Alpine initramfs intentionally synthesized a getty for that active console after applying the overlay; the authored inittab had no ttyS0 ID reservation, so both conditions produced the competing getty.
+- **Fix:** Add the valid normal-boot-dormant reservation `ttyS0::ctrlaltdel:/bin/true`, preserving the independent empty-ID Ctrl-Alt-Del reboot, tty2 rescue, direct serial markers, and root:dialout 0660 setup.
+- **Files changed:** `builder/apkovl/rootfs/etc/inittab`, `tests/deadline/run.ps1`
+- **Why not caught:** RuntimeStatic proved only that the authored overlay lacked a serial getty; it did not simulate Alpine initramfs's post-overlay missing-ID synthesis or reject boot-time ttyS0 actions.
+- **Recurrence guard:** Regression test `tests/deadline/run.ps1` — `Alpine initramfs console synthesis is suppressed by a dormant ttyS0 reservation`; it models the exact append predicate and BusyBox action mask, preserves duplicate Ctrl-Alt-Del behavior/tty2/direct markers, and kills removal/getty/once mutants.
+---
