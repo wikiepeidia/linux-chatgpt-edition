@@ -177,7 +177,7 @@ Add-TestCase -Name 'BUILD-03 hostile fixture matrix preflights before no-follow 
     Assert-False -Condition ([bool]($source -match 'find "\$sandbox"[^\r\n]*-printf')) -Message 'The hostile fixture must not depend on GNU find -printf inside the pinned Alpine builder.'
     Assert-Match -Value $source -Pattern 'find "\$sandbox"[^\r\n]*-exec stat -c' -Message 'The hostile fixture inventory must use BusyBox-compatible find -exec with no-follow stat evidence.'
     Assert-Match -Value $source -Pattern '\^\[bcdelps-\]\[rwxStTs-\]\{9\}\[\+IJAHijah\]\?' -Message 'The ISO manifest parser must recognize xorriso El Torito catalog entries and its closed ACL/hidden suffix alphabet.'
-    Assert-Match -Value $source -Pattern 'type == "-" \|\| type == "e"' -Message 'Xorriso El Torito catalog entries must be scanned as regular byte-bearing ISO members.'
+    Assert-Match -Value $source -Pattern 'type == "e"[\s\S]{0,120}type="e"' -Message 'Xorriso El Torito catalog entries must retain their distinct non-regular manifest type.'
     Assert-Match -Value $source -Pattern 'require_regular_member\(\)[\s\S]{0,300}\[ -f "\$1" \][\s\S]{0,300}\[ ! -L "\$1" \]' -Message 'Decoded members must require one no-follow regular file without imposing a nonempty evidence-file contract.'
     Assert-Match -Value $source -Pattern 'inspect_file\(\)[\s\S]{0,500}require_regular_member "\$file"' -Message 'Recursive inspection must admit preflight-declared zero-byte regular members for leaf classification.'
     Assert-Match -Value $source -Pattern ': > "\$root/iso-root/empty-member"' -Message 'The clean recursive ISO self-test must cover a legitimate zero-byte regular member.'
@@ -197,6 +197,28 @@ Add-TestCase -Name 'BUILD-03 hostile fixture matrix preflights before no-follow 
     Assert-Match -Value $source -Pattern 'SELF_TEST_WRONG_FAILURE.*expected \$expected but got \$actual' -Message 'Hostile fixture failures must report a bounded diagnostic code without leaking fixture contents.'
     Assert-False -Condition ($source -match '(?m)^\s*(eval\s|source\s|\.\s+\$)') -Message 'The inspector must not evaluate ambient or computed shell source.'
     Assert-False -Condition ($source -match '(?m)\b(mount|losetup)\b') -Message 'The unprivileged inspector must not mount images or allocate loop devices.'
+}
+
+Add-TestCase -Name 'BUILD-03 El Torito catalog bytes are bounded cross-checked and scanned' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
+    $source = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/linux/inspect-iso.sh')
+
+    Assert-False -Condition ([bool]($source -match 'type == "-" \|\| type == "e"\) type="f"')) -Message 'The El Torito catalog pseudo-file must never be collapsed into an ordinary ISO data file.'
+    Assert-Match -Value $source -Pattern 'parse_iso_catalog_report\(\)[\s\S]*-report_el_torito plain[\s\S]*assert_decoder_log_clean iso9660' -Message 'Catalog location metadata must come from one strict pinned-xorriso report.'
+    Assert-Match -Value $source -Pattern 'validate_iso_catalog_manifest\(\)[\s\S]*INSPECTION_ISO_CATALOG_INVALID[\s\S]*file_bytes' -Message 'Catalog path, size, interval, and ISO bounds must fail closed before materialization.'
+    Assert-Match -Value $source -Pattern 'stream_iso_boot_catalog\(\)[\s\S]*/bin/dd[\s\S]*ulimit -f[\s\S]*assert_root_confined_path' -Message 'The exact catalog sector interval must stream through the owned bounded sink using the pinned BusyBox dd.'
+    Assert-Match -Value $source -Pattern 'stream_iso_boot_catalog\(\)[\s\S]*counter_set expanded_bytes[\s\S]*counter_set materializations' -Message 'Catalog bytes must consume expanded-byte and materialization budgets.'
+    Assert-False -Condition ([bool]($source -match 'stream_iso_boot_catalog\(\)[\s\S]{0,2200}counter_set regular_files')) -Message 'A catalog pseudo-file must not inflate the regular-file counter.'
+    Assert-Match -Value $source -Pattern 'while IFS="\$tab" read -r id type size member target; do[\s\S]*\[ "\$type" = e \][\s\S]*stream_iso_boot_catalog[\s\S]*\[ "\$type" = f \][\s\S]*stream_regular_member' -Message 'Only type e may use the catalog interval reader; ordinary f members must remain concat-only.'
+    Assert-Match -Value $source -Pattern 'stream_iso_boot_catalog[\s\S]*scan_regular_bytes[\s\S]*inspect_file' -Message 'Materialized catalog bytes must pass the existing secret scanner and leaf-role inspection.'
+    Assert-False -Condition ([bool]($source -match '-extract_boot_images|-extract_single')) -Message 'The inspector must not ask xorriso to restore boot equipment into decoder-controlled filesystem paths.'
+
+    Assert-Match -Value $source -Pattern 'create_bootable_iso_fixture[\s\S]*-eltorito-id[\s\S]*-c boot/boot[.]cat[\s\S]*-b boot/boot[.]img' -Message 'The runtime self-test must build a real El Torito catalog fixture.'
+    Assert-Match -Value $source -Pattern 'bootable-clean-catalog[\s\S]*inspect_file' -Message 'A clean bootable ISO catalog must pass recursive inspection.'
+    Assert-Match -Value $source -Pattern 'catalog-host-marker[\s\S]*/run/300k-secrets[\s\S]*expect_probe_failure INSPECTION_SECRET_FOUND' -Message 'Catalog-only host marker bytes must be detected by recursive catalog scanning.'
+    foreach ($nearMiss in @('catalog-duplicate', 'catalog-missing', 'catalog-path-mismatch', 'catalog-size-mismatch', 'catalog-malformed', 'catalog-overflow', 'catalog-out-of-bounds', 'catalog-non-iso')) {
+        Assert-Match -Value $source -Pattern ([regex]::Escape($nearMiss)) -Message "Catalog near-miss fixture '$nearMiss' is absent."
+    }
+    Assert-Match -Value $source -Pattern 'expect_catalog_preflight_failure[\s\S]*materializations[\s\S]*-eq 0' -Message 'Every hostile catalog metadata fixture must fail before any byte materialization.'
 }
 
 Add-TestCase -Name 'BUILD-03 offline build proves decoder identity before inspecting and publishing' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
