@@ -966,6 +966,12 @@ inspect_file() {
     esac
 }
 
+manifest_has_uefi_tree() {
+    manifest=$1
+    tab=$(printf '\t')
+    grep -Eq "^iso:[0-9]{8}${tab}f${tab}[1-9][0-9]*${tab}efi/boot/bootx64[.]efi${tab}$" "$manifest"
+}
+
 write_iso_audit() {
     iso=$1
     output=$2
@@ -976,7 +982,7 @@ write_iso_audit() {
     uefi=false
     tab=$(printf '\t')
     grep -Eq "${tab}(f|d)${tab}[0-9]+${tab}(boot/)?(isolinux|syslinux)(/|$)" "$manifest" && bios=true || true
-    grep -Eq "${tab}(f|d)${tab}[0-9]+${tab}EFI/BOOT(/|$)" "$manifest" && uefi=true || true
+    manifest_has_uefi_tree "$manifest" && uefi=true || true
     trusted_key_count=$(wc -l < "$TRUSTED_KEYS" | tr -d ' ')
     evidence_hash=$(sha256_file "$TOOL_EVIDENCE")
     [ "$(cat /work/inspector-self-test.passed 2>/dev/null || true)" = passed ] \
