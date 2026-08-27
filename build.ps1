@@ -1008,6 +1008,7 @@ function Invoke-300kBuild {
     $backendResult = Invoke-QemuBackend -Operation build -QemuRoot $SelectedQemuRoot -StateRoot $state -RunId $runNonce `
         -RequestFile $requestPath -SourceArchive $sourceArchive -ExportDirectory $backendExport `
         -CloudImageUri ([uri]$inputs.qemu.cloud_image_url) -CloudImageSha512 $inputs.qemu.cloud_image_sha512 -CacheIdentity $cacheIdentity `
+        -BuildTimeoutSeconds 14400 `
         -SigningPrivateFile (Join-Path $secretRoot '300k.rsa') -SigningPublicFile (Join-Path $secretRoot '300k.rsa.pub')
     [System.IO.File]::Copy($requestPath, (Join-Path $backendExport 'build-request.json'), $true)
     return Publish-BuildArtifacts -StagingDirectory $backendExport -BuildId $buildId -BuildRequestHash $requestHash -BackendResult $backendResult -QemuImgPath $qemuImg -SourceCommit $sourceIdentity.git_commit -DockerProbe $dockerProbe -Inputs $inputs -BuildRequest $request

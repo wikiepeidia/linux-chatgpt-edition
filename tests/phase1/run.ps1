@@ -942,8 +942,7 @@ Add-TestCase -Name 'BUILD-03 recursive QEMU audit has layered finite timeout hea
     Assert-False -Condition ([bool]($keyInitialization -match '-BuildTimeoutSeconds')) -Message 'Signing-key initialization must retain the stricter backend default.'
 
     $runner = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'tests/phase1/run.ps1')
-    $realTracer = [regex]::Match($runner, "(?s)Add-TestCase -Name 'BUILD-03 BUILD-04 real clean-tree decoded-security QEMU tracer'.*?(?=Add-TestCase -Name 'BUILD-03 isolated post-build failure matrix)").Value
-    Assert-Match -Value $realTracer -Pattern '\$build = Invoke-CheckedProcess[\s\S]*?-TimeoutSeconds 18000 -AllowNonZero' -Message 'The outer Security child can preempt the finite four-hour guest build plus boot and publication overhead.'
+    Assert-Match -Value $runner -Pattern '(?m)^\s*\$build = Invoke-CheckedProcess .* -TimeoutSeconds 18000 -AllowNonZero$' -Message 'The outer Security child can preempt the finite four-hour guest build plus boot and publication overhead.'
 }
 
 if ($Scope -in @('Qemu', 'Security', 'All')) {
@@ -981,7 +980,7 @@ if ($Scope -in @('Qemu', 'Security', 'All')) {
         }
         Assert-Match -Value $initialization.StandardOutput -Pattern 'signing-key-(?:already-)?initialized' -Message 'Initialization child returned no successful result.'
 
-        $build = Invoke-CheckedProcess -FilePath $pwshPath -ArgumentList ($commonArguments + '-Clean') -WorkingDirectory $script:RepositoryRoot -TimeoutSeconds 14400 -AllowNonZero
+        $build = Invoke-CheckedProcess -FilePath $pwshPath -ArgumentList ($commonArguments + '-Clean') -WorkingDirectory $script:RepositoryRoot -TimeoutSeconds 18000 -AllowNonZero
         if ($build.ExitCode -ne 0) {
             throw "QEMU build child failed.`nSTDOUT:`n$($build.StandardOutput)`nSTDERR:`n$($build.StandardError)"
         }

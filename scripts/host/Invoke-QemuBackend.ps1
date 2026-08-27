@@ -466,7 +466,7 @@ function Invoke-QemuSshCommand {
         [Parameter(Mandatory)] [string] $KnownHostsFile,
         [Parameter(Mandatory)] [int] $Port,
         [Parameter(Mandatory)] [string[]] $Command,
-        [ValidateRange(1, 7200)] [int] $TimeoutSeconds = 60,
+        [ValidateRange(1, 14400)] [int] $TimeoutSeconds = 60,
         [switch] $AllowNonZero,
         [string] $Stage = 'ssh'
     )
