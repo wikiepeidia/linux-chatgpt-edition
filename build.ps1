@@ -552,6 +552,59 @@ function Assert-StagingTextSecretFree {
     }
 }
 
+function Assert-IsoAuditNonVacuous {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $Audit,
+        [Parameter(Mandatory)] $Inputs
+    )
+
+    $code = if ([long]$Audit.counts.members -le 0) {
+        'ISO_AUDIT_MEMBERS_ZERO'
+    }
+    elseif ([long]$Audit.counts.regular_files -le 0) {
+        'ISO_AUDIT_REGULAR_FILES_ZERO'
+    }
+    elseif ([long]$Audit.counts.regular_files -gt [long]$Audit.counts.members) {
+        'ISO_AUDIT_REGULAR_FILES_EXCEED_MEMBERS'
+    }
+    elseif ([long]$Audit.counts.containers -le 0) {
+        'ISO_AUDIT_CONTAINERS_ZERO'
+    }
+    elseif ([long]$Audit.counts.expanded_bytes -le 0) {
+        'ISO_AUDIT_EXPANDED_BYTES_ZERO'
+    }
+    elseif ([long]$Audit.counts.expanded_bytes -gt [long]$Inputs.inspection_policy.limits.max_total_expanded_bytes) {
+        'ISO_AUDIT_EXPANDED_BYTES_EXCEED_LIMIT'
+    }
+    elseif (
+        [int]$Audit.counts.max_observed_depth -lt 0 -or
+        [int]$Audit.counts.max_observed_depth -gt [int]$Inputs.inspection_policy.limits.max_depth
+    ) {
+        'ISO_AUDIT_DEPTH_OUT_OF_RANGE'
+    }
+    elseif ([int]$Audit.public_key_allowance.closed_key_count -ne 4) {
+        'ISO_AUDIT_CLOSED_KEY_COUNT_INVALID'
+    }
+    elseif ($Audit.public_key_allowance.manifest_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        'ISO_AUDIT_KEY_MANIFEST_HASH_INVALID'
+    }
+    elseif ($Audit.structural_boot_findings.classification -cne 'structural') {
+        'ISO_AUDIT_CLASSIFICATION_INVALID'
+    }
+    elseif (-not [bool]$Audit.structural_boot_findings.bios_tree_present) {
+        'ISO_AUDIT_BIOS_TREE_MISSING'
+    }
+    elseif (-not [bool]$Audit.structural_boot_findings.uefi_tree_present) {
+        'ISO_AUDIT_UEFI_TREE_MISSING'
+    }
+    else { $null }
+
+    if ($null -ne $code) {
+        throw (New-BuildException -Code $code -Message 'Decoded ISO audit invariant failed.')
+    }
+}
+
 function Test-ClosedStagingBundle {
     [CmdletBinding()]
     param(
@@ -688,12 +741,7 @@ function Test-ClosedStagingBundle {
             throw (New-BuildException -Code 'ISO_AUDIT_INVALID' -Message "Audit limit '$limit' differs from public inputs.")
         }
     }
-    if ([long]$audit.counts.members -le 0 -or [long]$audit.counts.regular_files -le 0 -or [long]$audit.counts.regular_files -gt [long]$audit.counts.members -or [long]$audit.counts.containers -le 0 -or [long]$audit.counts.expanded_bytes -le 0 -or
-        [long]$audit.counts.expanded_bytes -gt [long]$Inputs.inspection_policy.limits.max_total_expanded_bytes -or [int]$audit.counts.max_observed_depth -lt 0 -or [int]$audit.counts.max_observed_depth -gt [int]$Inputs.inspection_policy.limits.max_depth -or
-        [int]$audit.public_key_allowance.closed_key_count -ne 4 -or $audit.public_key_allowance.manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
-        $audit.structural_boot_findings.classification -cne 'structural' -or -not [bool]$audit.structural_boot_findings.bios_tree_present -or -not [bool]$audit.structural_boot_findings.uefi_tree_present) {
-        throw (New-BuildException -Code 'ISO_AUDIT_INVALID' -Message 'Audit counts or public-key allowance are vacuous.')
-    }
+    Assert-IsoAuditNonVacuous -Audit $audit -Inputs $Inputs
     $checksumLine = [System.IO.File]::ReadAllText($items['SHA256SUMS'].FullName).Replace("`r`n", "`n")
     if ($checksumLine -cne "$isoHash  $isoName`n") { throw (New-BuildException -Code 'ISO_REFERENCE_MISMATCH' -Message 'SHA256SUMS does not contain the one exact ISO record.') }
     $artifactMap = [ordered]@{ bootstrap_iso = $isoName; decoded_iso_audit = 'iso-audit.json'; iso_checksums = 'SHA256SUMS' }
