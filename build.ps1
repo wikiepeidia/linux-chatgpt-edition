@@ -1006,11 +1006,77 @@ function Test-DeadlineQemuArguments {
     return $true
 }
 
+function Read-DeadlineSerialSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [ValidateRange(1,67108864)] [long] $MaxBytes = 16777216
+    )
+    if (-not [System.IO.File]::Exists($Path)) { throw (New-BuildException -Code 'DEADLINE_SERIAL_MISSING' -Message 'Deadline serial evidence is absent.') }
+    $stream = $null
+    try {
+        $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        $stream = [System.IO.FileStream]::new(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            $share,
+            4096,
+            [System.IO.FileOptions]::SequentialScan
+        )
+        $snapshotLength = [long]$stream.Length
+        if ($snapshotLength -gt $MaxBytes) { throw (New-BuildException -Code 'DEADLINE_SERIAL_TOO_LARGE' -Message 'Deadline serial evidence exceeds the bounded live snapshot limit.') }
+        $bytes = [byte[]]::new([int]$snapshotLength)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) { break }
+            $offset += $read
+        }
+    }
+    catch [System.IO.IOException] {
+        throw (New-BuildException -Code 'DEADLINE_SERIAL_READ_FAILED' -Message 'Deadline serial evidence could not be snapshotted from the live writer.' -InnerException $_.Exception)
+    }
+    catch [System.UnauthorizedAccessException] {
+        throw (New-BuildException -Code 'DEADLINE_SERIAL_READ_FAILED' -Message 'Deadline serial evidence could not be snapshotted from the live writer.' -InnerException $_.Exception)
+    }
+    finally { if ($null -ne $stream) { $stream.Dispose() } }
+
+    if ($offset -ne $bytes.Length) {
+        $snapshot = [byte[]]::new($offset)
+        if ($offset -gt 0) { [System.Array]::Copy($bytes, 0, $snapshot, 0, $offset) }
+        $bytes = $snapshot
+    }
+    if ($bytes.Length -eq 0) { return [string]::Empty }
+
+    $encoding = [System.Text.UTF8Encoding]::new($false, $true)
+    $decoder = $encoding.GetDecoder()
+    $characters = [char[]]::new($encoding.GetMaxCharCount($bytes.Length))
+    $bytesUsed = 0
+    $charactersUsed = 0
+    $completed = $false
+    $flushing = $false
+    try {
+        $decoder.Convert($bytes, 0, $bytes.Length, $characters, 0, $characters.Length, $false, [ref]$bytesUsed, [ref]$charactersUsed, [ref]$completed)
+        $flushing = $true
+        $emptyBytes = [byte[]]::new(0)
+        $flushCharacters = [char[]]::new(2)
+        $flushBytesUsed = 0
+        $flushCharactersUsed = 0
+        $flushCompleted = $false
+        $decoder.Convert($emptyBytes, 0, 0, $flushCharacters, 0, $flushCharacters.Length, $true, [ref]$flushBytesUsed, [ref]$flushCharactersUsed, [ref]$flushCompleted)
+    }
+    catch [System.Text.DecoderFallbackException] {
+        if ($flushing) { throw (New-BuildException -Code 'DEADLINE_SERIAL_INCOMPLETE' -Message 'Deadline serial evidence ends with a partial UTF-8 sequence.' -InnerException $_.Exception) }
+        throw (New-BuildException -Code 'DEADLINE_SERIAL_ENCODING_INVALID' -Message 'Deadline serial evidence contains malformed UTF-8.' -InnerException $_.Exception)
+    }
+    return [string]::new($characters, 0, $charactersUsed)
+}
+
 function Get-DeadlineSerialFacts {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string] $Path)
-    if (-not [System.IO.File]::Exists($Path)) { throw (New-BuildException -Code 'DEADLINE_SERIAL_MISSING' -Message 'Deadline serial evidence is absent.') }
-    $text = [System.IO.File]::ReadAllText($Path)
+    $text = Read-DeadlineSerialSnapshot -Path $Path
     if ([string]::IsNullOrEmpty($text) -or -not $text.EndsWith("`n", [System.StringComparison]::Ordinal)) {
         throw (New-BuildException -Code 'DEADLINE_SERIAL_INCOMPLETE' -Message 'Deadline serial evidence has an incomplete final line.')
     }

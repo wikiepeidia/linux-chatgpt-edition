@@ -56,6 +56,21 @@ function Assert-Throws {
     throw $Message
 }
 
+function Assert-ThrowsCode {
+    param(
+        [Parameter(Mandatory)] [scriptblock] $Body,
+        [Parameter(Mandatory)] [string] $ExpectedCode,
+        [string] $Message = 'Expected a coded exception.'
+    )
+    try { & $Body }
+    catch {
+        $actualCode = [string]$_.Exception.Data['Code']
+        if ($actualCode -ceq $ExpectedCode) { return }
+        throw "$Message ExpectedCode=<$ExpectedCode> ActualCode=<$actualCode> Error=<$($_.Exception.Message)>"
+    }
+    throw "$Message ExpectedCode=<$ExpectedCode> but no exception was thrown."
+}
+
 function Get-RepoText {
     param([Parameter(Mandatory)] [string] $Path)
     $full = Join-Path $script:RepositoryRoot $Path
@@ -432,10 +447,16 @@ Add-Test -Name 'Deadline candidate and promotion path are isolated and fail clos
 Add-Test -Name 'Direct smoke contract is one-attempt BIOS optical and evidence driven' -Scopes @('SmokeUnit') -Body {
     $smokePath = Join-Path $script:RepositoryRoot 'scripts/host/Invoke-DeadlineSmoke.ps1'
     Assert-True (Test-Path -LiteralPath $smokePath -PathType Leaf) 'Direct deadline smoke runner is missing.'
+    $smokeSource = Get-RepoText 'scripts/host/Invoke-DeadlineSmoke.ps1'
+    Assert-Match $smokeSource '\[switch\]\s*\$RecoverHostObservationFailure' 'The exceptional recovery is not an explicit public switch.'
+    Assert-Match $smokeSource '-EnableHostObservationRecovery:\$RecoverHostObservationFailure' 'The public recovery switch is not bound to the closed recovery path.'
     . $smokePath
     foreach ($functionName in @('New-DeadlineQemuArguments','Get-DeadlineSerialFacts','Read-DeadlinePpm','New-DeadlineAttemptRecord','Invoke-DeadlineQmpCommand')) {
         Assert-True ($null -ne (Get-Command $functionName -CommandType Function -ErrorAction SilentlyContinue)) "Smoke function is missing: $functionName"
     }
+    Assert-True (Test-DeadlineRecoveryTimestamp -Value ([System.DateTimeOffset]::UtcNow)) 'An already-parsed canonical timestamp was rejected.'
+    Assert-True (Test-DeadlineRecoveryTimestamp -Value ([System.DateTimeOffset]::UtcNow.ToString('o'))) 'Invariant round-trip timestamp text was rejected.'
+    Assert-False (Test-DeadlineRecoveryTimestamp -Value '08/27/not-a-canonical-timestamp') 'Malformed timestamp text was accepted.'
 
     $args = New-DeadlineQemuArguments -QemuExecutable 'D:\VM\qemu\qemu-system-x86_64.exe' -IsoPath 'D:\candidate.iso' -SerialPath 'D:\serial.log' -QmpPort 49153
     Assert-Equal @('-machine','pc','-accel','tcg','-m','1024','-boot','order=d,strict=on','-cdrom','D:\candidate.iso','-vga','std','-display','none','-serial','file:D:\serial.log','-qmp','tcp:127.0.0.1:49153,server=on,wait=off','-monitor','none','-nic','none','-no-reboot') @($args) 'QEMU argv differs from the direct BIOS optical contract.'
@@ -452,6 +473,27 @@ Add-Test -Name 'Direct smoke contract is one-attempt BIOS optical and evidence d
         [System.IO.File]::AppendAllText($serial, "300K_STAGE=UI_READY`n")
         Assert-Throws { Get-DeadlineSerialFacts -Path $serial } 'Duplicate stage was accepted.'
 
+        $liveSerial = Join-Path $scratch 'live-serial.log'
+        $liveWriter = [System.IO.FileStream]::new($liveSerial, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+        try {
+            $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+            $splitCodePoint = $utf8.GetBytes([string][char]0x03C0)
+            $liveWriter.Write($splitCodePoint, 0, 1)
+            $liveWriter.Flush($true)
+            Assert-ThrowsCode { Get-DeadlineSerialFacts -Path $liveSerial } 'DEADLINE_SERIAL_INCOMPLETE' 'A trailing partial UTF-8 code point was not classified as retryable.'
+
+            $completeTail = $utf8.GetBytes(" preface`n300K_STAGE=ROOTFS_READY`n300K_STAGE=X_READY`n300K_STAGE=UI_READY`n300K_STAGE=TERM_EXEC_OK uid=1000 user=chatgpt tty=/dev/pts/7 command=ok file=ok exit=1`n")
+            $completeBytes = [byte[]]::new($splitCodePoint.Length - 1 + $completeTail.Length)
+            [System.Array]::Copy($splitCodePoint, 1, $completeBytes, 0, $splitCodePoint.Length - 1)
+            [System.Array]::Copy($completeTail, 0, $completeBytes, $splitCodePoint.Length - 1, $completeTail.Length)
+            $liveWriter.Write($completeBytes, 0, $completeBytes.Length)
+            $liveWriter.Flush($true)
+            $liveFacts = Get-DeadlineSerialFacts -Path $liveSerial
+            Assert-Equal '/dev/pts/7' $liveFacts.Terminal.tty 'Share-safe live parsing lost the completed PTY marker.'
+            Assert-ThrowsCode { Read-DeadlineSerialSnapshot -Path $liveSerial -MaxBytes 1 } 'DEADLINE_SERIAL_TOO_LARGE' 'The bounded snapshot reader accepted bytes beyond its explicit cap.'
+        }
+        finally { $liveWriter.Dispose() }
+
         $ppmPath = Join-Path $scratch 'screen.ppm'
         $bytes = [System.Collections.Generic.List[byte]]::new()
         $bytes.AddRange([System.Text.Encoding]::ASCII.GetBytes("P6`n2 1`n255`n"))
@@ -463,6 +505,107 @@ Add-Test -Name 'Direct smoke contract is one-attempt BIOS optical and evidence d
         $attempt = New-DeadlineAttemptRecord -AttemptRoot $attemptRoot -BuildId 'deadline-aaaaaaaaaaaa' -CandidateSha256 ('a' * 64) -EvidenceDirectory $scratch
         Assert-True (Test-Path -LiteralPath $attempt.Path -PathType Leaf) 'Attempt record was not durable.'
         Assert-Throws { New-DeadlineAttemptRecord -AttemptRoot $attemptRoot -BuildId 'deadline-aaaaaaaaaaaa' -CandidateSha256 ('a' * 64) -EvidenceDirectory $scratch } 'A second candidate attempt was accepted.'
+
+        $recoveryRoot = Join-Path $scratch 'recovery-contract'
+        $recoveryDist = Join-Path $recoveryRoot 'dist'
+        $recoveryAttemptRoot = Join-Path $recoveryDist '.deadline-attempts'
+        $recoveryEvidenceRoot = Join-Path $recoveryDist '.deadline-evidence'
+        $newRecoveryFixture = {
+            param(
+                [Parameter(Mandatory)] [string] $BuildId,
+                [string] $FailureCode = 'DEADLINE_SMOKE_FAILED',
+                [string] $SerialText = 'ISOLINUX boot prompt',
+                [switch] $AddScreen
+            )
+            $candidateIso = Join-Path $recoveryRoot ($BuildId + '.iso')
+            [System.IO.Directory]::CreateDirectory($recoveryRoot) | Out-Null
+            [System.IO.File]::WriteAllBytes($candidateIso, [byte[]](1..32))
+            $candidateSha256 = Get-LowerFileSha256 -Path $candidateIso
+            $candidateBytes = [long](Get-Item -LiteralPath $candidateIso).Length
+            $predecessorEvidence = Join-Path $recoveryEvidenceRoot $BuildId
+            [System.IO.Directory]::CreateDirectory($predecessorEvidence) | Out-Null
+            $serialPath = Join-Path $predecessorEvidence 'serial.log'
+            [System.IO.File]::WriteAllText($serialPath, $SerialText, [System.Text.UTF8Encoding]::new($false))
+            $predecessor = New-DeadlineAttemptRecord -AttemptRoot $recoveryAttemptRoot -BuildId $BuildId -CandidateSha256 $candidateSha256 -EvidenceDirectory $predecessorEvidence
+            $qemuArguments = New-DeadlineQemuArguments -QemuExecutable 'D:\VM\qemu\qemu-system-x86_64.exe' -IsoPath $candidateIso -SerialPath $serialPath -QmpPort 49154
+            Write-CanonicalJson ([ordered]@{ executable='D:\VM\qemu\qemu-system-x86_64.exe'; argv=@($qemuArguments) }) (Join-Path $predecessorEvidence 'qemu-argv.json')
+            $failureMessage = if ($FailureCode -ceq 'DEADLINE_SMOKE_FAILED') {
+                "Exception calling `"ReadAllText`" with `"1`" argument(s): `"The process cannot access the file '$serialPath' because it is being used by another process.`""
+            }
+            else { 'QEMU exited before all deadline stages.' }
+            Write-CanonicalJson ([ordered]@{ schema='DeadlineSmokeFailure'; schema_version=1; build_id=$BuildId; attempt_id=$predecessor.AttemptId; code=$FailureCode; message=$failureMessage; completed_utc=[System.DateTimeOffset]::UtcNow.ToString('o') }) (Join-Path $predecessorEvidence 'failure.json')
+            Update-DeadlineAttemptRecord -Attempt $predecessor -Status 'failed' -FailureCode $FailureCode
+            [System.IO.File]::Copy($predecessor.Path, (Join-Path $predecessorEvidence 'attempt.json'), $false)
+            if ($AddScreen) { [System.IO.File]::WriteAllBytes((Join-Path $predecessorEvidence 'screen.ppm'), [byte[]](1,2,3)) }
+            return [pscustomobject]@{
+                BuildId=$BuildId; CandidateIso=$candidateIso; CandidateSha256=$candidateSha256; CandidateBytes=$candidateBytes
+                Predecessor=$predecessor; PredecessorEvidence=$predecessorEvidence
+            }
+        }
+
+        $validRecovery = & $newRecoveryFixture -BuildId ('deadline-' + ('b' * 12))
+        $validPredecessorBytes = [System.IO.File]::ReadAllBytes($validRecovery.Predecessor.Path)
+        $validPredecessorSha256 = Get-LowerFileSha256 -Path $validRecovery.Predecessor.Path
+        $validArtifactHashes = @{}
+        foreach ($name in @('attempt.json','failure.json','qemu-argv.json','serial.log')) {
+            $validArtifactHashes[$name] = Get-LowerFileSha256 -Path (Join-Path $validRecovery.PredecessorEvidence $name)
+        }
+        $validSuccessorEvidence = Join-Path $recoveryEvidenceRoot 'valid-successor'
+        [System.IO.Directory]::CreateDirectory($validSuccessorEvidence) | Out-Null
+        Assert-ThrowsCode {
+            New-DeadlineRecoveryAttemptRecord -AttemptRoot $recoveryAttemptRoot -BuildId $validRecovery.BuildId -CandidateSha256 ('0' * 64) -CandidateBytes $validRecovery.CandidateBytes -CandidateIsoPath $validRecovery.CandidateIso -EvidenceDirectory $validSuccessorEvidence -QemuExecutable 'D:\VM\qemu\qemu-system-x86_64.exe' -OwnedProcessCount 0
+        } 'DEADLINE_RECOVERY_IDENTITY_INVALID' 'Recovery accepted a different candidate hash.'
+        Assert-ThrowsCode {
+            New-DeadlineRecoveryAttemptRecord -AttemptRoot $recoveryAttemptRoot -BuildId $validRecovery.BuildId -CandidateSha256 $validRecovery.CandidateSha256 -CandidateBytes ($validRecovery.CandidateBytes - 1) -CandidateIsoPath $validRecovery.CandidateIso -EvidenceDirectory $validSuccessorEvidence -QemuExecutable 'D:\VM\qemu\qemu-system-x86_64.exe' -OwnedProcessCount 0
+        } 'DEADLINE_RECOVERY_IDENTITY_INVALID' 'Recovery accepted candidate byte count N-1.'
+        Assert-ThrowsCode {
+            New-DeadlineRecoveryAttemptRecord -AttemptRoot $recoveryAttemptRoot -BuildId $validRecovery.BuildId -CandidateSha256 $validRecovery.CandidateSha256 -CandidateBytes ($validRecovery.CandidateBytes + 1) -CandidateIsoPath $validRecovery.CandidateIso -EvidenceDirectory $validSuccessorEvidence -QemuExecutable 'D:\VM\qemu\qemu-system-x86_64.exe' -OwnedProcessCount 0
+        } 'DEADLINE_RECOVERY_IDENTITY_INVALID' 'Recovery accepted candidate byte count N+1.'
+        Assert-ThrowsCode {
+            New-DeadlineRecoveryAttemptRecord -AttemptRoot $recoveryAttemptRoot -BuildId $validRecovery.BuildId -CandidateSha256 $validRecovery.CandidateSha256 -CandidateBytes $validRecovery.CandidateBytes -CandidateIsoPath $validRecovery.CandidateIso -EvidenceDirectory $validSuccessorEvidence -QemuExecutable 'D:\VM\qemu\qemu-system-x86_64.exe' -OwnedProcessCount 1
+        } 'DEADLINE_RECOVERY_PROCESS_ACTIVE' 'Recovery accepted a still-owned predecessor process.'
+
+        $ordinaryFailure = & $newRecoveryFixture -BuildId ('deadline-' + ('c' * 12)) -FailureCode 'DEADLINE_QEMU_EXITED_EARLY'
+        $ordinarySuccessor = Join-Path $recoveryEvidenceRoot 'ordinary-successor'
+        [System.IO.Directory]::CreateDirectory($ordinarySuccessor) | Out-Null
+        Assert-ThrowsCode {
+            New-DeadlineRecoveryAttemptRecord -AttemptRoot $recoveryAttemptRoot -BuildId $ordinaryFailure.BuildId -CandidateSha256 $ordinaryFailure.CandidateSha256 -CandidateBytes $ordinaryFailure.CandidateBytes -CandidateIsoPath $ordinaryFailure.CandidateIso -EvidenceDirectory $ordinarySuccessor -QemuExecutable 'D:\VM\qemu\qemu-system-x86_64.exe' -OwnedProcessCount 0
+        } 'DEADLINE_RECOVERY_NOT_ALLOWED' 'An ordinary guest/runtime failure received a recovery attempt.'
+
+        $malformedFailure = & $newRecoveryFixture -BuildId ('deadline-' + ('d' * 12))
+        [System.IO.File]::WriteAllText((Join-Path $malformedFailure.PredecessorEvidence 'failure.json'), '{', [System.Text.UTF8Encoding]::new($false))
+        $malformedSuccessor = Join-Path $recoveryEvidenceRoot 'malformed-successor'
+        [System.IO.Directory]::CreateDirectory($malformedSuccessor) | Out-Null
+        Assert-ThrowsCode {
+            New-DeadlineRecoveryAttemptRecord -AttemptRoot $recoveryAttemptRoot -BuildId $malformedFailure.BuildId -CandidateSha256 $malformedFailure.CandidateSha256 -CandidateBytes $malformedFailure.CandidateBytes -CandidateIsoPath $malformedFailure.CandidateIso -EvidenceDirectory $malformedSuccessor -QemuExecutable 'D:\VM\qemu\qemu-system-x86_64.exe' -OwnedProcessCount 0
+        } 'DEADLINE_RECOVERY_EVIDENCE_INVALID' 'Malformed predecessor evidence received a recovery attempt.'
+
+        $observedFailure = & $newRecoveryFixture -BuildId ('deadline-' + ('e' * 12)) -SerialText "300K_STAGE=ROOTFS_READY`n"
+        $observedSuccessor = Join-Path $recoveryEvidenceRoot 'observed-successor'
+        [System.IO.Directory]::CreateDirectory($observedSuccessor) | Out-Null
+        Assert-ThrowsCode {
+            New-DeadlineRecoveryAttemptRecord -AttemptRoot $recoveryAttemptRoot -BuildId $observedFailure.BuildId -CandidateSha256 $observedFailure.CandidateSha256 -CandidateBytes $observedFailure.CandidateBytes -CandidateIsoPath $observedFailure.CandidateIso -EvidenceDirectory $observedSuccessor -QemuExecutable 'D:\VM\qemu\qemu-system-x86_64.exe' -OwnedProcessCount 0
+        } 'DEADLINE_RECOVERY_NOT_ALLOWED' 'A predecessor with a 300K marker received a recovery attempt.'
+
+        $screenFailure = & $newRecoveryFixture -BuildId ('deadline-' + ('f' * 12)) -AddScreen
+        $screenSuccessor = Join-Path $recoveryEvidenceRoot 'screen-successor'
+        [System.IO.Directory]::CreateDirectory($screenSuccessor) | Out-Null
+        Assert-ThrowsCode {
+            New-DeadlineRecoveryAttemptRecord -AttemptRoot $recoveryAttemptRoot -BuildId $screenFailure.BuildId -CandidateSha256 $screenFailure.CandidateSha256 -CandidateBytes $screenFailure.CandidateBytes -CandidateIsoPath $screenFailure.CandidateIso -EvidenceDirectory $screenSuccessor -QemuExecutable 'D:\VM\qemu\qemu-system-x86_64.exe' -OwnedProcessCount 0
+        } 'DEADLINE_RECOVERY_NOT_ALLOWED' 'A predecessor with screenshot evidence received a recovery attempt.'
+
+        $recoveryAttempt = New-DeadlineRecoveryAttemptRecord -AttemptRoot $recoveryAttemptRoot -BuildId $validRecovery.BuildId -CandidateSha256 $validRecovery.CandidateSha256 -CandidateBytes $validRecovery.CandidateBytes -CandidateIsoPath $validRecovery.CandidateIso -EvidenceDirectory $validSuccessorEvidence -QemuExecutable 'D:\VM\qemu\qemu-system-x86_64.exe' -OwnedProcessCount 0
+        Assert-Equal 'DeadlineSmokeRecoveryAttempt' $recoveryAttempt.Record.schema 'Recovery record schema is not explicit.'
+        Assert-Equal ($validRecovery.BuildId + '.recovery.json') ([System.IO.Path]::GetFileName($recoveryAttempt.Path)) 'Recovery did not use the single successor record namespace.'
+        Assert-Equal $validPredecessorSha256 $recoveryAttempt.Record.predecessor_attempt_sha256 'Recovery record does not link the immutable predecessor SHA.'
+        Assert-Equal $validRecovery.CandidateBytes ([long]$recoveryAttempt.Record.candidate_bytes) 'Recovery record lost exact candidate bytes.'
+        Assert-Equal ([Convert]::ToHexString($validPredecessorBytes)) ([Convert]::ToHexString([System.IO.File]::ReadAllBytes($validRecovery.Predecessor.Path))) 'Recovery changed predecessor attempt bytes.'
+        foreach ($name in $validArtifactHashes.Keys) {
+            Assert-Equal $validArtifactHashes[$name] (Get-LowerFileSha256 -Path (Join-Path $validRecovery.PredecessorEvidence $name)) "Recovery changed predecessor artifact '$name'."
+        }
+        Assert-ThrowsCode {
+            New-DeadlineRecoveryAttemptRecord -AttemptRoot $recoveryAttemptRoot -BuildId $validRecovery.BuildId -CandidateSha256 $validRecovery.CandidateSha256 -CandidateBytes $validRecovery.CandidateBytes -CandidateIsoPath $validRecovery.CandidateIso -EvidenceDirectory $validSuccessorEvidence -QemuExecutable 'D:\VM\qemu\qemu-system-x86_64.exe' -OwnedProcessCount 0
+        } 'DEADLINE_RECOVERY_ALREADY_EXISTS' 'A second recovery attempt was accepted.'
     }
     finally {
         if ([System.IO.Directory]::Exists($scratch)) { [System.IO.Directory]::Delete($scratch, $true) }
@@ -473,6 +616,7 @@ Add-Test -Name 'Deadline documentation states exact commands and honest deferral
     $doc = Get-RepoText 'docs/DEADLINE-MVP.md'
     Assert-Match $doc 'build[.]ps1 -Backend Qemu -Target DeadlineMvp' 'Documentation lacks the exact deadline build command.'
     Assert-Match $doc 'Invoke-DeadlineSmoke[.]ps1' 'Documentation lacks the direct smoke command.'
+    Assert-Match $doc 'RecoverHostObservationFailure' 'Documentation lacks the explicit exceptional host-observation recovery command.'
     foreach ($claim in @('unofficial','offline','BIOS optical','UEFI runtime','raw USB','Docker parity','second build','size optimization','exhaustive security','release certification')) {
         Assert-Match $doc ([regex]::Escape($claim)) "Documentation does not classify $claim."
     }

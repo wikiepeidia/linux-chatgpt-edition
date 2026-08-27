@@ -14,7 +14,7 @@ The command builds once through the existing signed, offline Alpine repository p
 
 ## Execute the single BIOS optical smoke
 
-Use a fresh evidence directory for that candidate. This is intentionally one attempt; the candidate cannot be retried by this runner.
+Use a fresh evidence directory for that candidate. This is intentionally one attempt; ordinary guest, marker, screenshot, PTY, timeout, and QEMU failures cannot be retried by this runner.
 
 ```powershell
 pwsh -NoProfile -File scripts/host/Invoke-DeadlineSmoke.ps1 `
@@ -26,6 +26,20 @@ pwsh -NoProfile -File scripts/host/Invoke-DeadlineSmoke.ps1 `
 ```
 
 The executed lane is direct x86_64 QEMU, legacy BIOS `pc`, read-only optical `-cdrom`, 1 GiB RAM, standard VGA, `-display none`, and literal `-nic none`. It attaches no writable guest disk. Promotion happens only after the serial log contains one ordered `ROOTFS_READY`, `X_READY`, `UI_READY`, and `TERM_EXEC_OK`; the terminal fact must prove non-root user `chatgpt`, a `/dev/pts/<n>` PTY, command and file round trips, and a real exit code of 1. QMP captures exactly one nonblank P6 screenshot.
+
+One explicit successor is available only when the immutable first attempt is the exact Windows live-serial `ReadAllText` sharing failure, ended before every `300K_STAGE`, PTY marker, screenshot, and completed smoke record, still matches the candidate hash and byte count, and owns zero matching QEMU processes. Keep the first evidence directory unchanged and use a different fresh directory:
+
+```powershell
+pwsh -NoProfile -File scripts/host/Invoke-DeadlineSmoke.ps1 `
+  -CandidateManifest 'dist\.deadline-candidates\<build-id>\deadline-candidate.json' `
+  -EvidenceDirectory 'dist\.deadline-evidence\<build-id>-host-observation-recovery' `
+  -QemuRoot 'D:\VM\qemu' `
+  -TimeoutSeconds 900 `
+  -RecoverHostObservationFailure `
+  -Promote
+```
+
+The successor record links the predecessor attempt SHA-256 and is created with `CreateNew`; a second recovery is rejected. This exception does not weaken the general one-attempt rule.
 
 ## What this proves
 

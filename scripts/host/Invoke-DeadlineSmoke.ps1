@@ -4,6 +4,7 @@ param(
     [string] $EvidenceDirectory,
     [string] $QemuRoot = 'D:\VM\qemu',
     [ValidateRange(60, 900)] [int] $TimeoutSeconds = 900,
+    [switch] $RecoverHostObservationFailure,
     [switch] $Promote
 )
 
@@ -57,6 +58,166 @@ function Update-DeadlineAttemptRecord {
     $partial = $Attempt.Path + '.' + [Guid]::NewGuid().ToString('N') + '.partial'
     Write-CanonicalJson $record $partial
     [System.IO.File]::Move($partial, $Attempt.Path, $true)
+}
+
+function Get-DeadlineOwnedQemuProcessCount {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $QemuExecutable,
+        [Parameter(Mandatory)] [string] $CandidateIsoPath,
+        [Parameter(Mandatory)] [string] $SerialPath
+    )
+    if (-not $IsWindows) { throw (New-BuildException -Code 'DEADLINE_RECOVERY_PROCESS_CHECK_FAILED' -Message 'Deadline recovery process ownership can be verified only on the Windows build host.') }
+    $expectedQemu = [System.IO.Path]::GetFullPath($QemuExecutable)
+    $expectedIso = [System.IO.Path]::GetFullPath($CandidateIsoPath)
+    $expectedSerial = [System.IO.Path]::GetFullPath($SerialPath)
+    try { $processes = @(Get-CimInstance Win32_Process -Filter "Name = 'qemu-system-x86_64.exe'" -ErrorAction Stop) }
+    catch { throw (New-BuildException -Code 'DEADLINE_RECOVERY_PROCESS_CHECK_FAILED' -Message 'Owned QEMU process state could not be queried.' -InnerException $_.Exception) }
+    $owned = 0
+    foreach ($process in $processes) {
+        if ([string]::IsNullOrWhiteSpace([string]$process.ExecutablePath) -or [System.IO.Path]::GetFullPath([string]$process.ExecutablePath) -ine $expectedQemu) { continue }
+        $commandLine = [string]$process.CommandLine
+        if ([string]::IsNullOrWhiteSpace($commandLine)) { throw (New-BuildException -Code 'DEADLINE_RECOVERY_PROCESS_CHECK_FAILED' -Message 'A supplied-path QEMU process has an unreadable command line.') }
+        if (
+            $commandLine.IndexOf($expectedIso, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+            $commandLine.IndexOf($expectedSerial, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+        ) { $owned++ }
+    }
+    return $owned
+}
+
+function Test-DeadlineRecoveryTimestamp {
+    param([Parameter(Mandatory)] $Value)
+    if ($Value -is [System.DateTimeOffset] -or $Value -is [System.DateTime]) { return $true }
+    if ($Value -isnot [string]) { return $false }
+    $parsed = [System.DateTimeOffset]::MinValue
+    return [System.DateTimeOffset]::TryParseExact(
+        $Value,
+        'o',
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::None,
+        [ref]$parsed
+    )
+}
+
+function New-DeadlineRecoveryAttemptRecord {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $AttemptRoot,
+        [Parameter(Mandatory)] [string] $BuildId,
+        [Parameter(Mandatory)] [string] $CandidateSha256,
+        [Parameter(Mandatory)] [long] $CandidateBytes,
+        [Parameter(Mandatory)] [string] $CandidateIsoPath,
+        [Parameter(Mandatory)] [string] $EvidenceDirectory,
+        [Parameter(Mandatory)] [string] $QemuExecutable,
+        [Parameter(Mandatory)] [int] $OwnedProcessCount
+    )
+    if ($BuildId -cnotmatch '^deadline-[0-9a-f]{12}$' -or $CandidateSha256 -cnotmatch '^[0-9a-f]{64}$' -or $CandidateBytes -le 0) {
+        throw (New-BuildException -Code 'DEADLINE_RECOVERY_IDENTITY_INVALID' -Message 'Recovery candidate identity is malformed.')
+    }
+    $candidateItem = Get-Item -LiteralPath $CandidateIsoPath -Force -ErrorAction SilentlyContinue
+    if ($null -eq $candidateItem -or $candidateItem.PSIsContainer -or [long]$candidateItem.Length -ne $CandidateBytes -or (Get-LowerFileSha256 -Path $candidateItem.FullName) -cne $CandidateSha256) {
+        throw (New-BuildException -Code 'DEADLINE_RECOVERY_IDENTITY_INVALID' -Message 'Recovery candidate hash or byte count differs from the exact ISO.')
+    }
+    if ($OwnedProcessCount -ne 0) { throw (New-BuildException -Code 'DEADLINE_RECOVERY_PROCESS_ACTIVE' -Message 'The predecessor still owns a QEMU process.') }
+
+    $root = [System.IO.Path]::GetFullPath($AttemptRoot)
+    if ([System.IO.Path]::GetFileName($root) -cne '.deadline-attempts') { throw (New-BuildException -Code 'DEADLINE_RECOVERY_EVIDENCE_INVALID' -Message 'Recovery attempt root is outside the closed deadline namespace.') }
+    [System.IO.Directory]::CreateDirectory($root) | Out-Null
+    Assert-NoReparseAncestors -Path $root
+    $dist = [System.IO.Directory]::GetParent($root).FullName
+    $evidenceRoot = [System.IO.Path]::GetFullPath((Join-Path $dist '.deadline-evidence')).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    $predecessorEvidence = [System.IO.Path]::GetFullPath((Join-Path $evidenceRoot $BuildId))
+    $successorEvidence = [System.IO.Path]::GetFullPath($EvidenceDirectory)
+    if (
+        -not $successorEvidence.StartsWith($evidenceRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $successorEvidence -ieq $predecessorEvidence
+    ) { throw (New-BuildException -Code 'DEADLINE_RECOVERY_EVIDENCE_INVALID' -Message 'Recovery evidence must use a fresh successor directory under the deadline evidence root.') }
+    Assert-NoReparseAncestors -Path $predecessorEvidence
+    Assert-NoReparseAncestors -Path $successorEvidence
+
+    $predecessorPath = Join-Path $root ($BuildId + '.json')
+    $recoveryPath = Join-Path $root ($BuildId + '.recovery.json')
+    if ([System.IO.File]::Exists($recoveryPath)) { throw (New-BuildException -Code 'DEADLINE_RECOVERY_ALREADY_EXISTS' -Message 'This candidate already consumed its single host-observation recovery.') }
+    if (-not [System.IO.File]::Exists($predecessorPath) -or -not [System.IO.Directory]::Exists($predecessorEvidence)) {
+        throw (New-BuildException -Code 'DEADLINE_RECOVERY_EVIDENCE_INVALID' -Message 'Recovery predecessor attempt or evidence is absent.')
+    }
+    $predecessorItem = Get-Item -LiteralPath $predecessorPath -Force
+    if ($predecessorItem.PSIsContainer -or ($predecessorItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $predecessorItem.Length -le 0) {
+        throw (New-BuildException -Code 'DEADLINE_RECOVERY_EVIDENCE_INVALID' -Message 'Recovery predecessor attempt is not one positive regular no-follow file.')
+    }
+    $predecessorSha256 = Get-LowerFileSha256 -Path $predecessorPath
+    $predecessor = Read-ClosedJsonArtifact -Path $predecessorPath -Code 'DEADLINE_RECOVERY_EVIDENCE_INVALID'
+    Assert-ClosedObjectKeys $predecessor @('schema','schema_version','build_id','candidate_sha256','attempt_id','status','started_utc','completed_utc','evidence_directory','failure_code') 'DEADLINE_RECOVERY_EVIDENCE_INVALID' 'Deadline recovery predecessor attempt'
+    if (
+        $predecessor.schema -cne 'DeadlineSmokeAttempt' -or [int]$predecessor.schema_version -ne 1 -or
+        $predecessor.build_id -cne $BuildId -or $predecessor.candidate_sha256 -cne $CandidateSha256 -or
+        $predecessor.attempt_id -cnotmatch '^[0-9a-f]{32}$' -or $predecessor.status -cne 'failed' -or
+        $predecessor.failure_code -cne 'DEADLINE_SMOKE_FAILED' -or
+        [System.IO.Path]::GetFullPath([string]$predecessor.evidence_directory) -ine $predecessorEvidence
+    ) { throw (New-BuildException -Code 'DEADLINE_RECOVERY_NOT_ALLOWED' -Message 'The predecessor is not the closed host-observation failure eligible for recovery.') }
+    if (
+        -not (Test-DeadlineRecoveryTimestamp -Value $predecessor.started_utc) -or
+        -not (Test-DeadlineRecoveryTimestamp -Value $predecessor.completed_utc)
+    ) { throw (New-BuildException -Code 'DEADLINE_RECOVERY_EVIDENCE_INVALID' -Message 'Recovery predecessor timestamps are malformed.') }
+
+    $attemptCopy = Get-ClosedRegularArtifact -BaseDirectory $predecessorEvidence -Name 'attempt.json'
+    if ((Get-LowerFileSha256 -Path $attemptCopy.FullName) -cne $predecessorSha256) {
+        throw (New-BuildException -Code 'DEADLINE_RECOVERY_EVIDENCE_INVALID' -Message 'Predecessor attempt copy differs from the immutable root record.')
+    }
+    $failurePath = (Get-ClosedRegularArtifact -BaseDirectory $predecessorEvidence -Name 'failure.json').FullName
+    $failure = Read-ClosedJsonArtifact -Path $failurePath -Code 'DEADLINE_RECOVERY_EVIDENCE_INVALID'
+    Assert-ClosedObjectKeys $failure @('schema','schema_version','build_id','attempt_id','code','message','completed_utc') 'DEADLINE_RECOVERY_EVIDENCE_INVALID' 'Deadline recovery predecessor failure'
+    $serialPath = (Get-ClosedRegularArtifact -BaseDirectory $predecessorEvidence -Name 'serial.log').FullName
+    $expectedFailureMessage = 'Exception calling "ReadAllText" with "1" argument(s): "The process cannot access the file ''' + $serialPath + ''' because it is being used by another process."'
+    if (
+        $failure.schema -cne 'DeadlineSmokeFailure' -or [int]$failure.schema_version -ne 1 -or
+        $failure.build_id -cne $BuildId -or $failure.attempt_id -cne $predecessor.attempt_id -or
+        $failure.code -cne 'DEADLINE_SMOKE_FAILED' -or $failure.message -cne $expectedFailureMessage
+    ) { throw (New-BuildException -Code 'DEADLINE_RECOVERY_NOT_ALLOWED' -Message 'Failure evidence is not the exact live ReadAllText sharing failure.') }
+    if (-not (Test-DeadlineRecoveryTimestamp -Value $failure.completed_utc)) {
+        throw (New-BuildException -Code 'DEADLINE_RECOVERY_EVIDENCE_INVALID' -Message 'Recovery failure timestamp is malformed.')
+    }
+
+    $serialText = [System.IO.File]::ReadAllText($serialPath, [System.Text.UTF8Encoding]::new($false, $true))
+    if (
+        $serialText.Contains('300K_STAGE=', [System.StringComparison]::Ordinal) -or
+        $serialText.Contains('TERM_EXEC_OK', [System.StringComparison]::Ordinal) -or
+        [System.IO.File]::Exists((Join-Path $predecessorEvidence 'screen.ppm')) -or
+        [System.IO.File]::Exists((Join-Path $predecessorEvidence 'deadline-smoke-evidence.json'))
+    ) { throw (New-BuildException -Code 'DEADLINE_RECOVERY_NOT_ALLOWED' -Message 'Guest marker, PTY, screenshot, or completed smoke observation already exists.') }
+
+    $qemuArgvPath = (Get-ClosedRegularArtifact -BaseDirectory $predecessorEvidence -Name 'qemu-argv.json').FullName
+    $qemuArgv = Read-ClosedJsonArtifact -Path $qemuArgvPath -Code 'DEADLINE_RECOVERY_EVIDENCE_INVALID'
+    Assert-ClosedObjectKeys $qemuArgv @('executable','argv') 'DEADLINE_RECOVERY_EVIDENCE_INVALID' 'Deadline recovery predecessor QEMU argv'
+    if ([System.IO.Path]::GetFullPath([string]$qemuArgv.executable) -ine [System.IO.Path]::GetFullPath($QemuExecutable)) {
+        throw (New-BuildException -Code 'DEADLINE_RECOVERY_EVIDENCE_INVALID' -Message 'Predecessor used a different QEMU executable.')
+    }
+    try { [void](Test-DeadlineQemuArguments -QemuExecutable $QemuExecutable -Arguments @($qemuArgv.argv) -IsoPath $candidateItem.FullName -SerialPath $serialPath) }
+    catch { throw (New-BuildException -Code 'DEADLINE_RECOVERY_EVIDENCE_INVALID' -Message 'Predecessor QEMU argv differs from the exact candidate and serial path.' -InnerException $_.Exception) }
+    if ((Get-LowerFileSha256 -Path $predecessorPath) -cne $predecessorSha256) {
+        throw (New-BuildException -Code 'DEADLINE_RECOVERY_EVIDENCE_INVALID' -Message 'Predecessor attempt bytes changed during recovery validation.')
+    }
+
+    $attemptId = [Guid]::NewGuid().ToString('N')
+    $record = [ordered]@{
+        schema='DeadlineSmokeRecoveryAttempt'; schema_version=1; build_id=$BuildId; candidate_sha256=$CandidateSha256; candidate_bytes=[long]$CandidateBytes
+        attempt_id=$attemptId; status='started'; started_utc=[System.DateTimeOffset]::UtcNow.ToString('o')
+        completed_utc=$null; evidence_directory=$successorEvidence; failure_code=$null
+        predecessor_attempt_file=[System.IO.Path]::GetFileName($predecessorPath); predecessor_attempt_sha256=$predecessorSha256
+    }
+    $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-CanonicalJsonText $record))
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open($recoveryPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    catch [System.IO.IOException] {
+        throw (New-BuildException -Code 'DEADLINE_RECOVERY_ALREADY_EXISTS' -Message 'This candidate already consumed its single host-observation recovery.' -InnerException $_.Exception)
+    }
+    finally { if ($null -ne $stream) { $stream.Dispose() } }
+    return [pscustomobject]@{ Path=$recoveryPath; AttemptId=$attemptId; Record=$record }
 }
 
 function Read-DeadlineQmpLine {
@@ -134,6 +295,7 @@ function Invoke-DeadlineSmoke {
         [Parameter(Mandatory)] [string] $OutputDirectory,
         [Parameter(Mandatory)] [string] $SelectedQemuRoot,
         [ValidateRange(60,900)] [int] $BoundSeconds = 900,
+        [switch] $EnableHostObservationRecovery,
         [switch] $EnablePromotion
     )
     $candidate = Test-DeadlineCandidateDirectory $CandidateManifestPath
@@ -154,7 +316,15 @@ function Invoke-DeadlineSmoke {
     $stdoutPath = Join-Path $evidence 'qemu.stdout.log'
     $stderrPath = Join-Path $evidence 'qemu.stderr.log'
     $evidencePath = Join-Path $evidence 'deadline-smoke-evidence.json'
-    $attempt = New-DeadlineAttemptRecord -AttemptRoot (Join-Path $dist '.deadline-attempts') -BuildId $candidate.BuildId -CandidateSha256 $candidate.IsoSha256 -EvidenceDirectory $evidence
+    $attemptRoot = Join-Path $dist '.deadline-attempts'
+    if ($EnableHostObservationRecovery) {
+        $predecessorSerial = Join-Path (Join-Path (Join-Path $dist '.deadline-evidence') $candidate.BuildId) 'serial.log'
+        $ownedProcessCount = Get-DeadlineOwnedQemuProcessCount -QemuExecutable $qemu -CandidateIsoPath $candidate.IsoPath -SerialPath $predecessorSerial
+        $attempt = New-DeadlineRecoveryAttemptRecord -AttemptRoot $attemptRoot -BuildId $candidate.BuildId -CandidateSha256 $candidate.IsoSha256 -CandidateBytes $candidate.IsoBytes -CandidateIsoPath $candidate.IsoPath -EvidenceDirectory $evidence -QemuExecutable $qemu -OwnedProcessCount $ownedProcessCount
+    }
+    else {
+        $attempt = New-DeadlineAttemptRecord -AttemptRoot $attemptRoot -BuildId $candidate.BuildId -CandidateSha256 $candidate.IsoSha256 -EvidenceDirectory $evidence
+    }
     [System.IO.File]::Copy($attempt.Path, (Join-Path $evidence 'attempt.json'), $false)
 
     $reservation = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
@@ -250,7 +420,7 @@ function Invoke-DeadlineSmoke {
 if ($MyInvocation.InvocationName -ne '.') {
     try {
         if ([string]::IsNullOrWhiteSpace($CandidateManifest) -or [string]::IsNullOrWhiteSpace($EvidenceDirectory)) { throw (New-BuildException -Code 'DEADLINE_SMOKE_ARGUMENT_MISSING' -Message '-CandidateManifest and -EvidenceDirectory are required.') }
-        $result = Invoke-DeadlineSmoke -CandidateManifestPath $CandidateManifest -OutputDirectory $EvidenceDirectory -SelectedQemuRoot $QemuRoot -BoundSeconds $TimeoutSeconds -EnablePromotion:$Promote
+        $result = Invoke-DeadlineSmoke -CandidateManifestPath $CandidateManifest -OutputDirectory $EvidenceDirectory -SelectedQemuRoot $QemuRoot -BoundSeconds $TimeoutSeconds -EnableHostObservationRecovery:$RecoverHostObservationFailure -EnablePromotion:$Promote
         Write-Output (ConvertTo-CanonicalJsonText $result)
         exit 0
     }
