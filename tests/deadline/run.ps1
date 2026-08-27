@@ -240,6 +240,15 @@ Add-Test -Name 'Deadline target and profile extend rather than weaken Bootstrap'
     Assert-Match $runner '300k_bootstrap\)[\s\S]*run_inspector_self_test[\s\S]*inspect_iso_artifact' 'Bootstrap must retain both recursive verification stages.'
     Assert-Match $runner '300k_deadline\)[\s\S]*run_content_self_test[\s\S]*inspect_deadline_iso_artifact' 'Deadline must use content self-test and fast inspection.'
     Assert-Match $runner '--profile \$request_profile' 'mkimage must use only the allowlisted request profile.'
+
+    . (Join-Path $script:RepositoryRoot 'build.ps1')
+    $missingState = Join-Path ([System.IO.Path]::GetTempPath()) ('300k-deadline-missing-signing-' + [Guid]::NewGuid().ToString('N'))
+    $failureCode = $null
+    try {
+        Invoke-300kBuild -SelectedBackend Qemu -SelectedTarget DeadlineMvp -SelectedStateRoot $missingState -SelectedQemuRoot $QemuRoot -OnlyPreflight | Out-Null
+    }
+    catch { $failureCode = [string]$_.Exception.Data['Code'] }
+    Assert-Equal 'SIGNING_PUBLIC_REQUIRED' $failureCode 'Deadline preflight accepted a state root without the external signing identity.'
 }
 
 Add-Test -Name 'Deadline inspector requires exact BIOS, EFI, ISO, and deferral evidence' -Scopes @('BuildStatic') -Body {

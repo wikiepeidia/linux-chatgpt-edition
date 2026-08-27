@@ -1407,8 +1407,27 @@ function Invoke-300kBuild {
         if (-not $dockerProbe.available) { throw (New-BuildException -Code 'DOCKER_PREFLIGHT_FAILED' -Message "Explicit Docker backend failed: $($dockerProbe.reason)") }
         throw (New-BuildException -Code 'DOCKER_BACKEND_NOT_IMPLEMENTED' -Message 'Docker is verified but its adapter is intentionally deferred to Plan 01-03.')
     }
+    $deadlineSigning = $null
+    if ($OnlyPreflight -and $SelectedTarget -ceq 'DeadlineMvp' -and -not $InitializeKey) {
+        $deadlineSecretRoot = Join-Path $state 'secrets\apk'
+        $deadlineSigningPath = Join-Path $deadlineSecretRoot 'signing-public.json'
+        foreach ($requiredSigningFile in @($deadlineSigningPath, (Join-Path $deadlineSecretRoot '300k.rsa'), (Join-Path $deadlineSecretRoot '300k.rsa.pub'))) {
+            if (-not [System.IO.File]::Exists($requiredSigningFile)) {
+                throw (New-BuildException -Code 'SIGNING_PUBLIC_REQUIRED' -Message 'Run -InitializeSigningKey before an ordinary build.')
+            }
+            $signingItem = Get-Item -LiteralPath $requiredSigningFile -Force
+            if ($signingItem.PSIsContainer -or ($signingItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw (New-BuildException -Code 'SIGNING_PUBLIC_INVALID' -Message 'Signing identity inputs must be regular external files.')
+            }
+        }
+        $deadlineSigning = Get-Content -Raw -LiteralPath $deadlineSigningPath | ConvertFrom-Json
+        [void](Test-SigningPublicIdentity -SigningPublic $deadlineSigning -BaseDirectory $deadlineSecretRoot)
+    }
     if ($OnlyPreflight) {
-        return [pscustomobject]@{ status = 'preflight-passed'; backend = 'qemu'; docker_status = $dockerProbe.status; qemu = 'available'; target = $SelectedTarget }
+        return [pscustomobject]@{
+            status = 'preflight-passed'; backend = 'qemu'; docker_status = $dockerProbe.status; qemu = 'available'; target = $SelectedTarget
+            signing_public_sha256 = if ($null -eq $deadlineSigning) { $null } else { $deadlineSigning.public_key_sha256 }
+        }
     }
 
     Assert-CleanRepository
