@@ -1,6 +1,7 @@
 ::sysinit:/sbin/openrc sysinit
 ::sysinit:/sbin/openrc boot
 ::wait:/sbin/openrc default
+ttyS0::ctrlaltdel:/bin/true
 ::ctrlaltdel:/sbin/reboot
 ::shutdown:/sbin/openrc shutdown
 ::shutdown:/sbin/swapoff -a

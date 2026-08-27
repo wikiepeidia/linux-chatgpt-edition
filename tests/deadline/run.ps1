@@ -238,6 +238,38 @@ Add-Test -Name 'Non-root serial stages retain a dialout-writable tty without a c
     Assert-True ($rootfsMarker -gt ($permissionBlock.Index + $permissionBlock.Length)) 'The serial permission contract must complete before ROOTFS_READY is emitted.'
 }
 
+Add-Test -Name 'Alpine initramfs console synthesis is suppressed by a dormant ttyS0 reservation' -Scopes @('RuntimeStatic') -Body {
+    $inittab = Get-RepoText 'builder/apkovl/rootfs/etc/inittab'
+    $runtime = Get-RepoText 'builder/apkovl/rootfs/usr/local/bin/300k-runtime'
+
+    $entries = @([regex]::Matches($inittab, '(?m)^(?<terminal>[^:\r\n]*):(?<runlevel>[^:\r\n]*):(?<action>[^:\r\n]*):(?<command>[^\r\n]+)$') | ForEach-Object {
+        [pscustomobject]@{
+            Terminal = $_.Groups['terminal'].Value
+            Action = $_.Groups['action'].Value
+            Command = $_.Groups['command'].Value
+        }
+    })
+    $reservations = @($entries | Where-Object { $_.Terminal -ceq 'ttyS0' })
+    Assert-Equal 1 $reservations.Count 'Exactly one ttyS0 inittab ID must reserve the active serial console from Alpine initramfs synthesis.'
+    Assert-Equal 'ctrlaltdel' $reservations[0].Action 'The ttyS0 reservation must use a valid action that is dormant during normal boot.'
+    Assert-Equal '/bin/true' $reservations[0].Command 'The dormant ttyS0 reservation must execute no serial consumer.'
+
+    $normalBootActions = @('sysinit', 'wait', 'once', 'respawn', 'askfirst')
+    Assert-False ($normalBootActions -ccontains $reservations[0].Action) 'The ttyS0 reservation command must never run or open the serial device in BusyBox normal-boot action masks.'
+    $ctrlAltDelEntries = @($entries | Where-Object { $_.Action -ceq 'ctrlaltdel' })
+    Assert-Equal 2 $ctrlAltDelEntries.Count 'BusyBox must parse the dormant reservation and the existing Ctrl-Alt-Del reboot as independent actions.'
+    Assert-True ([bool]($ctrlAltDelEntries | Where-Object { $_.Terminal -ceq '' -and $_.Command -ceq '/sbin/reboot' })) 'The existing empty-ID Ctrl-Alt-Del reboot behavior must remain unchanged.'
+    Assert-True ([bool]($ctrlAltDelEntries | Where-Object { $_.Terminal -ceq 'ttyS0' -and $_.Command -ceq '/bin/true' })) 'The ttyS0 reservation must remain independently addressable without replacing reboot behavior.'
+
+    $finalInittab = $inittab
+    if ($finalInittab -notmatch '(?m)^ttyS0:') {
+        $finalInittab = $finalInittab.TrimEnd("`r", "`n") + "`n# enable login on alternative console`nttyS0::respawn:/sbin/getty -L 0 ttyS0 vt100`n"
+    }
+    Assert-False ([bool]($finalInittab -match '(?m)^ttyS0::[^\r\n]*\bgetty\b')) 'The exact Alpine initramfs append rule would synthesize a competing ttyS0 getty.'
+    Assert-Match $finalInittab '(?m)^tty2::respawn:/sbin/getty 38400 tty2$' 'The normal tty2 rescue console must survive the serial reservation.'
+    Assert-Match $runtime '(?m)^\s*printf ''\\n%s\\n'' "\$line" > /dev/ttyS0\s*$' 'Kernel serial diagnostics and direct non-root stage markers must retain the ttyS0 channel.'
+}
+
 Add-Test -Name 'Stable boot and PTY markers have one authored producer each' -Scopes @('RuntimeStatic') -Body {
     $all = ($runtimeFiles | ForEach-Object { Get-RepoText $_ }) -join "`n"
     $runtime = Get-RepoText 'builder/apkovl/rootfs/usr/local/bin/300k-runtime'
