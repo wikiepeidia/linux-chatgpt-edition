@@ -221,6 +221,102 @@ Add-TestCase -Name 'BUILD-03 El Torito catalog bytes are bounded cross-checked a
     Assert-Match -Value $source -Pattern 'expect_catalog_preflight_failure[\s\S]*materializations[\s\S]*-eq 0' -Message 'Every hostile catalog metadata fixture must fail before any byte materialization.'
 }
 
+Add-TestCase -Name 'BUILD-03 archive member failures cannot be overwritten by later clean members' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
+    $inspectorPath = Join-Path $script:RepositoryRoot 'scripts/linux/inspect-iso.sh'
+    $source = (Get-Content -Raw -LiteralPath $inspectorPath).Replace("`r`n", "`n")
+    $functionMatch = [regex]::Match($source, '(?ms)^inspect_archive_members\(\) \{.*?^\}')
+    Assert-True -Condition $functionMatch.Success -Message 'The production archive-member traversal function could not be isolated for its runtime regression fixture.'
+
+    $bash = Get-Command bash -ErrorAction SilentlyContinue
+    if ($null -eq $bash) {
+        $git = Get-Command git -ErrorAction Stop
+        $gitRoot = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $git.Source) '..'))
+        $bashPath = Join-Path $gitRoot 'bin/bash.exe'
+        Assert-True -Condition (Test-Path -LiteralPath $bashPath -PathType Leaf) -Message 'Git Bash is required to execute the archive-member shell control-flow regression.'
+    }
+    else { $bashPath = $bash.Source }
+
+    $harness = @'
+set -eu
+__INSPECT_ARCHIVE_MEMBERS__
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+OWNED_ROOT=$work
+fixture_manifest=
+trace=$work/trace
+
+counter_get() { printf '%s\n' 0; }
+counter_set() { :; }
+make_iso_manifest() { cp "$fixture_manifest" "$2"; }
+make_tar_manifest() { cp "$fixture_manifest" "$2"; }
+make_cpio_manifest() { cp "$fixture_manifest" "$2"; }
+make_squashfs_manifest() { cp "$fixture_manifest" "$2"; }
+validate_iso_catalog_manifest() { :; }
+preflight_graph() { :; }
+stream_iso_boot_catalog() { printf '%s\n' "$work/catalog-bytes"; }
+stream_regular_member() { printf '%s\n' "$work/regular-bytes"; }
+role_for_path() { printf '%s\n' auto; }
+inspect_file() { :; }
+scan_regular_bytes() {
+    printf '%s\n' "$2" >> "$trace"
+    case "$2" in
+        */reject-e|*/reject-f) return 73 ;;
+    esac
+    return 0
+}
+
+run_failure_case() {
+    name=$1
+    : > "$trace"
+    fixture_manifest=$work/$name.manifest
+    case "$name" in
+        early-e)
+            printf 'e1\te\t2048\treject-e\t1:1\nf2\tf\t1\tclean-later\t\n' > "$fixture_manifest"
+            ;;
+        early-f)
+            printf 'f1\tf\t1\treject-f\t\nf2\tf\t1\tclean-later\t\n' > "$fixture_manifest"
+            ;;
+    esac
+    if inspect_archive_members iso9660 "$work/input.iso" image.iso 0; then
+        printf '%s\n' "$name unexpectedly succeeded" >&2
+        exit 91
+    fi
+    if grep -F 'image.iso/clean-later' "$trace" >/dev/null; then
+        printf '%s\n' "$name inspected a later member after failure" >&2
+        exit 92
+    fi
+}
+
+run_success_case() {
+    name=$1
+    : > "$trace"
+    fixture_manifest=$work/$name.manifest
+    case "$name" in
+        clean-e)
+            printf 'e1\te\t2048\tclean-e\t1:1\nf2\tf\t1\tclean-later\t\n' > "$fixture_manifest"
+            ;;
+        clean-f)
+            printf 'f1\tf\t1\tclean-first\t\nf2\tf\t1\tclean-later\t\n' > "$fixture_manifest"
+            ;;
+    esac
+    inspect_archive_members iso9660 "$work/input.iso" image.iso 0
+    grep -F 'image.iso/clean-later' "$trace" >/dev/null
+}
+
+run_failure_case early-e
+run_failure_case early-f
+run_success_case clean-e
+run_success_case clean-f
+printf '%s\n' ARCHIVE_MEMBER_STATUS_PASS
+'@.Replace('__INSPECT_ARCHIVE_MEMBERS__', $functionMatch.Value)
+
+    $output = @($harness | & $bashPath -s 2>&1)
+    $exitCode = $LASTEXITCODE
+    Assert-Equal -Expected 0 -Actual $exitCode -Message ("Archive-member runtime regression failed. Output=<{0}>" -f ($output -join ' | '))
+    Assert-True -Condition ($output -ccontains 'ARCHIVE_MEMBER_STATUS_PASS') -Message 'Archive-member runtime regression returned no success marker.'
+}
+
 Add-TestCase -Name 'BUILD-03 offline build proves decoder identity before inspecting and publishing' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
     $linuxCore = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/linux/run-build.sh')
 
