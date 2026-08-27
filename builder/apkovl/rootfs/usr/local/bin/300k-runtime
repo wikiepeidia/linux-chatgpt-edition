@@ -71,7 +71,9 @@ PROOF
 action=
 case ${0##*/} in
     300k-autologin)
-        [ "$#" -eq 0 ] || usage
+        [ "$#" -eq 1 ] || usage
+        [ "$1" = -- ] || usage
+        shift
         action=autologin
         ;;
     *)
