@@ -631,7 +631,6 @@ function Invoke-QemuBackend {
         Close-LoopbackPortReservation -Reservation $sshReservation
         $qemuArguments = @(
             '-machine', 'q35',
-            '-accel', 'whpx',
             '-accel', 'tcg,thread=multi',
             '-m', '4096',
             '-smp', '4',

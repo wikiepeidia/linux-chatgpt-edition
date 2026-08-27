@@ -221,6 +221,7 @@ Add-Test -Name 'Deadline target and profile extend rather than weaken Bootstrap'
     $build = Get-RepoText 'build.ps1'
     $profile = Get-RepoText 'builder/profiles/mkimg.300k.sh'
     $runner = Get-RepoText 'scripts/linux/run-build.sh'
+    $qemuBackend = Get-RepoText 'scripts/host/Invoke-QemuBackend.ps1'
     $inputs = Get-RepoText 'builder/inputs.json' | ConvertFrom-Json -Depth 64
 
     Assert-Match $build "ValidateSet\('Bootstrap', 'DeadlineMvp'\)" 'Public target enum must include the isolated deadline target.'
@@ -240,6 +241,8 @@ Add-Test -Name 'Deadline target and profile extend rather than weaken Bootstrap'
     Assert-Match $runner '300k_bootstrap\)[\s\S]*run_inspector_self_test[\s\S]*inspect_iso_artifact' 'Bootstrap must retain both recursive verification stages.'
     Assert-Match $runner '300k_deadline\)[\s\S]*run_content_self_test[\s\S]*inspect_deadline_iso_artifact' 'Deadline must use content self-test and fast inspection.'
     Assert-Match $runner '--profile \$request_profile' 'mkimage must use only the allowlisted request profile.'
+    Assert-Match $qemuBackend "'-accel', 'tcg,thread=multi'" 'Builder VM must retain the deterministic TCG accelerator.'
+    Assert-False ([bool]($qemuBackend -match "'-accel', 'whpx'")) 'WHPX-first builder boot is forbidden after the observed Alpine IO-APIC timer panic.'
 
     . (Join-Path $script:RepositoryRoot 'build.ps1')
     $missingState = Join-Path ([System.IO.Path]::GetTempPath()) ('300k-deadline-missing-signing-' + [Guid]::NewGuid().ToString('N'))
