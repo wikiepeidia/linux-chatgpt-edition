@@ -927,6 +927,25 @@ Add-TestCase -Name 'BUILD-04 Linux core owns package/profile decisions and the Q
     Assert-Match -Value $qemu -Pattern 'Substring\(\$diagnostic\.Length - 512, 512\)' -Message 'Bounded remote diagnostics discard the final command failure.'
 }
 
+Add-TestCase -Name 'BUILD-03 recursive QEMU audit has layered finite timeout headroom' -Scopes @('Unit') -Requirements @('BUILD-03') -Body {
+    $backend = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'scripts/host/Invoke-QemuBackend.ps1')
+    $sshCommand = [regex]::Match($backend, '(?s)function Invoke-QemuSshCommand \{.*?(?=function Invoke-QemuScp \{)').Value
+    $scpCommand = [regex]::Match($backend, '(?s)function Invoke-QemuScp \{.*?(?=function Write-SanitizedSerialEvidence \{)').Value
+    Assert-Match -Value $sshCommand -Pattern '\[ValidateRange\(1, 14400\)\]\s*\[int\]\s*\$TimeoutSeconds' -Message 'The decoded build SSH stage cannot use the finite four-hour ceiling.'
+    Assert-Match -Value $scpCommand -Pattern '\[ValidateRange\(1, 7200\)\]\s*\[int\]\s*\$TimeoutSeconds' -Message 'The SCP timeout ceiling was broadened with the decoded audit deadline.'
+    Assert-Match -Value $backend -Pattern '\[ValidateRange\(60, 14400\)\]\s*\[int\]\s*\$BuildTimeoutSeconds = 7200' -Message 'The backend default must remain the stricter two-hour bound.'
+
+    $buildSource = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'build.ps1')
+    $ordinaryBuild = [regex]::Match($buildSource, '(?s)\$backendResult = Invoke-QemuBackend -Operation build.*?(?=\r?\n\s*\[System\.IO\.File\]::Copy)').Value
+    Assert-Match -Value $ordinaryBuild -Pattern '-BuildTimeoutSeconds 14400' -Message 'Only the real decoded build must explicitly request the finite four-hour stage bound.'
+    $keyInitialization = [regex]::Match($buildSource, '(?s)\$result = Invoke-QemuBackend -Operation init-signing-key.*?(?=\r?\n\s*\[System\.IO\.Directory\]::CreateDirectory)').Value
+    Assert-False -Condition ([bool]($keyInitialization -match '-BuildTimeoutSeconds')) -Message 'Signing-key initialization must retain the stricter backend default.'
+
+    $runner = Get-Content -Raw -LiteralPath (Join-Path $script:RepositoryRoot 'tests/phase1/run.ps1')
+    $realTracer = [regex]::Match($runner, "(?s)Add-TestCase -Name 'BUILD-03 BUILD-04 real clean-tree decoded-security QEMU tracer'.*?(?=Add-TestCase -Name 'BUILD-03 isolated post-build failure matrix)").Value
+    Assert-Match -Value $realTracer -Pattern '\$build = Invoke-CheckedProcess[\s\S]*?-TimeoutSeconds 18000 -AllowNonZero' -Message 'The outer Security child can preempt the finite four-hour guest build plus boot and publication overhead.'
+}
+
 if ($Scope -in @('Qemu', 'Security', 'All')) {
     Add-TestCase -Name 'BUILD-03 BUILD-04 real clean-tree decoded-security QEMU tracer' -Scopes @('Qemu', 'Security') -Requirements @('BUILD-03', 'BUILD-04') -Body {
         $gitPath = (Get-Command git.exe -CommandType Application -ErrorAction Stop).Source
