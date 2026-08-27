@@ -241,8 +241,18 @@ Add-Test -Name 'Deadline target and profile extend rather than weaken Bootstrap'
     Assert-Match $runner '300k_bootstrap\)[\s\S]*run_inspector_self_test[\s\S]*inspect_iso_artifact' 'Bootstrap must retain both recursive verification stages.'
     Assert-Match $runner '300k_deadline\)[\s\S]*run_content_self_test[\s\S]*inspect_deadline_iso_artifact' 'Deadline must use content self-test and fast inspection.'
     Assert-Match $runner '--profile \$request_profile' 'mkimage must use only the allowlisted request profile.'
+    Assert-Match $build '\[switch\]\s*\$BuilderReadinessProbe' 'The bounded builder transport probe must be exposed explicitly.'
+    Assert-Match $build 'Invoke-QemuBackend -Operation readiness-probe' 'The builder transport probe must reuse the owned QEMU backend.'
+    $probeInvocation = [regex]::Match($build, '(?s)\$probe\s*=\s*Invoke-QemuBackend -Operation readiness-probe.*?(?=\r?\n\s*if \()').Value
+    Assert-Match $probeInvocation '-BootTimeoutSeconds 300' 'Builder readiness probe must have a short finite boot bound.'
+    Assert-False ([bool]($probeInvocation -match 'RequestFile|SourceArchive|SigningPrivateFile|SigningPublicFile')) 'Builder readiness probe must not accept source, request, or signing inputs.'
+    Assert-Match $build 'QEMU_READINESS_BASE_(MISSING|HASH_MISMATCH)' 'Builder readiness probe must require the existing pinned base image.'
+    Assert-Match $qemuBackend "ValidateSet\('init-signing-key', 'build', 'readiness-probe'\)" 'The QEMU backend must expose an isolated readiness-only operation.'
+    Assert-Match $qemuBackend "'-machine', 'pc'" 'Builder VM must use the stable pc/i440fx machine.'
+    Assert-False ([bool]($qemuBackend -match "'-machine', 'q35'")) 'q35 builder boot is forbidden after the Alpine IO-APIC timer panic under TCG.'
     Assert-Match $qemuBackend "'-accel', 'tcg,thread=multi'" 'Builder VM must retain the deterministic TCG accelerator.'
     Assert-False ([bool]($qemuBackend -match "'-accel', 'whpx'")) 'WHPX-first builder boot is forbidden after the observed Alpine IO-APIC timer panic.'
+    Assert-Match $qemuBackend '(?s)after-ssh-readiness.*?if \(\$Operation -ceq ''readiness-probe''\)\s*\{\s*\$managementStages[.]Add\(''builder-readiness-live''\)\s*\}\s*else\s*\{' 'Readiness-only operation must stop after its live SSH proof; source transfer, package build, and artifact export belong only to the alternate branch.'
 
     . (Join-Path $script:RepositoryRoot 'build.ps1')
     $missingState = Join-Path ([System.IO.Path]::GetTempPath()) ('300k-deadline-missing-signing-' + [Guid]::NewGuid().ToString('N'))

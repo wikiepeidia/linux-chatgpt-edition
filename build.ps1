@@ -10,6 +10,7 @@ param(
     [string] $QemuRoot = 'D:\VM\qemu',
     [Nullable[long]] $SourceDateEpoch,
     [switch] $InitializeSigningKey,
+    [switch] $BuilderReadinessProbe,
     [switch] $PreflightOnly,
     [switch] $Clean
 )
@@ -1385,6 +1386,7 @@ function Invoke-300kBuild {
         [Parameter(Mandatory)] [string] $SelectedQemuRoot,
         [Nullable[long]] $RequestedSourceDateEpoch,
         [switch] $InitializeKey,
+        [switch] $ProbeBuilderReadiness,
         [switch] $OnlyPreflight,
         [switch] $CleanExactNamespace
     )
@@ -1397,6 +1399,9 @@ function Invoke-300kBuild {
     $qemuImg = [System.IO.Path]::GetFullPath((Join-Path $SelectedQemuRoot 'qemu-img.exe'))
     if (-not [System.IO.File]::Exists($qemuExe) -or -not [System.IO.File]::Exists($qemuImg)) {
         throw (New-BuildException -Code 'QEMU_PREFLIGHT_FAILED' -Message 'qemu-system-x86_64.exe and qemu-img.exe are required at -QemuRoot.')
+    }
+    if ($ProbeBuilderReadiness -and ($SelectedBackend -cne 'Qemu' -or $SelectedTarget -cne 'DeadlineMvp' -or $InitializeKey -or $OnlyPreflight -or $CleanExactNamespace)) {
+        throw (New-BuildException -Code 'QEMU_READINESS_PROBE_CONFLICT' -Message 'The builder readiness probe requires explicit Qemu + DeadlineMvp and cannot initialize keys, preflight, or clean a build namespace.')
     }
 
     $dockerProbe = if ($SelectedBackend -ceq 'Qemu') {
@@ -1432,6 +1437,54 @@ function Invoke-300kBuild {
 
     Assert-CleanRepository
     [System.IO.Directory]::CreateDirectory($state) | Out-Null
+    if ($ProbeBuilderReadiness) {
+        $probeCloudImageUri = [uri]$inputs.qemu.cloud_image_url
+        $probeBasePath = Join-Path (Join-Path $state 'state\qemu\base') ([System.IO.Path]::GetFileName($probeCloudImageUri.AbsolutePath))
+        if (-not [System.IO.File]::Exists($probeBasePath)) {
+            throw (New-BuildException -Code 'QEMU_READINESS_BASE_MISSING' -Message 'Builder readiness probe requires the existing pinned base image and will not download it.')
+        }
+        if ((Get-FileHash -LiteralPath $probeBasePath -Algorithm SHA512).Hash.ToLowerInvariant() -cne $inputs.qemu.cloud_image_sha512) {
+            throw (New-BuildException -Code 'QEMU_READINESS_BASE_HASH_MISMATCH' -Message 'Existing builder base image differs from its pinned SHA-512.')
+        }
+        $probeNonce = [Guid]::NewGuid().ToString('N')
+        $probeRoot = Join-Path $state "state\host-runs\$probeNonce"
+        $probeExport = Join-Path $probeRoot 'readiness-evidence'
+        [System.IO.Directory]::CreateDirectory($probeExport) | Out-Null
+        try {
+            $probe = Invoke-QemuBackend -Operation readiness-probe -QemuRoot $SelectedQemuRoot -StateRoot $state -RunId $probeNonce `
+                -ExportDirectory $probeExport -CloudImageUri $probeCloudImageUri -CloudImageSha512 $inputs.qemu.cloud_image_sha512 `
+                -CacheIdentity (Get-LowerFileSha256 -Path $inputsPath) -BootTimeoutSeconds 300 -BuildTimeoutSeconds 60
+            if (
+                -not [bool]$probe.CleanupComplete -or
+                $probe.Operation -cne 'readiness-probe' -or
+                $probe.Machine -cne 'pc' -or
+                $probe.Accelerator -cne 'tcg,thread=multi' -or
+                $probe.ReadinessMarker -cne '300K_SSH_READY' -or
+                @($probe.ManagementStages | Where-Object { $_ -ceq 'ssh-readiness-live' }).Count -ne 1 -or
+                @($probe.ManagementStages | Where-Object { $_ -ceq 'builder-readiness-live' }).Count -ne 1 -or
+                @($probe.ManagementStages | Where-Object { $_ -ceq 'shutdown-complete' }).Count -ne 1
+            ) {
+                throw (New-BuildException -Code 'QEMU_READINESS_PROBE_INVALID' -Message 'Builder readiness probe did not prove serial trust, strict SSH, shutdown, and cleanup on the stable transport.')
+            }
+            return [pscustomobject]@{
+                status = 'builder-readiness-passed'
+                backend = 'qemu'
+                machine = $probe.Machine
+                accelerator = $probe.Accelerator
+                serial_marker = $probe.ReadinessMarker
+                serial_host_fingerprint = $probe.SerialFingerprint
+                ssh_probe = 'passed'
+                cleanup_complete = $probe.CleanupComplete
+            }
+        }
+        finally {
+            $expectedHostRuns = [System.IO.Path]::GetFullPath((Join-Path $state 'state\host-runs')).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+            $actualProbeRoot = [System.IO.Path]::GetFullPath($probeRoot)
+            if ($actualProbeRoot.StartsWith($expectedHostRuns + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase) -and [System.IO.Directory]::Exists($actualProbeRoot)) {
+                [System.IO.Directory]::Delete($actualProbeRoot, $true)
+            }
+        }
+    }
     $sourceIdentity = Get-GitSourceIdentity -RequestedEpoch $RequestedSourceDateEpoch
     $runNonce = [Guid]::NewGuid().ToString('N')
     $runRoot = Join-Path $state "state\host-runs\$runNonce"
@@ -1531,7 +1584,8 @@ function Invoke-300kBuild {
 if ($MyInvocation.InvocationName -ne '.') {
     try {
         $result = Invoke-300kBuild -SelectedBackend $Backend -SelectedTarget $Target -SelectedStateRoot $StateRoot -SelectedQemuRoot $QemuRoot `
-            -RequestedSourceDateEpoch $SourceDateEpoch -InitializeKey:$InitializeSigningKey -OnlyPreflight:$PreflightOnly -CleanExactNamespace:$Clean
+            -RequestedSourceDateEpoch $SourceDateEpoch -InitializeKey:$InitializeSigningKey -ProbeBuilderReadiness:$BuilderReadinessProbe `
+            -OnlyPreflight:$PreflightOnly -CleanExactNamespace:$Clean
         Write-Output (ConvertTo-CanonicalJsonText -Value $result)
         exit 0
     }
