@@ -53,3 +53,13 @@ Resolved debug sessions. Used by `gsd-debugger` to surface known-pattern hypothe
 - **Why not caught:** RuntimeStatic encoded an inferred zero-argument `getty -n -l` contract and lacked a dependency-ABI assertion with closed boundary neighbors.
 - **Recurrence guard:** Regression test `tests/deadline/run.ps1` — `Locked live-user boot path is bounded and retains rescue access` requires argc 1, literal `--`, immediate shift, and the unchanged action-level argc-0 guard; original-guard mutant fails 8/9 and fixed code passes 9/9.
 ---
+
+## serial-stage-permissions — Serial getty revoked non-root marker access
+- **Date:** 2026-08-28
+- **Error patterns:** `ROOTFS_READY` only, missing `X_READY`, `UI_READY`, `TERM_EXEC_OK`, `ttyS0`, root:root 0620, silent `-w` skip
+- **Root cause(s):** The inittab respawned pinned BusyBox getty on ttyS0 after ROOTFS_READY, resetting the shared proof device to root:root 0620; later X/UI/TERM producers ran as chatgpt and wrote directly through a helper that skipped an unwritable tty, while startup lacked a verified root:dialout 0660 contract.
+- **Fix:** Remove only the competing ttyS0 getty, retain tty2 rescue, and make startup fail closed on missing dialout membership before applying root:dialout 0660 to an actual ttyS0 character device ahead of ROOTFS_READY.
+- **Files changed:** `builder/apkovl/rootfs/etc/inittab`, `builder/apkovl/rootfs/etc/local.d/300k.start`, `tests/deadline/run.ps1`
+- **Why not caught:** RuntimeStatic checked supplemental groups, marker producers, and rescue consoles separately but did not model BusyBox getty's ownership side effect against the uid-1000 direct writer; the helper's silent writability guard disguised a channel failure as missing graphical stages.
+- **Recurrence guard:** Regression test `tests/deadline/run.ps1` — `Non-root serial stages retain a dialout-writable tty without a competing getty`; RED 9/10, GREEN 10/10, exact ttyS0-getty and 0620-mode mutants killed, Deadline AllStatic 16/16, and Phase 1 Unit 27/27. Guest proof remains required on the next rebuilt candidate.
+---
