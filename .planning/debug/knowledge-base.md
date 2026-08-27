@@ -23,3 +23,13 @@ Resolved debug sessions. Used by `gsd-debugger` to surface known-pattern hypothe
 - **Why not caught:** No existing host fixture held `serial.log` open for writing while `Get-DeadlineSerialFacts` read it; `SmokeUnit` covered only complete closed files.
 - **Recurrence guard:** Regression test `tests/deadline/run.ps1` — `Direct smoke contract is one-attempt BIOS optical and evidence driven` — covers live sharing, partial UTF-8, byte bounds, closed recovery rejection, predecessor immutability, and second-recovery refusal.
 ---
+
+## apkovl-not-applied — Valid overlay was erased during diskless package installation
+- **Date:** 2026-08-28
+- **Error patterns:** `(none) login:`, `DEADLINE_SMOKE_TIMEOUT`, zero `300K_*` markers, dot-prefixed apkovl members, incomplete runlevels
+- **Root cause(s):** The custom generator archived `.` so initramfs fed dot-prefixed names to apk's package-relative overlay protection; the overlay also omitted both a coherent boot-service strategy and `etc/hostname`, while implicit 0700 ancestors would block the non-root UI.
+- **Fix:** Archive exact roots `etc home usr`, write the validated hostname, create traversable 0755 ancestors, and install the complete pinned explicit eudev runlevels without `.default_boot_services`, `mdev`, or `hwdrivers`.
+- **Files changed:** `builder/apkovl/genapkovl-300k.sh`, `tests/deadline/run.ps1`
+- **Why not caught:** Existing gates checked only apkovl presence and deterministic source, not tar member namespace, initramfs lifecycle completeness, device-manager exclusivity, hostname, or ancestor modes.
+- **Recurrence guard:** Regression test `tests/deadline/run.ps1` — `Apkovl member paths and lifecycle survive diskless package install`; focused dot-operand mutant killed, RuntimeStatic 8/8, Deadline AllStatic 14/14, and Phase 1 Unit 27/27.
+---
